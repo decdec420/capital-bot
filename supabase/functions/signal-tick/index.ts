@@ -22,6 +22,7 @@ import { getBrokerCredentials, placeMarketBuy, placeMarketSell } from "../_share
 import { fetchHourlyCandles, currentRsi } from "../_shared/indicators.ts";
 import { corsHeaders, makeCorsHeaders } from "../_shared/cors.ts";
 import { log } from "../_shared/logger.ts";
+import { sendTelegram, fmtBuy, fmtSell } from "../_shared/telegram.ts";
 
 const FN = "signal-tick";
 
@@ -41,6 +42,22 @@ interface Settings {
   rsi_buy_threshold: number;
   rsi_sell_threshold: number;
   live_trading: boolean;
+  stop_loss_pct: number;   // e.g. 5 = close if down 5%
+  take_profit_pct: number; // e.g. 10 = close if up 10%
+}
+
+/**
+ * Volume filter: returns true when the latest candle's volume is at
+ * least 50% of the median volume of the candle set.  A very quiet
+ * candle (thin market) is a sign of low conviction — skip the signal.
+ */
+function volumeFilterPass(candles: { volume: number }[]): boolean {
+  if (candles.length === 0) return true;
+  const vols = candles.map((c) => c.volume).sort((a, b) => a - b);
+  const mid = Math.floor(vols.length / 2);
+  const median = vols.length % 2 === 0 ? (vols[mid - 1] + vols[mid]) / 2 : vols[mid];
+  const latest = candles[candles.length - 1].volume;
+  return latest >= median * 0.5;
 }
 
 // deno-lint-ignore no-explicit-any
@@ -50,7 +67,7 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
   price: number;
   reason: string;
 }> {
-  const { user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading } = settings;
+  const { user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, stop_loss_pct, take_profit_pct } = settings;
 
   // 1. Fetch candles + compute RSI
   const creds = await getBrokerCredentials(admin, user_id);
@@ -69,6 +86,67 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
     .maybeSingle();
 
   if (tradeErr) throw new Error(`[signal-tick] DB error checking open trades: ${tradeErr.message}`);
+
+  // 2a. Stop-loss / take-profit (priority over RSI signals)
+  if (openTrade) {
+    const entryPrice = Number(openTrade.entry_price);
+    const changePct = ((currentPrice - entryPrice) / entryPrice) * 100;
+    const slHit = stop_loss_pct > 0 && changePct <= -stop_loss_pct;
+    const tpHit = take_profit_pct > 0 && changePct >= take_profit_pct;
+
+    if (slHit || tpHit) {
+      const exitReason = slHit ? `Stop-loss (${changePct.toFixed(2)}%)` : `Take-profit (${changePct.toFixed(2)}%)`;
+      const pnlGross = (currentPrice - entryPrice) * Number(openTrade.size);
+      const pnlPct = changePct;
+      log("info", "risk_exit", { fn: FN, user_id, symbol, reason: exitReason, changePct: changePct.toFixed(2), live: live_trading });
+
+      if (!live_trading) {
+        await admin.from("trades").update({
+          status: "closed",
+          exit_price: currentPrice,
+          exit_fees_usd: 0,
+          pnl_usd: pnlGross,
+          pnl_pct: pnlPct,
+          closed_at: new Date().toISOString(),
+          notes: `[PAPER] ${exitReason} — Closed @ $${currentPrice.toFixed(2)} — P&L $${pnlGross.toFixed(2)}`,
+        }).eq("id", openTrade.id);
+        await sendTelegram(fmtSell(symbol, rsiValue, currentPrice, entryPrice, pnlGross, pnlPct, false, exitReason));
+        await logTick(admin, user_id, symbol, rsiValue, currentPrice, "sell", `PAPER ${exitReason}`);
+        return { action: "sell", rsi: rsiValue, price: currentPrice, reason: `PAPER ${exitReason}` };
+      }
+
+      const clientOrderId = `${openTrade.id}-risk`;
+      const fill = await placeMarketSell(creds, symbol, Number(openTrade.size).toFixed(8), clientOrderId);
+      const realPnl = (fill.fillPrice - entryPrice) * fill.filledBaseSize;
+      const realPnlPct = ((fill.fillPrice - entryPrice) / entryPrice) * 100;
+      const netPnl = realPnl - Number(openTrade.entry_fees_usd ?? 0) - fill.feesUsd;
+
+      await admin.from("trades").update({
+        status: "closed",
+        exit_price: fill.fillPrice,
+        exit_fees_usd: fill.feesUsd,
+        pnl_usd: realPnl,
+        pnl_pct: realPnlPct,
+        effective_pnl: netPnl,
+        closed_at: new Date().toISOString(),
+        close_order_id: fill.orderId,
+        notes: `LIVE ${exitReason} — filled @ $${fill.fillPrice.toFixed(2)} — net P&L $${netPnl.toFixed(2)}`,
+      }).eq("id", openTrade.id);
+
+      await sendTelegram(fmtSell(symbol, rsiValue, fill.fillPrice, entryPrice, realPnl, realPnlPct, true, exitReason));
+      log("info", "risk_exit_filled", { fn: FN, user_id, symbol, fillPrice: fill.fillPrice, netPnl: netPnl.toFixed(2) });
+      await logTick(admin, user_id, symbol, rsiValue, fill.fillPrice, "sell", `LIVE ${exitReason} net $${netPnl.toFixed(2)}`);
+      return { action: "sell", rsi: rsiValue, price: fill.fillPrice, reason: `LIVE ${exitReason}` };
+    }
+  }
+
+  // 2b. Volume filter — skip low-conviction signals
+  const volOk = volumeFilterPass(candles);
+  if (!volOk) {
+    log("info", "vol_filter_skip", { fn: FN, user_id, symbol, rsi: rsiValue.toFixed(2) });
+    await logTick(admin, user_id, symbol, rsiValue, currentPrice, "hold", "Volume filter — skipping signal");
+    return { action: "hold", rsi: rsiValue, price: currentPrice, reason: "Volume too low — skipping signal" };
+  }
 
   // 3. Decision
   const hasBuySignal  = rsiValue < rsi_buy_threshold;
@@ -92,6 +170,7 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
         rsi_at_entry: rsiValue,
         notes: `[PAPER] RSI ${rsiValue.toFixed(1)} < ${rsi_buy_threshold}`,
       });
+      await sendTelegram(fmtBuy(symbol, rsiValue, currentPrice, simulatedSize, buy_amount_usd, false));
       await logTick(admin, user_id, symbol, rsiValue, currentPrice, "buy", `PAPER BUY — RSI ${rsiValue.toFixed(1)}`);
       return { action: "buy", rsi: rsiValue, price: currentPrice, reason: "PAPER BUY" };
     }
@@ -114,6 +193,7 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
     });
 
     log("info", "buy_filled", { fn: FN, user_id, symbol, fillPrice: fill.fillPrice, size: fill.filledBaseSize, fees: fill.feesUsd });
+    await sendTelegram(fmtBuy(symbol, rsiValue, fill.fillPrice, fill.filledBaseSize, fill.filledQuoteSize, true));
     await logTick(admin, user_id, symbol, rsiValue, fill.fillPrice, "buy", `LIVE BUY filled @ $${fill.fillPrice.toFixed(2)}`);
     return { action: "buy", rsi: rsiValue, price: fill.fillPrice, reason: "LIVE BUY" };
   }
@@ -136,6 +216,7 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
         closed_at: new Date().toISOString(),
         notes: `[PAPER] Closed @ $${currentPrice.toFixed(2)} — RSI ${rsiValue.toFixed(1)} > ${rsi_sell_threshold} — P&L $${pnlGross.toFixed(2)}`,
       }).eq("id", openTrade.id);
+      await sendTelegram(fmtSell(symbol, rsiValue, currentPrice, Number(openTrade.entry_price), pnlGross, pnlPct, false));
       await logTick(admin, user_id, symbol, rsiValue, currentPrice, "sell", `PAPER SELL — P&L $${pnlGross.toFixed(2)}`);
       return { action: "sell", rsi: rsiValue, price: currentPrice, reason: "PAPER SELL" };
     }
@@ -161,6 +242,7 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
     }).eq("id", openTrade.id);
 
     log("info", "sell_filled", { fn: FN, user_id, symbol, fillPrice: fill.fillPrice, pnl: realPnl.toFixed(2), netPnl: netPnl.toFixed(2) });
+    await sendTelegram(fmtSell(symbol, rsiValue, fill.fillPrice, Number(openTrade.entry_price), realPnl, pnlPct, true));
     await logTick(admin, user_id, symbol, rsiValue, fill.fillPrice, "sell", `LIVE SELL filled @ $${fill.fillPrice.toFixed(2)} — net $${netPnl.toFixed(2)}`);
     return { action: "sell", rsi: rsiValue, price: fill.fillPrice, reason: "LIVE SELL" };
   }
@@ -201,7 +283,7 @@ Deno.serve(async (req) => {
     if (CRON_TOKEN && bearer === CRON_TOKEN) {
       const { data: allSettings, error } = await admin
         .from("settings")
-        .select("user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading")
+        .select("user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, stop_loss_pct, take_profit_pct")
         .eq("enabled", true);
 
       if (error) return json({ ok: false, error: error.message }, 500, cors);
@@ -233,7 +315,7 @@ Deno.serve(async (req) => {
 
     const { data: settings, error: settingsErr } = await admin
       .from("settings")
-      .select("user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, enabled")
+      .select("user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, enabled, stop_loss_pct, take_profit_pct")
       .eq("user_id", user.id)
       .maybeSingle();
 
