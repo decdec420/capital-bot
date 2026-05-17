@@ -44,6 +44,8 @@ interface BotSettings {
   buy_amount_usd: number;
   rsi_buy_threshold: number;
   rsi_sell_threshold: number;
+  stop_loss_pct: number;
+  take_profit_pct: number;
 }
 
 function fmt(n?: number | null, decimals = 2) {
@@ -106,10 +108,11 @@ export default function Dashboard() {
   const runNow = useMutation({
     mutationFn: async () => {
       const { data: { session } } = await supabase.auth.getSession();
+      if (!session) throw new Error("Session expired — please log in again");
       const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
       const r = await fetch(`${SUPABASE_URL}/functions/v1/signal-tick`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${session!.access_token}`, "Content-Type": "application/json" },
+        headers: { Authorization: `Bearer ${session.access_token}`, "Content-Type": "application/json" },
         body: "{}",
       });
       const json = await r.json();
@@ -130,10 +133,11 @@ export default function Dashboard() {
   const closeTrade = useMutation({
     mutationFn: async (tradeId: string) => {
       const { data: { session } } = await supabase.auth.getSession();
+      if (!session) throw new Error("Session expired — please log in again");
       const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
       const r = await fetch(`${SUPABASE_URL}/functions/v1/trade-close`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${session!.access_token}`, "Content-Type": "application/json" },
+        headers: { Authorization: `Bearer ${session.access_token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ tradeId }),
       });
       const json = await r.json();

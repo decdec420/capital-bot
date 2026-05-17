@@ -13,6 +13,8 @@ interface BotSettings {
   rsi_sell_threshold: number;
   enabled: boolean;
   live_trading: boolean;
+  stop_loss_pct: number;
+  take_profit_pct: number;
 }
 
 function Label({ children }: { children: React.ReactNode }) {
@@ -32,6 +34,7 @@ export default function Settings() {
   const [form, setForm] = useState<BotSettings>({
     symbol: "BTC-USD", buy_amount_usd: 10, rsi_buy_threshold: 30,
     rsi_sell_threshold: 70, enabled: false, live_trading: false,
+    stop_loss_pct: 5, take_profit_pct: 10,
   });
   const [apiKeyName, setApiKeyName] = useState("");
   const [privatePem, setPrivatePem] = useState("");
@@ -105,10 +108,11 @@ export default function Settings() {
     setTestingConn(true);
     try {
       const { data: { session } } = await supabase.auth.getSession();
+      if (!session) { toast.error("Session expired — please log in again"); return; }
       const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
       const r = await fetch(`${SUPABASE_URL}/functions/v1/broker-connection`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${session!.access_token}`, "Content-Type": "application/json" },
+        headers: { Authorization: `Bearer ${session.access_token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ action: "test", apiKeyName, privatePem }),
       });
       const json = await r.json();
@@ -236,6 +240,34 @@ export default function Settings() {
               className="w-full"
             />
             <Hint>Sell when RSI rises above this value (overbought). Default 70.</Hint>
+          </Field>
+
+          <Field>
+            <div className="flex items-center justify-between">
+              <Label>Stop-loss %</Label>
+              <span className="text-sm font-medium tabular-nums">{form.stop_loss_pct === 0 ? "Off" : `${form.stop_loss_pct}%`}</span>
+            </div>
+            <input
+              type="range" min="0" max="20" step="0.5"
+              value={form.stop_loss_pct}
+              onChange={(e) => set("stop_loss_pct")(Number(e.target.value))}
+              className="w-full"
+            />
+            <Hint>Close position if price drops this % below entry. 0 = disabled. Default 5%.</Hint>
+          </Field>
+
+          <Field>
+            <div className="flex items-center justify-between">
+              <Label>Take-profit %</Label>
+              <span className="text-sm font-medium tabular-nums">{form.take_profit_pct === 0 ? "Off" : `${form.take_profit_pct}%`}</span>
+            </div>
+            <input
+              type="range" min="0" max="50" step="0.5"
+              value={form.take_profit_pct}
+              onChange={(e) => set("take_profit_pct")(Number(e.target.value))}
+              className="w-full"
+            />
+            <Hint>Close position if price rises this % above entry. 0 = disabled. Default 10%.</Hint>
           </Field>
 
           <div className="pt-1">
