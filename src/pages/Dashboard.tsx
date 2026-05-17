@@ -22,9 +22,31 @@ interface Trade {
   effective_pnl?: number;
   status: string;
   rsi_at_entry?: number;
+  trailing_high?: number;
+  close_reason?: string;
   created_at: string;
   closed_at?: string;
   notes?: string;
+}
+
+function closeReasonLabel(reason?: string): string {
+  switch (reason) {
+    case "rsi_signal":    return "RSI signal";
+    case "trailing_stop": return "Trailing stop";
+    case "stop_loss":     return "Stop-loss";
+    case "take_profit":   return "Take-profit";
+    case "manual":        return "Manual close";
+    default:              return "—";
+  }
+}
+
+function duration(from: string, to?: string): string {
+  const ms = new Date(to ?? new Date()).getTime() - new Date(from).getTime();
+  const h = Math.floor(ms / 3600000);
+  if (h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  const rem = h % 24;
+  return rem > 0 ? `${d}d ${rem}h` : `${d}d`;
 }
 
 interface TickLog {
@@ -302,32 +324,81 @@ export default function Dashboard() {
 
         {/* Trade history */}
         {closedTrades.length > 0 && (
-          <div className="rounded-lg border border-border overflow-hidden">
-            <div className="px-5 py-3 border-b border-border">
-              <h2 className="font-medium text-sm">Trade history</h2>
-            </div>
-            <div className="divide-y divide-border">
-              {closedTrades.map((t) => {
-                const pnl = Number(t.effective_pnl ?? t.pnl_usd ?? 0);
-                return (
-                  <div key={t.id} className="px-5 py-3 flex items-center justify-between text-sm">
-                    <div className="flex items-center gap-3">
-                      {pnl > 0 ? <TrendingUp className="w-4 h-4 text-green-500" /> : pnl < 0 ? <TrendingDown className="w-4 h-4 text-red-500" /> : <Minus className="w-4 h-4 text-muted-foreground" />}
-                      <div>
-                        <p className="font-medium">{t.symbol}</p>
-                        <p className="text-xs text-muted-foreground">
-                          ${fmt(t.entry_price)} → ${fmt(t.exit_price)} · {t.rsi_at_entry ? `RSI ${t.rsi_at_entry.toFixed(1)}` : ""}
-                        </p>
-                      </div>
+          <div className="space-y-3">
+            <h2 className="font-medium text-sm px-1">Trade history</h2>
+            {closedTrades.map((t, idx) => {
+              const pnl     = Number(t.effective_pnl ?? t.pnl_usd ?? 0);
+              const pnlPct  = Number(t.pnl_pct ?? 0);
+              const isWin   = pnl > 0;
+              const entryDt = new Date(t.created_at);
+              const exitDt  = t.closed_at ? new Date(t.closed_at) : null;
+              const held    = duration(t.created_at, t.closed_at);
+              const peak    = t.trailing_high ? Number(t.trailing_high) : null;
+              const peakGainPct = peak && t.entry_price
+                ? ((peak - Number(t.entry_price)) / Number(t.entry_price)) * 100
+                : null;
+
+              return (
+                <div key={t.id} className="rounded-lg border border-border p-4 space-y-3">
+                  {/* Header row */}
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      {isWin
+                        ? <TrendingUp className="w-4 h-4 text-green-500" />
+                        : pnl < 0
+                          ? <TrendingDown className="w-4 h-4 text-red-500" />
+                          : <Minus className="w-4 h-4 text-muted-foreground" />}
+                      <span className="font-medium text-sm">{t.symbol}</span>
+                      <span className="text-xs text-muted-foreground">#{closedTrades.length - idx}</span>
+                      {t.close_reason && (
+                        <span className={`text-[11px] font-medium px-1.5 py-0.5 rounded-full ${
+                          t.close_reason === "trailing_stop" ? "bg-orange-100 text-orange-700 dark:bg-orange-900 dark:text-orange-300"
+                          : t.close_reason === "stop_loss"   ? "bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300"
+                          : t.close_reason === "take_profit" ? "bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300"
+                          : "bg-muted text-muted-foreground"
+                        }`}>
+                          {closeReasonLabel(t.close_reason)}
+                        </span>
+                      )}
                     </div>
                     <div className="text-right">
-                      <p className={`font-medium ${pnlColor(pnl)}`}>{pnl >= 0 ? "+" : ""}${fmt(pnl)}</p>
-                      <p className="text-xs text-muted-foreground">{new Date(t.closed_at!).toLocaleDateString()}</p>
+                      <p className={`font-semibold text-sm ${pnlColor(pnl)}`}>
+                        {pnl >= 0 ? "+" : ""}${fmt(pnl)} <span className="font-normal text-xs">({pnl >= 0 ? "+" : ""}{fmt(pnlPct)}%)</span>
+                      </p>
                     </div>
                   </div>
-                );
-              })}
-            </div>
+
+                  {/* Price journey */}
+                  <div className="grid grid-cols-3 gap-3 text-xs">
+                    <div>
+                      <p className="text-muted-foreground mb-0.5">Entry</p>
+                      <p className="font-medium">${fmt(t.entry_price)}</p>
+                      <p className="text-muted-foreground">{entryDt.toLocaleDateString("en-US", { month: "short", day: "numeric" })} {entryDt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}</p>
+                    </div>
+                    {peak && (
+                      <div>
+                        <p className="text-muted-foreground mb-0.5">Peak</p>
+                        <p className="font-medium text-green-600 dark:text-green-400">${fmt(peak)}</p>
+                        <p className="text-muted-foreground">{peakGainPct != null ? `+${fmt(peakGainPct)}% from entry` : ""}</p>
+                      </div>
+                    )}
+                    <div className={peak ? "" : "col-start-3"}>
+                      <p className="text-muted-foreground mb-0.5">Exit</p>
+                      <p className="font-medium">${fmt(t.exit_price)}</p>
+                      <p className="text-muted-foreground">{exitDt ? `${exitDt.toLocaleDateString("en-US", { month: "short", day: "numeric" })} ${exitDt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}` : "—"}</p>
+                    </div>
+                  </div>
+
+                  {/* Footer metadata */}
+                  <div className="flex items-center gap-4 text-xs text-muted-foreground border-t border-border pt-2">
+                    <span>Held {held}</span>
+                    <span>RSI entry {t.rsi_at_entry?.toFixed(1) ?? "—"}</span>
+                    <span>Size {Number(t.size).toFixed(6)} BTC</span>
+                    <span className="ml-auto">{closeReasonLabel(t.close_reason)}</span>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         )}
 

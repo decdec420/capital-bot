@@ -15,6 +15,7 @@ interface BotSettings {
   live_trading: boolean;
   stop_loss_pct: number;
   take_profit_pct: number;
+  trailing_stop_pct: number;
 }
 
 function Label({ children }: { children: React.ReactNode }) {
@@ -34,7 +35,7 @@ export default function Settings() {
   const [form, setForm] = useState<BotSettings>({
     symbol: "BTC-USD", buy_amount_usd: 10, rsi_buy_threshold: 30,
     rsi_sell_threshold: 70, enabled: false, live_trading: false,
-    stop_loss_pct: 5, take_profit_pct: 10,
+    stop_loss_pct: 5, take_profit_pct: 10, trailing_stop_pct: 3,
   });
   const [apiKeyName, setApiKeyName] = useState("");
   const [privatePem, setPrivatePem] = useState("");
@@ -254,6 +255,20 @@ export default function Settings() {
               className="w-full"
             />
             <Hint>Close position if price drops this % below entry. 0 = disabled. Default 5%.</Hint>
+          </Field>
+
+          <Field>
+            <div className="flex items-center justify-between">
+              <Label>Trailing stop %</Label>
+              <span className="text-sm font-medium tabular-nums">{form.trailing_stop_pct === 0 ? "Off" : `${form.trailing_stop_pct}%`}</span>
+            </div>
+            <input
+              type="range" min="0" max="15" step="0.5"
+              value={form.trailing_stop_pct}
+              onChange={(e) => set("trailing_stop_pct")(Number(e.target.value))}
+              className="w-full"
+            />
+            <Hint>Sell if price drops this % below its peak since entry. Locks in gains on the way up. Default 3%.</Hint>
           </Field>
 
           <Field>

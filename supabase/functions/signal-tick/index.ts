@@ -42,8 +42,9 @@ interface Settings {
   rsi_buy_threshold: number;
   rsi_sell_threshold: number;
   live_trading: boolean;
-  stop_loss_pct: number;   // e.g. 5 = close if down 5%
-  take_profit_pct: number; // e.g. 10 = close if up 10%
+  stop_loss_pct: number;      // e.g. 5 = close if down 5% from entry
+  take_profit_pct: number;    // e.g. 10 = close if up 10% from entry
+  trailing_stop_pct: number;  // e.g. 3 = close if price drops 3% from its peak
 }
 
 /**
@@ -67,7 +68,7 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
   price: number;
   reason: string;
 }> {
-  const { user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, stop_loss_pct, take_profit_pct } = settings;
+  const { user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, stop_loss_pct, take_profit_pct, trailing_stop_pct } = settings;
 
   // 1. Fetch candles + compute RSI
   const creds = await getBrokerCredentials(admin, user_id);
@@ -80,63 +81,75 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
   // 2. Check for open position
   const { data: openTrade, error: tradeErr } = await admin
     .from("trades")
-    .select("id, size, entry_price, entry_fees_usd")
+    .select("id, size, entry_price, entry_fees_usd, trailing_high")
     .eq("user_id", user_id)
     .eq("status", "open")
     .maybeSingle();
 
   if (tradeErr) throw new Error(`[signal-tick] DB error checking open trades: ${tradeErr.message}`);
 
-  // 2a. Stop-loss / take-profit (priority over RSI signals)
+  // 2a. Risk management (priority over RSI signals):
+  //     trailing stop → stop-loss → take-profit
   if (openTrade) {
     const entryPrice = Number(openTrade.entry_price);
-    const changePct = ((currentPrice - entryPrice) / entryPrice) * 100;
-    const slHit = stop_loss_pct > 0 && changePct <= -stop_loss_pct;
-    const tpHit = take_profit_pct > 0 && changePct >= take_profit_pct;
 
-    if (slHit || tpHit) {
-      const exitReason = slHit ? `Stop-loss (${changePct.toFixed(2)}%)` : `Take-profit (${changePct.toFixed(2)}%)`;
+    // Update trailing high: if current price is a new peak, save it
+    const prevHigh = openTrade.trailing_high ? Number(openTrade.trailing_high) : entryPrice;
+    const newHigh  = Math.max(prevHigh, currentPrice);
+    if (newHigh > prevHigh) {
+      await admin.from("trades").update({ trailing_high: newHigh }).eq("id", openTrade.id);
+    }
+
+    const changePct        = ((currentPrice - entryPrice) / entryPrice) * 100;
+    const dropFromPeak     = ((currentPrice - newHigh) / newHigh) * 100; // always <= 0 while held
+    const trailingStopHit  = trailing_stop_pct > 0 && dropFromPeak <= -trailing_stop_pct;
+    const slHit            = stop_loss_pct > 0 && changePct <= -stop_loss_pct;
+    const tpHit            = take_profit_pct > 0 && changePct >= take_profit_pct;
+
+    if (trailingStopHit || slHit || tpHit) {
+      const closeReason = trailingStopHit
+        ? `trailing_stop`
+        : slHit ? `stop_loss` : `take_profit`;
+      const exitLabel = trailingStopHit
+        ? `Trailing stop (peak $${newHigh.toFixed(0)}, dropped ${dropFromPeak.toFixed(2)}%)`
+        : slHit
+          ? `Stop-loss (${changePct.toFixed(2)}%)`
+          : `Take-profit (${changePct.toFixed(2)}%)`;
+
       const pnlGross = (currentPrice - entryPrice) * Number(openTrade.size);
-      const pnlPct = changePct;
-      log("info", "risk_exit", { fn: FN, user_id, symbol, reason: exitReason, changePct: changePct.toFixed(2), live: live_trading });
+      const pnlPct   = changePct;
+      log("info", "risk_exit", { fn: FN, user_id, symbol, reason: exitLabel, live: live_trading });
 
       if (!live_trading) {
         await admin.from("trades").update({
-          status: "closed",
-          exit_price: currentPrice,
-          exit_fees_usd: 0,
-          pnl_usd: pnlGross,
-          pnl_pct: pnlPct,
-          closed_at: new Date().toISOString(),
-          notes: `[PAPER] ${exitReason} — Closed @ $${currentPrice.toFixed(2)} — P&L $${pnlGross.toFixed(2)}`,
+          status: "closed", exit_price: currentPrice, exit_fees_usd: 0,
+          pnl_usd: pnlGross, pnl_pct: pnlPct, effective_pnl: pnlGross,
+          closed_at: new Date().toISOString(), close_reason: closeReason,
+          notes: `[PAPER] ${exitLabel} — Closed @ $${currentPrice.toFixed(2)} — P&L $${pnlGross.toFixed(2)}`,
         }).eq("id", openTrade.id);
-        await sendTelegram(fmtSell(symbol, rsiValue, currentPrice, entryPrice, pnlGross, pnlPct, false, exitReason));
-        await logTick(admin, user_id, symbol, rsiValue, currentPrice, "sell", `PAPER ${exitReason}`);
-        return { action: "sell", rsi: rsiValue, price: currentPrice, reason: `PAPER ${exitReason}` };
+        await sendTelegram(fmtSell(symbol, rsiValue, currentPrice, entryPrice, pnlGross, pnlPct, false, exitLabel));
+        await logTick(admin, user_id, symbol, rsiValue, currentPrice, "sell", `PAPER ${exitLabel}`);
+        return { action: "sell", rsi: rsiValue, price: currentPrice, reason: `PAPER ${exitLabel}` };
       }
 
       const clientOrderId = `${openTrade.id}-risk`;
       const fill = await placeMarketSell(creds, symbol, Number(openTrade.size).toFixed(8), clientOrderId);
-      const realPnl = (fill.fillPrice - entryPrice) * fill.filledBaseSize;
+      const realPnl    = (fill.fillPrice - entryPrice) * fill.filledBaseSize;
       const realPnlPct = ((fill.fillPrice - entryPrice) / entryPrice) * 100;
-      const netPnl = realPnl - Number(openTrade.entry_fees_usd ?? 0) - fill.feesUsd;
+      const netPnl     = realPnl - Number(openTrade.entry_fees_usd ?? 0) - fill.feesUsd;
 
       await admin.from("trades").update({
-        status: "closed",
-        exit_price: fill.fillPrice,
-        exit_fees_usd: fill.feesUsd,
-        pnl_usd: realPnl,
-        pnl_pct: realPnlPct,
-        effective_pnl: netPnl,
-        closed_at: new Date().toISOString(),
-        close_order_id: fill.orderId,
-        notes: `LIVE ${exitReason} — filled @ $${fill.fillPrice.toFixed(2)} — net P&L $${netPnl.toFixed(2)}`,
+        status: "closed", exit_price: fill.fillPrice, exit_fees_usd: fill.feesUsd,
+        pnl_usd: realPnl, pnl_pct: realPnlPct, effective_pnl: netPnl,
+        closed_at: new Date().toISOString(), close_order_id: fill.orderId,
+        close_reason: closeReason,
+        notes: `LIVE ${exitLabel} — filled @ $${fill.fillPrice.toFixed(2)} — net P&L $${netPnl.toFixed(2)}`,
       }).eq("id", openTrade.id);
 
-      await sendTelegram(fmtSell(symbol, rsiValue, fill.fillPrice, entryPrice, realPnl, realPnlPct, true, exitReason));
+      await sendTelegram(fmtSell(symbol, rsiValue, fill.fillPrice, entryPrice, realPnl, realPnlPct, true, exitLabel));
       log("info", "risk_exit_filled", { fn: FN, user_id, symbol, fillPrice: fill.fillPrice, netPnl: netPnl.toFixed(2) });
-      await logTick(admin, user_id, symbol, rsiValue, fill.fillPrice, "sell", `LIVE ${exitReason} net $${netPnl.toFixed(2)}`);
-      return { action: "sell", rsi: rsiValue, price: fill.fillPrice, reason: `LIVE ${exitReason}` };
+      await logTick(admin, user_id, symbol, rsiValue, fill.fillPrice, "sell", `LIVE ${exitLabel} net $${netPnl.toFixed(2)}`);
+      return { action: "sell", rsi: rsiValue, price: fill.fillPrice, reason: `LIVE ${exitLabel}` };
     }
   }
 
@@ -213,6 +226,8 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
         exit_fees_usd: 0,
         pnl_usd: pnlGross,
         pnl_pct: pnlPct,
+        effective_pnl: pnlGross,
+        close_reason: "rsi_signal",
         closed_at: new Date().toISOString(),
         notes: `[PAPER] Closed @ $${currentPrice.toFixed(2)} — RSI ${rsiValue.toFixed(1)} > ${rsi_sell_threshold} — P&L $${pnlGross.toFixed(2)}`,
       }).eq("id", openTrade.id);
@@ -238,6 +253,7 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
       effective_pnl: netPnl,
       closed_at: new Date().toISOString(),
       close_order_id: fill.orderId,
+      close_reason: "rsi_signal",
       notes: `LIVE SELL — RSI ${rsiValue.toFixed(1)} > ${rsi_sell_threshold} — filled @ $${fill.fillPrice.toFixed(2)} — net P&L $${netPnl.toFixed(2)}`,
     }).eq("id", openTrade.id);
 
@@ -283,7 +299,7 @@ Deno.serve(async (req) => {
     if (CRON_TOKEN && bearer === CRON_TOKEN) {
       const { data: allSettings, error } = await admin
         .from("settings")
-        .select("user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, stop_loss_pct, take_profit_pct")
+        .select("user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, stop_loss_pct, take_profit_pct, trailing_stop_pct")
         .eq("enabled", true);
 
       if (error) return json({ ok: false, error: error.message }, 500, cors);
@@ -315,7 +331,7 @@ Deno.serve(async (req) => {
 
     const { data: settings, error: settingsErr } = await admin
       .from("settings")
-      .select("user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, enabled, stop_loss_pct, take_profit_pct")
+      .select("user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, enabled, stop_loss_pct, take_profit_pct, trailing_stop_pct")
       .eq("user_id", user.id)
       .maybeSingle();
 
