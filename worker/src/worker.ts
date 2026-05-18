@@ -379,13 +379,22 @@ async function reconcilePendingTrades(): Promise<void> {
 function startHealthServer() {
   const port = Number(Deno.env.get("PORT") ?? 8080);
   Deno.serve({ port }, (_req) => {
-    const status: Record<string, unknown> = { ok: true, uptime: Math.floor(performance.now() / 1000) };
+    // Only expose symbol-level aggregates — no user IDs, no trade IDs.
+    const symbols: Record<string, unknown> = {};
     for (const [symbol, s] of symbolStates) {
-      status[symbol] = { rsi: s.lastRsi.toFixed(2), price: s.currentPrice.toFixed(2), candles: s.closePrices.length };
+      symbols[symbol] = {
+        rsi: s.lastRsi.toFixed(2),
+        price: s.currentPrice.toFixed(2),
+        candles: s.closePrices.length,
+      };
     }
-    for (const [uid, u] of userStates) {
-      status[`user_${uid.slice(0, 8)}`] = { enabled: u.settings.enabled, openTrade: u.openTrade?.id ?? null };
-    }
+    const status = {
+      ok: true,
+      uptime: Math.floor(performance.now() / 1000),
+      users: userStates.size,
+      openPositions: [...userStates.values()].filter((u) => u.openTrade !== null).length,
+      symbols,
+    };
     return new Response(JSON.stringify(status, null, 2), { headers: { "Content-Type": "application/json" } });
   });
   console.log(`[health] HTTP server on :${port}`);

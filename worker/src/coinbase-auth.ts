@@ -72,15 +72,17 @@ export function normalizePrivateKey(input: string): string {
  * Sign a JWT for Coinbase CDP API keys (organizations/.../apiKeys/... format).
  * CDP keys require iss="cdp" and a uri claim (METHOD HOST+PATH, no scheme).
  * Example uri: "GET api.coinbase.com/api/v3/brokerage/accounts"
+ *
+ * IMPORTANT: privatePem must already be normalized via normalizePrivateKey().
+ * Callers in broker.ts receive credentials from UserState which are normalized
+ * at load time — normalizing again here would be a wasteful no-op.
  */
 export async function signJwt(keyName: string, privatePem: string, uri: string): Promise<string> {
-  // normalizePrivateKey converts EC PEM → JWK or PKCS8, and expands literal \n
-  const normalized = normalizePrivateKey(privatePem);
   let privateKey: CryptoKey;
-  if (normalized.startsWith("{")) {
-    privateKey = await crypto.subtle.importKey("jwk", JSON.parse(normalized) as JsonWebKey, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+  if (privatePem.trimStart().startsWith("{")) {
+    privateKey = await crypto.subtle.importKey("jwk", JSON.parse(privatePem) as JsonWebKey, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
   } else {
-    privateKey = await crypto.subtle.importKey("pkcs8", pemToDer(normalized), { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+    privateKey = await crypto.subtle.importKey("pkcs8", pemToDer(privatePem), { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
   }
   const now = Math.floor(Date.now() / 1000);
   const nonce = Array.from(crypto.getRandomValues(new Uint8Array(8))).map((b) => b.toString(16).padStart(2, "0")).join("");
