@@ -13,11 +13,11 @@
 // ─────────────────────────────────────────────────────────────
 
 import { CoinbaseWs } from "./coinbase-ws.ts";
-import { CandleBuilder, computeRsi, type Candle } from "./indicators.ts";
+import { CandleBuilder, computeRsi, computeRsiSeries, volumeFilterPass, type Candle } from "./indicators.ts";
 import { evaluateTradeDecision } from "./trade-decision.ts";
-import { fetchHistoricalCandles, placeMarketBuy, placeMarketSell, probeAuth, type Credentials } from "./broker.ts";
+import { fetchHistoricalCandles, fetchBestBidAsk, placeMarketBuy, placeMarketSell, probeAuth, type Credentials } from "./broker.ts";
 import {
-  loadAllSettings, loadOpenTrade, getCoinbaseCredentials,
+  loadAllSettings, loadOpenTrade, loadClosedTradeRiskRows, getCoinbaseCredentials,
   insertTrade, insertPendingTrade, confirmTrade, deleteTrade,
   loadPendingTrades, closeTrade, updateTrailingHigh, logTick,
   type Settings, type OpenTrade,
@@ -28,13 +28,15 @@ import { normalizePrivateKey } from "./coinbase-auth.ts";
 const RSI_PERIOD        = 14;
 const WARMUP_CANDLES    = 100;
 const SETTINGS_REFRESH  = 15_000; // ms — reduced from 60s to limit disable-lag
+const RSI_HISTORY_LIMIT = 50;     // bounded recent RSI values for signal-shape detection
 
 // ── Per-symbol shared state ─────────────────────────────────
 
 interface SymbolState {
   builder:      CandleBuilder;
-  closePrices:  number[];  // rolling close history for RSI
-  recentCandles: Candle[]; // last N candles for volume filter
+  closePrices:   number[];   // rolling close history for RSI
+  rsiHistory:    number[];   // bounded recent RSI series (last RSI_HISTORY_LIMIT values)
+  recentCandles: Candle[];   // last N candles for volume filter
   lastRsi:      number;
   currentPrice: number;
   lastTickMs:   number;    // wall-clock ms of most recent trade tick (for dead-man's switch)
@@ -62,10 +64,13 @@ async function warmupSymbol(symbol: string, creds: Credentials): Promise<void> {
   try {
     const candles = await fetchHistoricalCandles(creds, symbol, WARMUP_CANDLES, "FIVE_MINUTE");
     const closePrices = candles.map((c) => c.close);
-    const lastRsi = computeRsi(closePrices, RSI_PERIOD);
+    const rsiSeries  = computeRsiSeries(closePrices, RSI_PERIOD);
+    const rsiHistory = rsiSeries.slice(-RSI_HISTORY_LIMIT);
+    const lastRsi    = rsiHistory[rsiHistory.length - 1] ?? computeRsi(closePrices, RSI_PERIOD);
     symbolStates.set(symbol, {
       builder: new CandleBuilder(),
       closePrices,
+      rsiHistory,
       recentCandles: candles.slice(-20),
       lastRsi,
       currentPrice: closePrices[closePrices.length - 1] ?? 0,
@@ -78,6 +83,7 @@ async function warmupSymbol(symbol: string, creds: Credentials): Promise<void> {
     symbolStates.set(symbol, {
       builder: new CandleBuilder(),
       closePrices: [],
+      rsiHistory:  [],
       recentCandles: [],
       lastRsi: 50,
       currentPrice: 0,
@@ -131,6 +137,90 @@ async function reloadSettings(): Promise<void> {
   } catch (e) {
     console.error("[settings] reload failed:", e instanceof Error ? e.message : String(e));
   }
+}
+
+
+// ── Entry risk gates: checked before every BUY ────────────
+// Hard stops that protect capital regardless of RSI signal quality.
+// If any gate fires, the buy is skipped and RISK_BLOCKED is logged.
+
+function calcVolatilityPct(candle: Candle): number {
+  const mid = (candle.high + candle.low) / 2;
+  return mid > 0 ? ((candle.high - candle.low) / mid) * 100 : Infinity;
+}
+
+function maxClosedTradeDrawdownPct(rows: Awaited<ReturnType<typeof loadClosedTradeRiskRows>>): number {
+  let cumReturnPct = 0, peakReturnPct = 0, maxDrawdownPct = 0;
+  for (const row of rows) {
+    const tradeReturnPct = row.quote_size > 0
+      ? (row.effective_pnl / row.quote_size) * 100
+      : row.pnl_pct;
+    cumReturnPct += Number.isFinite(tradeReturnPct) ? tradeReturnPct : 0;
+    peakReturnPct = Math.max(peakReturnPct, cumReturnPct);
+    maxDrawdownPct = Math.max(maxDrawdownPct, peakReturnPct - cumReturnPct);
+  }
+  return maxDrawdownPct;
+}
+
+async function blockEntry(userId: string, symbol: string, rsi: number, price: number, blocker: string): Promise<boolean> {
+  const reason = `RISK_BLOCKED: ${blocker}`;
+  console.warn(`[risk-gate] ${userId} ${reason}`);
+  await logTick(userId, symbol, rsi, price, "RISK_BLOCKED", reason);
+  return true;
+}
+
+async function entryRiskBlocked(
+  userId: string, state: UserState, symState: SymbolState, closedCandle: Candle,
+): Promise<boolean> {
+  const { settings, openTrade } = state;
+  const { lastRsi, currentPrice, recentCandles } = symState;
+
+  if (openTrade) return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `existing_open_position:${openTrade.id}`);
+
+  if (recentCandles.length < RSI_PERIOD + 1)
+    return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `missing_candles:have_${recentCandles.length}_need_${RSI_PERIOD + 1}`);
+
+  if (!currentPrice || !Number.isFinite(currentPrice) || Date.now() - symState.lastTickMs > 2 * 60_000)
+    return blockEntry(userId, settings.symbol, lastRsi, currentPrice, "stale_market_data:no_recent_ticks");
+
+  const candleAgeMs = Date.now() - closedCandle.startTime * 1000;
+  if (candleAgeMs > 10 * 60_000)
+    return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `stale_market_data:last_candle_${Math.round(candleAgeMs / 1000)}s_old`);
+
+  if (settings.max_volatility_pct > 0) {
+    const volPct = calcVolatilityPct(closedCandle);
+    if (volPct > settings.max_volatility_pct)
+      return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `high_volatility_spike:${volPct.toFixed(2)}pct>${settings.max_volatility_pct}pct`);
+  }
+
+  const rows = await loadClosedTradeRiskRows(userId);
+
+  if (settings.daily_loss_limit_usd > 0) {
+    const startOfDay = new Date(); startOfDay.setUTCHours(0, 0, 0, 0);
+    const dailyPnl = rows
+      .filter((r) => new Date(r.closed_at ?? r.created_at).getTime() >= startOfDay.getTime())
+      .reduce((sum, r) => sum + r.effective_pnl, 0);
+    if (dailyPnl <= -settings.daily_loss_limit_usd)
+      return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `daily_loss_limit:${dailyPnl.toFixed(2)}<=-${settings.daily_loss_limit_usd}`);
+  }
+
+  if (settings.max_drawdown_pct > 0) {
+    const drawdownPct = maxClosedTradeDrawdownPct(rows);
+    if (drawdownPct >= settings.max_drawdown_pct)
+      return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `max_drawdown:${drawdownPct.toFixed(2)}pct>=${settings.max_drawdown_pct}pct`);
+  }
+
+  if (settings.max_spread_pct > 0) {
+    try {
+      const quote = await fetchBestBidAsk(settings.symbol);
+      if (quote.spreadPct > settings.max_spread_pct)
+        return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `unacceptable_spread:${quote.spreadPct.toFixed(3)}pct>${settings.max_spread_pct}pct`);
+    } catch (e) {
+      return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `bid_ask_unavailable:${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  return false; // all gates passed
 }
 
 // ── Risk exits: checked on EVERY price tick ────────────────
@@ -207,12 +297,13 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
   // Respect the enabled flag — settings refresh every 15s so lag is minimal
   if (!settings.enabled) return;
 
-  const { lastRsi, currentPrice, recentCandles, closePrices } = symState;
+  const { lastRsi, currentPrice, recentCandles, closePrices, rsiHistory } = symState;
 
   const decision = evaluateTradeDecision({
     settings,
     openTrade,
     lastRsi,
+    rsiHistory,
     closePrices,
     recentCandles,
     currentPrice,
@@ -221,6 +312,8 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
 
   // ── BUY ─────────────────────────────────────────────────
   if (decision.state === "TRADE_ALLOWED" && !decision.riskBlocked && !openTrade) {
+    // Hard entry-risk gates (daily loss, drawdown, spread, volatility, stale data)
+    if (await entryRiskBlocked(userId, state, symState, closedCandle)) return;
     console.log(`[signal] ${userId} BUY — decision=${decision.state} score=${decision.score} reasons=${decision.reasons.join("; ")} @ $${currentPrice.toFixed(2)}`);
     try {
       if (!settings.live_trading) {
@@ -343,6 +436,8 @@ async function onTrade(symbol: string, price: number, size: number): Promise<voi
     symState.recentCandles.push(closedCandle);
     if (symState.recentCandles.length > 20) symState.recentCandles.shift();
     symState.lastRsi = computeRsi(symState.closePrices, RSI_PERIOD);
+    symState.rsiHistory.push(symState.lastRsi);
+    if (symState.rsiHistory.length > RSI_HISTORY_LIMIT) symState.rsiHistory.shift();
 
     console.log(`[candle] ${symbol} close=$${closedCandle.close.toFixed(2)} RSI=${symState.lastRsi.toFixed(2)} vol=${closedCandle.volume.toFixed(4)}`);
 
@@ -450,7 +545,7 @@ async function main() {
       await probeAuth(creds); // verify JWT signing works for order placement
     } else {
       console.warn(`[main] no credentials available for ${symbol} warmup — starting cold`);
-      symbolStates.set(symbol, { builder: new CandleBuilder(), closePrices: [], recentCandles: [], lastRsi: 50, currentPrice: 0, lastTickMs: Date.now() });
+      symbolStates.set(symbol, { builder: new CandleBuilder(), closePrices: [], rsiHistory: [], recentCandles: [], lastRsi: 50, currentPrice: 0, lastTickMs: Date.now() });
     }
   }
 

@@ -115,3 +115,18 @@ export async function fetchHistoricalCandles(
     }))
     .sort((a, b) => a.startTime - b.startTime);
 }
+
+export interface BestBidAsk { bid: number; ask: number; mid: number; spreadPct: number; }
+
+/** Fetch best bid/ask for spread gate — public endpoint, no auth needed */
+export async function fetchBestBidAsk(productId: string): Promise<BestBidAsk> {
+  const r = await fetch(`${CB}/api/v3/brokerage/best_bid_ask?product_ids=${productId}`);
+  if (!r.ok) throw new Error(`[broker] best bid/ask ${r.status}: ${await r.text()}`);
+  const body = await r.json();
+  const entry = body.pricebooks?.[0];
+  const bid = Number(entry?.bids?.[0]?.price ?? 0);
+  const ask = Number(entry?.asks?.[0]?.price ?? 0);
+  if (!bid || !ask || ask < bid) throw new Error(`[broker] invalid bid/ask for ${productId}`);
+  const mid = (bid + ask) / 2;
+  return { bid, ask, mid, spreadPct: ((ask - bid) / mid) * 100 };
+}

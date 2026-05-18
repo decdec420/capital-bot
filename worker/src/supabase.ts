@@ -22,7 +22,23 @@ export interface Settings {
   stop_loss_pct: number;
   take_profit_pct: number;
   trailing_stop_pct: number;
+  // Entry risk gates — 0 = disabled
+  daily_loss_limit_usd: number;  // block new buys when today's net P&L <= -this
+  max_drawdown_pct: number;       // block when equity curve drawdown >= this %
+  max_spread_pct: number;         // block when bid/ask spread >= this %
+  max_volatility_pct: number;     // block when latest candle high-low range >= this %
+  // Entry quality gate: 0-100 slider in UI; maps to internal multi-factor score
+  entry_score_threshold: number;
   enabled: boolean;
+}
+
+export interface ClosedTradeRiskRow {
+  effective_pnl: number;
+  pnl_usd: number;
+  pnl_pct: number;
+  quote_size: number;
+  closed_at: string | null;
+  created_at: string;
 }
 
 export interface OpenTrade {
@@ -51,7 +67,13 @@ async function rest(method: string, path: string, body?: unknown): Promise<any> 
 
 /** Load all enabled users' settings */
 export async function loadAllSettings(): Promise<Settings[]> {
-  return rest("GET", "/settings?enabled=eq.true&select=user_id,symbol,buy_amount_usd,rsi_buy_threshold,rsi_sell_threshold,live_trading,stop_loss_pct,take_profit_pct,trailing_stop_pct,enabled");
+  return rest(
+    "GET",
+    "/settings?enabled=eq.true&select=user_id,symbol,buy_amount_usd," +
+    "rsi_buy_threshold,rsi_sell_threshold,live_trading,stop_loss_pct," +
+    "take_profit_pct,trailing_stop_pct,daily_loss_limit_usd,max_drawdown_pct," +
+    "max_spread_pct,max_volatility_pct,entry_score_threshold,enabled",
+  );
 }
 
 /** Load open trade for a user (null if none) */
@@ -68,6 +90,24 @@ export async function loadOpenTrade(userId: string): Promise<OpenTrade | null> {
     trailing_high: r.trailing_high ? Number(r.trailing_high) : null,
     rsi_at_entry: Number(r.rsi_at_entry ?? 0),
   };
+}
+
+/** Load closed trades for daily-loss and max-drawdown gate checks */
+export async function loadClosedTradeRiskRows(userId: string): Promise<ClosedTradeRiskRow[]> {
+  const rows = await rest(
+    "GET",
+    `/trades?user_id=eq.${userId}&status=eq.closed` +
+    `&select=effective_pnl,pnl_usd,pnl_pct,quote_size,closed_at,created_at` +
+    `&order=closed_at.asc.nullslast,created_at.asc`,
+  );
+  return (rows ?? []).map((r: any) => ({
+    effective_pnl: Number(r.effective_pnl ?? r.pnl_usd ?? 0),
+    pnl_usd:       Number(r.pnl_usd ?? r.effective_pnl ?? 0),
+    pnl_pct:       Number(r.pnl_pct ?? 0),
+    quote_size:    Number(r.quote_size ?? 0),
+    closed_at:     r.closed_at ?? null,
+    created_at:    r.created_at,
+  }));
 }
 
 /** Get Coinbase credentials for a user from Vault */
@@ -94,11 +134,6 @@ export async function insertTrade(trade: {
   return rows[0].id;
 }
 
-/**
- * Insert a placeholder row BEFORE placing the order.
- * If the worker crashes between order placement and the DB write,
- * this row survives and is reconciled on next startup.
- */
 export async function insertPendingTrade(trade: {
   user_id: string; symbol: string; quote_size: number;
   rsi_at_entry: number; client_order_id: string;
@@ -106,8 +141,7 @@ export async function insertPendingTrade(trade: {
   const rows = await rest("POST", "/trades", {
     user_id: trade.user_id,
     symbol: trade.symbol,
-    entry_price: 0,
-    size: 0,
+    entry_price: 0, size: 0,
     quote_size: trade.quote_size,
     entry_fees_usd: 0,
     rsi_at_entry: trade.rsi_at_entry,
@@ -118,7 +152,6 @@ export async function insertPendingTrade(trade: {
   return rows[0].id;
 }
 
-/** Upgrade a pending trade to open once the fill is confirmed */
 export async function confirmTrade(id: string, fill: {
   entry_price: number; size: number; quote_size: number;
   entry_fees_usd: number; coinbase_order_id: string; notes: string;
@@ -126,18 +159,15 @@ export async function confirmTrade(id: string, fill: {
   await rest("PATCH", `/trades?id=eq.${id}`, { ...fill, status: "open" });
 }
 
-/** Delete a trade row (used to clean up failed pending rows) */
 export async function deleteTrade(id: string): Promise<void> {
   await rest("DELETE", `/trades?id=eq.${id}`, undefined);
 }
 
-/** Load any pending trades across all users (for startup reconciliation) */
 export async function loadPendingTrades(): Promise<Array<{ id: string; user_id: string; symbol: string; coinbase_order_id: string | null }>> {
   const rows = await rest("GET", "/trades?status=eq.pending&select=id,user_id,symbol,coinbase_order_id");
   return rows ?? [];
 }
 
-/** Close an existing trade */
 export async function closeTrade(id: string, update: {
   exit_price: number; exit_fees_usd: number;
   pnl_usd: number; pnl_pct: number; effective_pnl: number;
@@ -150,12 +180,10 @@ export async function closeTrade(id: string, update: {
   });
 }
 
-/** Update trailing_high on an open trade */
 export async function updateTrailingHigh(id: string, trailingHigh: number): Promise<void> {
   await rest("PATCH", `/trades?id=eq.${id}`, { trailing_high: trailingHigh });
 }
 
-/** Append a row to tick_log */
 export async function logTick(userId: string, symbol: string, rsi: number, price: number, action: string, reason: string): Promise<void> {
   await rest("POST", "/tick_log", { user_id: userId, symbol, rsi, price, action, reason });
 }

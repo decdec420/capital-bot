@@ -1,18 +1,16 @@
 // ============================================================
-// signal-tick — the bot's core trading loop
+// signal-tick — fallback trading loop (Edge Function)
 // ============================================================
-// Logic (no AI involved):
-//   1. Fetch last 30 hourly BTC-USD candles from Coinbase
-//   2. Compute RSI(14) on close prices
-//   3. No open position + RSI < buy_threshold  → BUY
-//   4. Open position  + RSI > sell_threshold   → SELL
-//   5. Otherwise                               → hold, log, exit
+// NOTE: The Fly.io WebSocket worker (worker/src/worker.ts) is the
+// primary trade executor. This function is NOT scheduled via pg_cron.
+// It exists as a manual trigger / fallback only.
 //
-// Called two ways:
-//   A. pg_cron every 5 min with SIGNAL_TICK_CRON_TOKEN
-//      → processes ALL enabled users in sequence
-//   B. User pressing "Run now" in dashboard with their JWT
-//      → processes only that user
+// Logic:
+//   1. Fetch last 100 5-min candles, compute RSI(14)
+//   2. No open position + RSI < buy_threshold → risk gates → BUY
+//   3. Open position  + RSI > sell_threshold   → SELL
+//   4. Open position  + stop/trail/TP hit      → SELL
+//   5. Otherwise                               → hold, log, exit
 //
 // Fail-safe: if the broker call throws, we write nothing to the
 // trades table. No ghost trades.
@@ -45,7 +43,12 @@ interface Settings {
   live_trading: boolean;
   stop_loss_pct: number;      // e.g. 5 = close if down 5% from entry
   take_profit_pct: number;    // e.g. 10 = close if up 10% from entry
-  trailing_stop_pct: number;  // e.g. 3 = close if price drops 3% from its peak
+  trailing_stop_pct: number;
+  // Entry risk gates (0 = disabled)
+  daily_loss_limit_usd: number;
+  max_drawdown_pct: number;
+  max_spread_pct: number;
+  max_volatility_pct: number;
 }
 
 /**
@@ -69,7 +72,7 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
   price: number;
   reason: string;
 }> {
-  const { user_id, symbol, buy_amount_usd, entry_score_threshold, rsi_buy_threshold, rsi_sell_threshold, live_trading, stop_loss_pct, take_profit_pct, trailing_stop_pct } = settings;
+  const { user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, stop_loss_pct, take_profit_pct, trailing_stop_pct, daily_loss_limit_usd, max_volatility_pct } = settings;
 
   // 1. Fetch candles + compute RSI
   // 5-minute candles, 100 periods = ~8 hours of data for solid RSI warmup.
@@ -170,6 +173,36 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
 
   // ── BUY ──────────────────────────────────────────────────
   if (hasBuySignal && !openTrade) {
+
+    // ── Entry risk gates ──────────────────────────────────────
+    const latestCandle = candles[candles.length - 1];
+
+    if (max_volatility_pct > 0 && latestCandle) {
+      const mid = (latestCandle.high + latestCandle.low) / 2;
+      const volPct = mid > 0 ? ((latestCandle.high - latestCandle.low) / mid) * 100 : Infinity;
+      if (volPct > max_volatility_pct) {
+        const reason = `RISK_BLOCKED: high_volatility_spike:${volPct.toFixed(2)}pct>${max_volatility_pct}pct`;
+        log("warn", "risk_blocked", { fn: FN, user_id, symbol, reason });
+        await logTick(admin, user_id, symbol, rsiValue, currentPrice, "RISK_BLOCKED", reason);
+        return { action: "RISK_BLOCKED", rsi: rsiValue, price: currentPrice, reason };
+      }
+    }
+
+    if (daily_loss_limit_usd > 0) {
+      const startOfDay = new Date(); startOfDay.setUTCHours(0, 0, 0, 0);
+      const { data: todayTrades } = await admin
+        .from("trades").select("effective_pnl")
+        .eq("user_id", user_id).eq("status", "closed")
+        .gte("closed_at", startOfDay.toISOString());
+      const dailyPnl = (todayTrades ?? []).reduce((s: number, r: { effective_pnl: number }) => s + Number(r.effective_pnl ?? 0), 0);
+      if (dailyPnl <= -daily_loss_limit_usd) {
+        const reason = `RISK_BLOCKED: daily_loss_limit:${dailyPnl.toFixed(2)}<=-${daily_loss_limit_usd}`;
+        log("warn", "risk_blocked", { fn: FN, user_id, symbol, reason });
+        await logTick(admin, user_id, symbol, rsiValue, currentPrice, "RISK_BLOCKED", reason);
+        return { action: "RISK_BLOCKED", rsi: rsiValue, price: currentPrice, reason };
+      }
+    }
+
     log("info", "buy_signal", { fn: FN, user_id, symbol, rsi: rsiValue.toFixed(2), amount: buy_amount_usd, live: live_trading });
 
     if (!live_trading) {
@@ -302,7 +335,7 @@ Deno.serve(async (req) => {
     if (CRON_TOKEN && bearer === CRON_TOKEN) {
       const { data: allSettings, error } = await admin
         .from("settings")
-        .select("user_id, symbol, buy_amount_usd, entry_score_threshold, rsi_buy_threshold, rsi_sell_threshold, live_trading, stop_loss_pct, take_profit_pct, trailing_stop_pct")
+        .select("user_id, symbol, buy_amount_usd, entry_score_threshold, rsi_buy_threshold, rsi_sell_threshold, live_trading, stop_loss_pct, take_profit_pct, trailing_stop_pct, daily_loss_limit_usd, max_drawdown_pct, max_spread_pct, max_volatility_pct")
         .eq("enabled", true);
 
       if (error) return json({ ok: false, error: error.message }, 500, cors);
@@ -334,7 +367,7 @@ Deno.serve(async (req) => {
 
     const { data: settings, error: settingsErr } = await admin
       .from("settings")
-      .select("user_id, symbol, buy_amount_usd, entry_score_threshold, rsi_buy_threshold, rsi_sell_threshold, live_trading, enabled, stop_loss_pct, take_profit_pct, trailing_stop_pct")
+      .select("user_id, symbol, buy_amount_usd, entry_score_threshold, rsi_buy_threshold, rsi_sell_threshold, live_trading, enabled, stop_loss_pct, take_profit_pct, trailing_stop_pct, daily_loss_limit_usd, max_drawdown_pct, max_spread_pct, max_volatility_pct")
       .eq("user_id", user.id)
       .maybeSingle();
 

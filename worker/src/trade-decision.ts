@@ -31,7 +31,12 @@ export interface TradeDecision {
 const RSI_PERIOD = 14;
 const EMA_SHORT_PERIOD = 50;
 const EMA_LONG_PERIOD = 200;
-const MIN_TRADE_SCORE = 5;
+// MAX_INTERNAL_SCORE ≈ 12 (RSI+EMA+volume+support factors).
+// entry_score_threshold (0-100 UI) maps to this scale.
+const MAX_INTERNAL_SCORE = 12;
+function minTradeScore(settings: Settings): number {
+  return Math.max(1, Math.round((settings.entry_score_threshold / 100) * MAX_INTERNAL_SCORE));
+}
 
 function average(values: number[]): number {
   if (values.length === 0) return 0;
@@ -180,9 +185,9 @@ export function evaluateTradeDecision(input: TradeDecisionInput): TradeDecision 
     state = "IN_POSITION";
   } else if (riskBlocked && oversoldTrigger) {
     state = "RISK_BLOCKED";
-  } else if (!riskBlocked && oversoldTrigger && score >= MIN_TRADE_SCORE) {
+  } else if (!riskBlocked && oversoldTrigger && score >= minTradeScore(settings)) {
     state = "TRADE_ALLOWED";
-  } else if (oversoldTrigger || score >= MIN_TRADE_SCORE - 1) {
+  } else if (oversoldTrigger || score >= minTradeScore(settings) - 1) {
     state = "ENTRY_CANDIDATE";
   } else if (lastRsi <= settings.rsi_buy_threshold + 5 || score >= 2) {
     state = "SETUP_FORMING";
@@ -200,7 +205,7 @@ export function evaluateTradeDecision(input: TradeDecisionInput): TradeDecision 
   } else if (!oversoldTrigger) {
     nextTrigger = `RSI below ${settings.rsi_buy_threshold}`;
   } else {
-    nextTrigger = `score at least ${MIN_TRADE_SCORE} (currently ${score})`;
+    nextTrigger = `score at least ${minTradeScore(settings)} (quality ${settings.entry_score_threshold}%) (currently ${score})`;
   }
 
   return { state, score, riskBlocked, reasons, blockers, nextTrigger };

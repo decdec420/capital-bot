@@ -82,3 +82,20 @@ export function volumeFilterPass(recentCandles: Candle[]): boolean {
   const median = vols.length % 2 === 0 ? (vols[mid - 1] + vols[mid]) / 2 : vols[mid];
   return recentCandles[recentCandles.length - 1].volume >= median * 0.5;
 }
+
+/** Full Wilder-smoothed RSI series — one value per close from index `period` onward. Used to seed rsiHistory at warmup. */
+export function computeRsiSeries(closes: number[], period = 14): number[] {
+  if (closes.length < period + 1) return [];
+  const series: number[] = [];
+  let avgG = 0, avgL = 0;
+  for (let i = 1; i <= period; i++) { const d = closes[i] - closes[i-1]; if (d >= 0) avgG += d; else avgL -= d; }
+  avgG /= period; avgL /= period;
+  series.push(avgL === 0 ? 100 : 100 - 100 / (1 + avgG / avgL));
+  for (let i = period + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i-1];
+    avgG = (avgG * (period-1) + (d > 0 ? d : 0)) / period;
+    avgL = (avgL * (period-1) + (d < 0 ? -d : 0)) / period;
+    series.push(avgL === 0 ? 100 : 100 - 100 / (1 + avgG / avgL));
+  }
+  return series;
+}
