@@ -17,7 +17,8 @@ import { CandleBuilder, computeRsi, volumeFilterPass, type Candle } from "./indi
 import { fetchHistoricalCandles, placeMarketBuy, placeMarketSell, probeAuth, type Credentials } from "./broker.ts";
 import {
   loadAllSettings, loadOpenTrade, getCoinbaseCredentials,
-  insertTrade, closeTrade, updateTrailingHigh, logTick,
+  insertTrade, insertPendingTrade, confirmTrade, deleteTrade,
+  loadPendingTrades, closeTrade, updateTrailingHigh, logTick,
   type Settings, type OpenTrade,
 } from "./supabase.ts";
 import { sendTelegram, fmtBuy, fmtSell } from "./telegram.ts";
@@ -25,7 +26,7 @@ import { normalizePrivateKey } from "./coinbase-auth.ts";
 
 const RSI_PERIOD        = 14;
 const WARMUP_CANDLES    = 100;
-const SETTINGS_REFRESH  = 60_000; // ms
+const SETTINGS_REFRESH  = 15_000; // ms — reduced from 60s to limit disable-lag
 
 // ── Per-symbol shared state ─────────────────────────────────
 
@@ -198,6 +199,10 @@ async function checkRiskExits(userId: string, state: UserState, price: number, r
 
 async function checkSignals(userId: string, state: UserState, symState: SymbolState, closedCandle: Candle): Promise<void> {
   const { settings, openTrade } = state;
+
+  // Respect the enabled flag — settings refresh every 15s so lag is minimal
+  if (!settings.enabled) return;
+
   const { lastRsi, currentPrice, recentCandles } = symState;
 
   const volOk = volumeFilterPass(recentCandles);
@@ -226,15 +231,30 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
         await logTick(userId, settings.symbol, lastRsi, currentPrice, "buy", `PAPER BUY — RSI ${lastRsi.toFixed(1)}`);
       } else {
         if (!state.credentials) throw new Error("live mode but no credentials");
-        const fill = await placeMarketBuy(state.credentials, settings.symbol, settings.buy_amount_usd.toFixed(2), crypto.randomUUID());
-        const id = await insertTrade({
+        // ── Idempotency: write pending row BEFORE placing order ──
+        // If the worker crashes after fill but before DB write, this row
+        // survives and is flagged on next startup for manual reconciliation.
+        const clientOrderId = crypto.randomUUID();
+        const pendingId = await insertPendingTrade({
           user_id: userId, symbol: settings.symbol,
+          quote_size: settings.buy_amount_usd,
+          rsi_at_entry: lastRsi, client_order_id: clientOrderId,
+        });
+        let fill;
+        try {
+          fill = await placeMarketBuy(state.credentials, settings.symbol, settings.buy_amount_usd.toFixed(2), clientOrderId);
+        } catch (e) {
+          // Order failed — clean up the pending row so it doesn't linger
+          await deleteTrade(pendingId).catch(console.error);
+          throw e;
+        }
+        await confirmTrade(pendingId, {
           entry_price: fill.fillPrice, size: fill.filledBaseSize,
           quote_size: fill.filledQuoteSize, entry_fees_usd: fill.feesUsd,
-          rsi_at_entry: lastRsi, coinbase_order_id: fill.orderId,
+          coinbase_order_id: fill.orderId,
           notes: `LIVE BUY — RSI ${lastRsi.toFixed(1)} filled @ $${fill.fillPrice.toFixed(2)}`,
         });
-        state.openTrade = { id, entry_price: fill.fillPrice, size: fill.filledBaseSize, quote_size: fill.filledQuoteSize, entry_fees_usd: fill.feesUsd, trailing_high: null, rsi_at_entry: lastRsi };
+        state.openTrade = { id: pendingId, entry_price: fill.fillPrice, size: fill.filledBaseSize, quote_size: fill.filledQuoteSize, entry_fees_usd: fill.feesUsd, trailing_high: null, rsi_at_entry: lastRsi };
         await sendTelegram(fmtBuy(settings.symbol, lastRsi, fill.fillPrice, fill.filledBaseSize, fill.filledQuoteSize, true));
         await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "buy", `LIVE BUY filled @ $${fill.fillPrice.toFixed(2)}`);
       }
@@ -333,6 +353,27 @@ async function onTrade(symbol: string, price: number, size: number): Promise<voi
   }
 }
 
+// ── Startup: reconcile any pending trades from a previous crash ───────────
+
+async function reconcilePendingTrades(): Promise<void> {
+  try {
+    const pending = await loadPendingTrades();
+    if (pending.length === 0) return;
+    for (const row of pending) {
+      console.warn(`[reconcile] Found pending trade ${row.id} (${row.symbol}, clientOrderId=${row.coinbase_order_id}) — worker may have crashed mid-buy. Deleting and alerting.`);
+      await deleteTrade(row.id).catch(console.error);
+      await sendTelegram(
+        `⚠️ capital-bot restarted with an unconfirmed trade row.\n` +
+        `Symbol: ${row.symbol}\nRow ID: ${row.id.slice(0, 8)}\n` +
+        `clientOrderId: ${row.coinbase_order_id ?? "unknown"}\n` +
+        `Check Coinbase for an orphaned order and close manually if needed.`
+      ).catch(console.error);
+    }
+  } catch (e) {
+    console.error("[reconcile] failed:", e instanceof Error ? e.message : String(e));
+  }
+}
+
 // ── HTTP health server ─────────────────────────────────────
 
 function startHealthServer() {
@@ -355,6 +396,9 @@ function startHealthServer() {
 async function main() {
   console.log("=== capital-bot worker starting ===");
   startHealthServer();
+
+  // Reconcile any pending trades left over from a previous crash
+  await reconcilePendingTrades();
 
   // Load initial settings
   await reloadSettings();

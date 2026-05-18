@@ -56,13 +56,7 @@ export class CandleBuilder {
 export function computeRsi(closes: number[], period = 14): number {
   if (closes.length < period + 1) return 50;
 
-  let gains = 0, losses = 0;
-  for (let i = closes.length - period; i < closes.length; i++) {
-    const d = closes[i] - closes[i - 1];
-    if (d >= 0) gains += d; else losses -= d;
-  }
-  // Use last `period` bars to init, then Wilder-smooth from there
-  // For accuracy with larger buffers, walk the full array
+  // Seed with simple average of first `period` moves, then Wilder-smooth the rest.
   let avgG = 0, avgL = 0;
   for (let i = 1; i <= period; i++) {
     const d = closes[i] - closes[i - 1];

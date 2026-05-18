@@ -84,7 +84,7 @@ export async function getCoinbaseCredentials(userId: string): Promise<{ apiKeyNa
   return { apiKeyName: row.api_key_name, privateKey: row.api_key_private_pem };
 }
 
-/** Open a new trade record */
+/** Open a new trade record (status = "open") */
 export async function insertTrade(trade: {
   user_id: string; symbol: string; entry_price: number;
   size: number; quote_size: number; entry_fees_usd: number;
@@ -92,6 +92,49 @@ export async function insertTrade(trade: {
 }): Promise<string> {
   const rows = await rest("POST", "/trades", { ...trade, status: "open" });
   return rows[0].id;
+}
+
+/**
+ * Insert a placeholder row BEFORE placing the order.
+ * If the worker crashes between order placement and the DB write,
+ * this row survives and is reconciled on next startup.
+ */
+export async function insertPendingTrade(trade: {
+  user_id: string; symbol: string; quote_size: number;
+  rsi_at_entry: number; client_order_id: string;
+}): Promise<string> {
+  const rows = await rest("POST", "/trades", {
+    user_id: trade.user_id,
+    symbol: trade.symbol,
+    entry_price: 0,
+    size: 0,
+    quote_size: trade.quote_size,
+    entry_fees_usd: 0,
+    rsi_at_entry: trade.rsi_at_entry,
+    coinbase_order_id: trade.client_order_id,
+    notes: `PENDING — clientOrderId ${trade.client_order_id}`,
+    status: "pending",
+  });
+  return rows[0].id;
+}
+
+/** Upgrade a pending trade to open once the fill is confirmed */
+export async function confirmTrade(id: string, fill: {
+  entry_price: number; size: number; quote_size: number;
+  entry_fees_usd: number; coinbase_order_id: string; notes: string;
+}): Promise<void> {
+  await rest("PATCH", `/trades?id=eq.${id}`, { ...fill, status: "open" });
+}
+
+/** Delete a trade row (used to clean up failed pending rows) */
+export async function deleteTrade(id: string): Promise<void> {
+  await rest("DELETE", `/trades?id=eq.${id}`, undefined);
+}
+
+/** Load any pending trades across all users (for startup reconciliation) */
+export async function loadPendingTrades(): Promise<Array<{ id: string; user_id: string; symbol: string; coinbase_order_id: string | null }>> {
+  const rows = await rest("GET", "/trades?status=eq.pending&select=id,user_id,symbol,coinbase_order_id");
+  return rows ?? [];
 }
 
 /** Close an existing trade */
