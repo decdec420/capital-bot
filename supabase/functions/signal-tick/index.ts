@@ -39,6 +39,7 @@ interface Settings {
   user_id: string;
   symbol: string;
   buy_amount_usd: number;
+  entry_score_threshold: number;
   rsi_buy_threshold: number;
   rsi_sell_threshold: number;
   live_trading: boolean;
@@ -68,7 +69,7 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
   price: number;
   reason: string;
 }> {
-  const { user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, stop_loss_pct, take_profit_pct, trailing_stop_pct } = settings;
+  const { user_id, symbol, buy_amount_usd, entry_score_threshold, rsi_buy_threshold, rsi_sell_threshold, live_trading, stop_loss_pct, take_profit_pct, trailing_stop_pct } = settings;
 
   // 1. Fetch candles + compute RSI
   // 5-minute candles, 100 periods = ~8 hours of data for solid RSI warmup.
@@ -78,7 +79,7 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
   const rsiValue = currentRsi(candles, 14);
   const currentPrice = candles[candles.length - 1].close;
 
-  log("info", "tick_rsi", { fn: FN, user_id, symbol, rsi: rsiValue.toFixed(2), price: currentPrice });
+  log("info", "tick_rsi", { fn: FN, user_id, symbol, rsi: rsiValue.toFixed(2), price: currentPrice, entry_score_threshold });
 
   // 2. Check for open position
   const { data: openTrade, error: tradeErr } = await admin
@@ -301,7 +302,7 @@ Deno.serve(async (req) => {
     if (CRON_TOKEN && bearer === CRON_TOKEN) {
       const { data: allSettings, error } = await admin
         .from("settings")
-        .select("user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, stop_loss_pct, take_profit_pct, trailing_stop_pct")
+        .select("user_id, symbol, buy_amount_usd, entry_score_threshold, rsi_buy_threshold, rsi_sell_threshold, live_trading, stop_loss_pct, take_profit_pct, trailing_stop_pct")
         .eq("enabled", true);
 
       if (error) return json({ ok: false, error: error.message }, 500, cors);
@@ -333,7 +334,7 @@ Deno.serve(async (req) => {
 
     const { data: settings, error: settingsErr } = await admin
       .from("settings")
-      .select("user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, enabled, stop_loss_pct, take_profit_pct, trailing_stop_pct")
+      .select("user_id, symbol, buy_amount_usd, entry_score_threshold, rsi_buy_threshold, rsi_sell_threshold, live_trading, enabled, stop_loss_pct, take_profit_pct, trailing_stop_pct")
       .eq("user_id", user.id)
       .maybeSingle();
 

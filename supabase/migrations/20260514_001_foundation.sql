@@ -19,6 +19,8 @@ create table if not exists public.settings (
   symbol              text not null default 'BTC-USD',
   buy_amount_usd      numeric(10,2) not null default 10.00
                         check (buy_amount_usd >= 1.00),
+  entry_score_threshold numeric(5,2) not null default 65.0
+                        check (entry_score_threshold between 0 and 100),
   rsi_buy_threshold   numeric(5,2) not null default 30.0
                         check (rsi_buy_threshold between 1 and 49),
   rsi_sell_threshold  numeric(5,2) not null default 70.0
