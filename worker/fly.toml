@@ -7,7 +7,7 @@ app = 'capital-bot-worker-black-moonrise-2383'
 primary_region = 'iad'
 
 [build]
-  dockerfile = 'Dockerfile'
+  dockerfile = 'worker/Dockerfile'
 
 [env]
   PORT = '8080'
