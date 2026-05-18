@@ -19,18 +19,67 @@
 // ============================================================
 
 import { getBrokerCredentials, placeMarketBuy, placeMarketSell } from "../_shared/broker.ts";
-import { fetchCandles, currentRsi } from "../_shared/indicators.ts";
+import { fetchCandles, rsi } from "../_shared/indicators.ts";
 import { corsHeaders, makeCorsHeaders } from "../_shared/cors.ts";
 import { log } from "../_shared/logger.ts";
 import { sendTelegram, fmtBuy, fmtSell } from "../_shared/telegram.ts";
 
 const FN = "signal-tick";
+const RSI_HISTORY_LIMIT = 50;
 
 function json(body: unknown, status = 200, cors: Record<string, string> = corsHeaders) {
   return new Response(JSON.stringify(body), {
     status,
     headers: { ...cors, "Content-Type": "application/json" },
   });
+}
+
+
+interface RsiDecision {
+  buySignal: boolean;
+  sellSignal: boolean;
+  recentOversoldDip: boolean;
+  recoveringFromRecentLow: boolean;
+  rsiRisingAcrossRecentCandles: boolean;
+  rsiFallingFast: boolean;
+}
+
+function evaluateRsiDecision(rsiHistory: number[], buyThreshold: number, sellThreshold: number): RsiDecision {
+  const recent = rsiHistory.slice(-6);
+  const last = recent[recent.length - 1] ?? 50;
+  const previous = recent[recent.length - 2] ?? last;
+  const recentLow = recent.length > 0 ? Math.min(...recent) : last;
+  const threeAgo = recent[recent.length - 4] ?? recent[0] ?? last;
+  const risingWindow = recent.slice(-3);
+
+  const recentOversoldDip = recentLow <= buyThreshold;
+  const recoveringFromRecentLow = last > previous && last >= recentLow + 2;
+  const rsiRisingAcrossRecentCandles = risingWindow.length >= 3 && risingWindow.every((value, i, values) => i === 0 || value > values[i - 1]);
+  const rsiFallingFast = recent.length >= 4 && threeAgo - last >= 8;
+
+  return {
+    buySignal: last < buyThreshold || (recentOversoldDip && recoveringFromRecentLow && rsiRisingAcrossRecentCandles),
+    sellSignal: last > sellThreshold || rsiFallingFast,
+    recentOversoldDip,
+    recoveringFromRecentLow,
+    rsiRisingAcrossRecentCandles,
+    rsiFallingFast,
+  };
+}
+
+function describeBuyDecision(decision: RsiDecision, rsiValue: number, buyThreshold: number): string {
+  if (rsiValue < buyThreshold) return `RSI ${rsiValue.toFixed(1)} < ${buyThreshold}`;
+  const flags = [
+    decision.recentOversoldDip && "recent oversold dip",
+    decision.recoveringFromRecentLow && "recovering from low",
+    decision.rsiRisingAcrossRecentCandles && "rising RSI",
+  ].filter(Boolean).join(", ");
+  return `RSI rebound (${flags})`;
+}
+
+function describeSellDecision(decision: RsiDecision, rsiValue: number, sellThreshold: number): string {
+  if (rsiValue > sellThreshold) return `RSI ${rsiValue.toFixed(1)} > ${sellThreshold}`;
+  return "RSI falling fast";
 }
 
 // ── Per-user tick logic ───────────────────────────────────────
@@ -75,7 +124,8 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
   // Each cron tick (every 5 min) closes a fresh candle → RSI reacts to every move.
   const creds = await getBrokerCredentials(admin, user_id);
   const candles = await fetchCandles(creds, symbol, 100, "FIVE_MINUTE");
-  const rsiValue = currentRsi(candles, 14);
+  const rsiHistory = rsi(candles.map((c) => c.close), 14).slice(-RSI_HISTORY_LIMIT);
+  const rsiValue = rsiHistory[rsiHistory.length - 1] ?? 50;
   const currentPrice = candles[candles.length - 1].close;
 
   log("info", "tick_rsi", { fn: FN, user_id, symbol, rsi: rsiValue.toFixed(2), price: currentPrice });
@@ -164,12 +214,15 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
   }
 
   // 3. Decision
-  const hasBuySignal  = rsiValue < rsi_buy_threshold;
-  const hasSellSignal = rsiValue > rsi_sell_threshold;
+  const decision = evaluateRsiDecision(rsiHistory, rsi_buy_threshold, rsi_sell_threshold);
+  const hasBuySignal  = decision.buySignal;
+  const hasSellSignal = decision.sellSignal;
+  const buyReason = describeBuyDecision(decision, rsiValue, rsi_buy_threshold);
+  const sellReason = describeSellDecision(decision, rsiValue, rsi_sell_threshold);
 
   // ── BUY ──────────────────────────────────────────────────
   if (hasBuySignal && !openTrade) {
-    log("info", "buy_signal", { fn: FN, user_id, symbol, rsi: rsiValue.toFixed(2), amount: buy_amount_usd, live: live_trading });
+    log("info", "buy_signal", { fn: FN, user_id, symbol, rsi: rsiValue.toFixed(2), amount: buy_amount_usd, live: live_trading, recentOversoldDip: decision.recentOversoldDip, recoveringFromRecentLow: decision.recoveringFromRecentLow, rsiRisingAcrossRecentCandles: decision.rsiRisingAcrossRecentCandles });
 
     if (!live_trading) {
       // Paper mode: simulate the buy, record at current price
@@ -183,10 +236,10 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
         entry_fees_usd: 0,
         status: "open",
         rsi_at_entry: rsiValue,
-        notes: `[PAPER] RSI ${rsiValue.toFixed(1)} < ${rsi_buy_threshold}`,
+        notes: `[PAPER] ${buyReason}`,
       });
       await sendTelegram(fmtBuy(symbol, rsiValue, currentPrice, simulatedSize, buy_amount_usd, false));
-      await logTick(admin, user_id, symbol, rsiValue, currentPrice, "buy", `PAPER BUY — RSI ${rsiValue.toFixed(1)}`);
+      await logTick(admin, user_id, symbol, rsiValue, currentPrice, "buy", `PAPER BUY — ${buyReason}`);
       return { action: "buy", rsi: rsiValue, price: currentPrice, reason: "PAPER BUY" };
     }
 
@@ -204,7 +257,7 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
       status: "open",
       coinbase_order_id: fill.orderId,
       rsi_at_entry: rsiValue,
-      notes: `LIVE BUY — RSI ${rsiValue.toFixed(1)} < ${rsi_buy_threshold} — filled @ $${fill.fillPrice.toFixed(2)}`,
+      notes: `LIVE BUY — ${buyReason} — filled @ $${fill.fillPrice.toFixed(2)}`,
     });
 
     log("info", "buy_filled", { fn: FN, user_id, symbol, fillPrice: fill.fillPrice, size: fill.filledBaseSize, fees: fill.feesUsd });
@@ -215,7 +268,7 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
 
   // ── SELL ─────────────────────────────────────────────────
   if (hasSellSignal && openTrade) {
-    log("info", "sell_signal", { fn: FN, user_id, symbol, rsi: rsiValue.toFixed(2), size: openTrade.size, live: live_trading });
+    log("info", "sell_signal", { fn: FN, user_id, symbol, rsi: rsiValue.toFixed(2), size: openTrade.size, live: live_trading, rsiFallingFast: decision.rsiFallingFast });
 
     const pnlGross = (currentPrice - Number(openTrade.entry_price)) * Number(openTrade.size);
 
@@ -231,7 +284,7 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
         effective_pnl: pnlGross,
         close_reason: "rsi_signal",
         closed_at: new Date().toISOString(),
-        notes: `[PAPER] Closed @ $${currentPrice.toFixed(2)} — RSI ${rsiValue.toFixed(1)} > ${rsi_sell_threshold} — P&L $${pnlGross.toFixed(2)}`,
+        notes: `[PAPER] Closed @ $${currentPrice.toFixed(2)} — ${sellReason} — P&L $${pnlGross.toFixed(2)}`,
       }).eq("id", openTrade.id);
       await sendTelegram(fmtSell(symbol, rsiValue, currentPrice, Number(openTrade.entry_price), pnlGross, pnlPct, false));
       await logTick(admin, user_id, symbol, rsiValue, currentPrice, "sell", `PAPER SELL — P&L $${pnlGross.toFixed(2)}`);
@@ -256,7 +309,7 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
       closed_at: new Date().toISOString(),
       close_order_id: fill.orderId,
       close_reason: "rsi_signal",
-      notes: `LIVE SELL — RSI ${rsiValue.toFixed(1)} > ${rsi_sell_threshold} — filled @ $${fill.fillPrice.toFixed(2)} — net P&L $${netPnl.toFixed(2)}`,
+      notes: `LIVE SELL — ${sellReason} — filled @ $${fill.fillPrice.toFixed(2)} — net P&L $${netPnl.toFixed(2)}`,
     }).eq("id", openTrade.id);
 
     log("info", "sell_filled", { fn: FN, user_id, symbol, fillPrice: fill.fillPrice, pnl: realPnl.toFixed(2), netPnl: netPnl.toFixed(2) });

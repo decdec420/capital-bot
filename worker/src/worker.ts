@@ -13,7 +13,7 @@
 // ─────────────────────────────────────────────────────────────
 
 import { CoinbaseWs } from "./coinbase-ws.ts";
-import { CandleBuilder, computeRsi, volumeFilterPass, type Candle } from "./indicators.ts";
+import { CandleBuilder, computeRsi, computeRsiSeries, volumeFilterPass, type Candle } from "./indicators.ts";
 import { fetchHistoricalCandles, placeMarketBuy, placeMarketSell, probeAuth, type Credentials } from "./broker.ts";
 import {
   loadAllSettings, loadOpenTrade, getCoinbaseCredentials,
@@ -27,12 +27,14 @@ import { normalizePrivateKey } from "./coinbase-auth.ts";
 const RSI_PERIOD        = 14;
 const WARMUP_CANDLES    = 100;
 const SETTINGS_REFRESH  = 15_000; // ms — reduced from 60s to limit disable-lag
+const RSI_HISTORY_LIMIT = 50;
 
 // ── Per-symbol shared state ─────────────────────────────────
 
 interface SymbolState {
   builder:      CandleBuilder;
   closePrices:  number[];  // rolling close history for RSI
+  rsiHistory:   number[];  // bounded recent RSI series for signal shape detection
   recentCandles: Candle[]; // last N candles for volume filter
   lastRsi:      number;
   currentPrice: number;
@@ -61,10 +63,12 @@ async function warmupSymbol(symbol: string, creds: Credentials): Promise<void> {
   try {
     const candles = await fetchHistoricalCandles(creds, symbol, WARMUP_CANDLES, "FIVE_MINUTE");
     const closePrices = candles.map((c) => c.close);
-    const lastRsi = computeRsi(closePrices, RSI_PERIOD);
+    const rsiHistory = computeRsiSeries(closePrices, RSI_PERIOD).slice(-RSI_HISTORY_LIMIT);
+    const lastRsi = rsiHistory[rsiHistory.length - 1] ?? 50;
     symbolStates.set(symbol, {
       builder: new CandleBuilder(),
       closePrices,
+      rsiHistory,
       recentCandles: candles.slice(-20),
       lastRsi,
       currentPrice: closePrices[closePrices.length - 1] ?? 0,
@@ -77,6 +81,7 @@ async function warmupSymbol(symbol: string, creds: Credentials): Promise<void> {
     symbolStates.set(symbol, {
       builder: new CandleBuilder(),
       closePrices: [],
+      rsiHistory: [],
       recentCandles: [],
       lastRsi: 50,
       currentPrice: 0,
@@ -198,15 +203,65 @@ async function checkRiskExits(userId: string, state: UserState, price: number, r
   return true;
 }
 
+// ── RSI signal shape helpers ───────────────────────────────
+
+interface RsiDecision {
+  buySignal: boolean;
+  sellSignal: boolean;
+  recentOversoldDip: boolean;
+  recoveringFromRecentLow: boolean;
+  rsiRisingAcrossRecentCandles: boolean;
+  rsiFallingFast: boolean;
+}
+
+function evaluateRsiDecision(rsiHistory: number[], buyThreshold: number, sellThreshold: number): RsiDecision {
+  const recent = rsiHistory.slice(-6);
+  const last = recent[recent.length - 1] ?? 50;
+  const previous = recent[recent.length - 2] ?? last;
+  const recentLow = recent.length > 0 ? Math.min(...recent) : last;
+  const threeAgo = recent[recent.length - 4] ?? recent[0] ?? last;
+  const risingWindow = recent.slice(-3);
+
+  const recentOversoldDip = recentLow <= buyThreshold;
+  const recoveringFromRecentLow = last > previous && last >= recentLow + 2;
+  const rsiRisingAcrossRecentCandles = risingWindow.length >= 3 && risingWindow.every((value, i, values) => i === 0 || value > values[i - 1]);
+  const rsiFallingFast = recent.length >= 4 && threeAgo - last >= 8;
+
+  return {
+    buySignal: last < buyThreshold || (recentOversoldDip && recoveringFromRecentLow && rsiRisingAcrossRecentCandles),
+    sellSignal: last > sellThreshold || rsiFallingFast,
+    recentOversoldDip,
+    recoveringFromRecentLow,
+    rsiRisingAcrossRecentCandles,
+    rsiFallingFast,
+  };
+}
+
+function describeBuyDecision(decision: RsiDecision, rsi: number, buyThreshold: number): string {
+  if (rsi < buyThreshold) return `RSI ${rsi.toFixed(1)} < ${buyThreshold}`;
+  const flags = [
+    decision.recentOversoldDip && "recent oversold dip",
+    decision.recoveringFromRecentLow && "recovering from low",
+    decision.rsiRisingAcrossRecentCandles && "rising RSI",
+  ].filter(Boolean).join(", ");
+  return `RSI rebound (${flags})`;
+}
+
+function describeSellDecision(decision: RsiDecision, rsi: number, sellThreshold: number): string {
+  if (rsi > sellThreshold) return `RSI ${rsi.toFixed(1)} > ${sellThreshold}`;
+  return "RSI falling fast";
+}
+
+
 // ── RSI signals: checked on candle close ──────────────────
 
-async function checkSignals(userId: string, state: UserState, symState: SymbolState, closedCandle: Candle): Promise<void> {
+async function checkSignals(userId: string, state: UserState, symState: SymbolState): Promise<void> {
   const { settings, openTrade } = state;
 
   // Respect the enabled flag — settings refresh every 15s so lag is minimal
   if (!settings.enabled) return;
 
-  const { lastRsi, currentPrice, recentCandles } = symState;
+  const { lastRsi, currentPrice, recentCandles, rsiHistory } = symState;
 
   const volOk = volumeFilterPass(recentCandles);
   if (!volOk) {
@@ -214,12 +269,15 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
     return;
   }
 
-  const buySignal  = lastRsi < settings.rsi_buy_threshold;
-  const sellSignal = lastRsi > settings.rsi_sell_threshold;
+  const decision = evaluateRsiDecision(rsiHistory, settings.rsi_buy_threshold, settings.rsi_sell_threshold);
+  const buySignal  = decision.buySignal;
+  const sellSignal = decision.sellSignal;
+  const buyReason = describeBuyDecision(decision, lastRsi, settings.rsi_buy_threshold);
+  const sellReason = describeSellDecision(decision, lastRsi, settings.rsi_sell_threshold);
 
   // ── BUY ─────────────────────────────────────────────────
   if (buySignal && !openTrade) {
-    console.log(`[signal] ${userId} BUY — RSI ${lastRsi.toFixed(2)} < ${settings.rsi_buy_threshold} @ $${currentPrice.toFixed(2)}`);
+    console.log(`[signal] ${userId} BUY — RSI ${lastRsi.toFixed(2)}; oversoldDip=${decision.recentOversoldDip} recovering=${decision.recoveringFromRecentLow} rising=${decision.rsiRisingAcrossRecentCandles} @ $${currentPrice.toFixed(2)}`);
     try {
       if (!settings.live_trading) {
         const size = settings.buy_amount_usd / currentPrice;
@@ -227,11 +285,11 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
           user_id: userId, symbol: settings.symbol,
           entry_price: currentPrice, size, quote_size: settings.buy_amount_usd,
           entry_fees_usd: 0, rsi_at_entry: lastRsi,
-          notes: `[PAPER] RSI ${lastRsi.toFixed(1)} < ${settings.rsi_buy_threshold}`,
+          notes: `[PAPER] ${buyReason}`,
         });
         state.openTrade = { id, entry_price: currentPrice, size, quote_size: settings.buy_amount_usd, entry_fees_usd: 0, trailing_high: null, rsi_at_entry: lastRsi };
         await sendTelegram(fmtBuy(settings.symbol, lastRsi, currentPrice, size, settings.buy_amount_usd, false));
-        await logTick(userId, settings.symbol, lastRsi, currentPrice, "buy", `PAPER BUY — RSI ${lastRsi.toFixed(1)}`);
+        await logTick(userId, settings.symbol, lastRsi, currentPrice, "buy", `PAPER BUY — ${buyReason}`);
       } else {
         if (!state.credentials) throw new Error("live mode but no credentials");
         // ── Idempotency: write pending row BEFORE placing order ──
@@ -255,11 +313,11 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
           entry_price: fill.fillPrice, size: fill.filledBaseSize,
           quote_size: fill.filledQuoteSize, entry_fees_usd: fill.feesUsd,
           coinbase_order_id: fill.orderId,
-          notes: `LIVE BUY — RSI ${lastRsi.toFixed(1)} filled @ $${fill.fillPrice.toFixed(2)}`,
+          notes: `LIVE BUY — ${buyReason} — filled @ $${fill.fillPrice.toFixed(2)}`,
         });
         state.openTrade = { id: pendingId, entry_price: fill.fillPrice, size: fill.filledBaseSize, quote_size: fill.filledQuoteSize, entry_fees_usd: fill.feesUsd, trailing_high: null, rsi_at_entry: lastRsi };
         await sendTelegram(fmtBuy(settings.symbol, lastRsi, fill.fillPrice, fill.filledBaseSize, fill.filledQuoteSize, true));
-        await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "buy", `LIVE BUY filled @ $${fill.fillPrice.toFixed(2)}`);
+        await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "buy", `LIVE BUY — ${buyReason} — filled @ $${fill.fillPrice.toFixed(2)}`);
       }
     } catch (e) {
       console.error(`[signal] buy failed for ${userId}:`, e instanceof Error ? e.message : String(e));
@@ -269,7 +327,7 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
 
   // ── SELL (RSI signal) ───────────────────────────────────
   if (sellSignal && openTrade) {
-    console.log(`[signal] ${userId} SELL — RSI ${lastRsi.toFixed(2)} > ${settings.rsi_sell_threshold} @ $${currentPrice.toFixed(2)}`);
+    console.log(`[signal] ${userId} SELL — RSI ${lastRsi.toFixed(2)}; threshold=${lastRsi > settings.rsi_sell_threshold} fallingFast=${decision.rsiFallingFast} @ $${currentPrice.toFixed(2)}`);
     try {
       const entry  = openTrade.entry_price;
       const pnlPct = ((currentPrice - entry) / entry) * 100;
@@ -278,7 +336,7 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
         await closeTrade(openTrade.id, {
           exit_price: currentPrice, exit_fees_usd: 0, pnl_usd: pnl, pnl_pct: pnlPct,
           effective_pnl: pnl, close_reason: "rsi_signal",
-          notes: `[PAPER] RSI ${lastRsi.toFixed(1)} > ${settings.rsi_sell_threshold} @ $${currentPrice.toFixed(2)} — P&L $${pnl.toFixed(2)}`,
+          notes: `[PAPER] ${sellReason} @ $${currentPrice.toFixed(2)} — P&L $${pnl.toFixed(2)}`,
         });
         await sendTelegram(fmtSell(settings.symbol, lastRsi, currentPrice, entry, (currentPrice - entry) * openTrade.size, pnlPct, false));
         await logTick(userId, settings.symbol, lastRsi, currentPrice, "sell", `PAPER SELL — P&L $${((currentPrice - entry) * openTrade.size).toFixed(2)}`);
@@ -292,7 +350,7 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
           exit_price: fill.fillPrice, exit_fees_usd: fill.feesUsd,
           pnl_usd: realPnl, pnl_pct: realPnlPct, effective_pnl: netPnl,
           close_reason: "rsi_signal", close_order_id: fill.orderId,
-          notes: `LIVE SELL — RSI ${lastRsi.toFixed(1)} — filled $${fill.fillPrice.toFixed(2)} — net $${netPnl.toFixed(2)}`,
+          notes: `LIVE SELL — ${sellReason} — filled $${fill.fillPrice.toFixed(2)} — net $${netPnl.toFixed(2)}`,
         });
         await sendTelegram(fmtSell(settings.symbol, lastRsi, fill.fillPrice, entry, realPnl, realPnlPct, true));
         await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "sell", `LIVE SELL filled @ $${fill.fillPrice.toFixed(2)}`);
@@ -341,6 +399,8 @@ async function onTrade(symbol: string, price: number, size: number): Promise<voi
     symState.recentCandles.push(closedCandle);
     if (symState.recentCandles.length > 20) symState.recentCandles.shift();
     symState.lastRsi = computeRsi(symState.closePrices, RSI_PERIOD);
+    symState.rsiHistory.push(symState.lastRsi);
+    if (symState.rsiHistory.length > RSI_HISTORY_LIMIT) symState.rsiHistory.shift();
 
     console.log(`[candle] ${symbol} close=$${closedCandle.close.toFixed(2)} RSI=${symState.lastRsi.toFixed(2)} vol=${closedCandle.volume.toFixed(4)}`);
 
@@ -349,7 +409,7 @@ async function onTrade(symbol: string, price: number, size: number): Promise<voi
       if (userInFlight.has(userId)) continue; // risk exit in progress, skip this candle signal
       userInFlight.add(userId);
       try {
-        await checkSignals(userId, userState, symState, closedCandle);
+        await checkSignals(userId, userState, symState);
       } finally {
         userInFlight.delete(userId);
       }
@@ -448,7 +508,7 @@ async function main() {
       await probeAuth(creds); // verify JWT signing works for order placement
     } else {
       console.warn(`[main] no credentials available for ${symbol} warmup — starting cold`);
-      symbolStates.set(symbol, { builder: new CandleBuilder(), closePrices: [], recentCandles: [], lastRsi: 50, currentPrice: 0, lastTickMs: Date.now() });
+      symbolStates.set(symbol, { builder: new CandleBuilder(), closePrices: [], rsiHistory: [], recentCandles: [], lastRsi: 50, currentPrice: 0, lastTickMs: Date.now() });
     }
   }
 

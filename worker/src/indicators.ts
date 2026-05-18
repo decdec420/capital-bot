@@ -54,7 +54,17 @@ export class CandleBuilder {
  * Needs at least period+1 values; returns 50 (neutral) if not enough data.
  */
 export function computeRsi(closes: number[], period = 14): number {
-  if (closes.length < period + 1) return 50;
+  const series = computeRsiSeries(closes, period);
+  return series[series.length - 1] ?? 50;
+}
+
+/**
+ * Wilder-smoothed RSI series. Returns one RSI value per close.
+ * Entries before `period` are 50 (neutral) until there is enough history.
+ */
+export function computeRsiSeries(closes: number[], period = 14): number[] {
+  const out = new Array<number>(closes.length).fill(50);
+  if (closes.length < period + 1) return out;
 
   // Seed with simple average of first `period` moves, then Wilder-smooth the rest.
   let avgG = 0, avgL = 0;
@@ -63,6 +73,7 @@ export function computeRsi(closes: number[], period = 14): number {
     if (d >= 0) avgG += d; else avgL -= d;
   }
   avgG /= period; avgL /= period;
+  out[period] = avgL === 0 ? 100 : 100 - 100 / (1 + avgG / avgL);
 
   for (let i = period + 1; i < closes.length; i++) {
     const d = closes[i] - closes[i - 1];
@@ -70,8 +81,9 @@ export function computeRsi(closes: number[], period = 14): number {
     const l = d < 0 ? -d : 0;
     avgG = (avgG * (period - 1) + g) / period;
     avgL = (avgL * (period - 1) + l) / period;
+    out[i] = avgL === 0 ? 100 : 100 - 100 / (1 + avgG / avgL);
   }
-  return avgL === 0 ? 100 : 100 - 100 / (1 + avgG / avgL);
+  return out;
 }
 
 /** Volume filter: true if latest candle volume >= 50% of median */
