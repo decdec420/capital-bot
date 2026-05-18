@@ -47,6 +47,10 @@ interface UserState {
 
 const symbolStates = new Map<string, SymbolState>();
 const userStates   = new Map<string, UserState>();
+// Per-user lock: prevents concurrent signal/risk evaluation for the same user.
+// A rapid burst of ticks could otherwise cause two buys before the first
+// insertTrade() resolves and state.openTrade is updated.
+const userInFlight = new Set<string>();
 
 // ── Boot: warmup RSI from historical candles ───────────────
 
@@ -297,7 +301,13 @@ async function onTrade(symbol: string, price: number, size: number): Promise<voi
   for (const [userId, userState] of userStates) {
     if (userState.settings.symbol !== symbol) continue;
     if (!userState.openTrade) continue;
-    await checkRiskExits(userId, userState, price, symState.lastRsi);
+    if (userInFlight.has(userId)) continue; // already processing a signal for this user
+    userInFlight.add(userId);
+    try {
+      await checkRiskExits(userId, userState, price, symState.lastRsi);
+    } finally {
+      userInFlight.delete(userId);
+    }
   }
 
   // Candle closed: recompute RSI, check buy/sell for all users
@@ -312,12 +322,12 @@ async function onTrade(symbol: string, price: number, size: number): Promise<voi
 
     for (const [userId, userState] of userStates) {
       if (userState.settings.symbol !== symbol) continue;
-      // Skip risk exits on candle close — they were already checked in the tick above
-      if (!userState.openTrade) {
+      if (userInFlight.has(userId)) continue; // risk exit in progress, skip this candle signal
+      userInFlight.add(userId);
+      try {
         await checkSignals(userId, userState, symState, closedCandle);
-      } else {
-        // Check RSI sell signal (risk exits already handled per-tick)
-        await checkSignals(userId, userState, symState, closedCandle);
+      } finally {
+        userInFlight.delete(userId);
       }
     }
   }
