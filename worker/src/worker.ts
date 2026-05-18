@@ -13,7 +13,8 @@
 // ─────────────────────────────────────────────────────────────
 
 import { CoinbaseWs } from "./coinbase-ws.ts";
-import { CandleBuilder, computeRsi, volumeFilterPass, type Candle } from "./indicators.ts";
+import { CandleBuilder, computeRsi, type Candle } from "./indicators.ts";
+import { evaluateTradeDecision } from "./trade-decision.ts";
 import { fetchHistoricalCandles, placeMarketBuy, placeMarketSell, probeAuth, type Credentials } from "./broker.ts";
 import {
   loadAllSettings, loadOpenTrade, getCoinbaseCredentials,
@@ -206,20 +207,21 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
   // Respect the enabled flag — settings refresh every 15s so lag is minimal
   if (!settings.enabled) return;
 
-  const { lastRsi, currentPrice, recentCandles } = symState;
+  const { lastRsi, currentPrice, recentCandles, closePrices } = symState;
 
-  const volOk = volumeFilterPass(recentCandles);
-  if (!volOk) {
-    await logTick(userId, settings.symbol, lastRsi, currentPrice, "hold", "Volume filter — skipped");
-    return;
-  }
-
-  const buySignal  = lastRsi < settings.rsi_buy_threshold;
+  const decision = evaluateTradeDecision({
+    settings,
+    openTrade,
+    lastRsi,
+    closePrices,
+    recentCandles,
+    currentPrice,
+  });
   const sellSignal = lastRsi > settings.rsi_sell_threshold;
 
   // ── BUY ─────────────────────────────────────────────────
-  if (buySignal && !openTrade) {
-    console.log(`[signal] ${userId} BUY — RSI ${lastRsi.toFixed(2)} < ${settings.rsi_buy_threshold} @ $${currentPrice.toFixed(2)}`);
+  if (decision.state === "TRADE_ALLOWED" && !decision.riskBlocked && !openTrade) {
+    console.log(`[signal] ${userId} BUY — decision=${decision.state} score=${decision.score} reasons=${decision.reasons.join("; ")} @ $${currentPrice.toFixed(2)}`);
     try {
       if (!settings.live_trading) {
         const size = settings.buy_amount_usd / currentPrice;
@@ -307,7 +309,7 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
   // ── HOLD ────────────────────────────────────────────────
   const holdReason = openTrade
     ? `holding — RSI ${lastRsi.toFixed(1)} (sell > ${settings.rsi_sell_threshold})`
-    : `waiting — RSI ${lastRsi.toFixed(1)} (buy < ${settings.rsi_buy_threshold})`;
+    : `${decision.state.toLowerCase()} — score ${decision.score}; next: ${decision.nextTrigger}`;
   await logTick(userId, settings.symbol, lastRsi, currentPrice, "hold", holdReason);
 }
 
