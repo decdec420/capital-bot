@@ -19,7 +19,7 @@
 // ============================================================
 
 import { getBrokerCredentials, placeMarketBuy, placeMarketSell } from "../_shared/broker.ts";
-import { fetchHourlyCandles, currentRsi } from "../_shared/indicators.ts";
+import { fetchCandles, currentRsi } from "../_shared/indicators.ts";
 import { corsHeaders, makeCorsHeaders } from "../_shared/cors.ts";
 import { log } from "../_shared/logger.ts";
 import { sendTelegram, fmtBuy, fmtSell } from "../_shared/telegram.ts";
@@ -71,8 +71,10 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
   const { user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, stop_loss_pct, take_profit_pct, trailing_stop_pct } = settings;
 
   // 1. Fetch candles + compute RSI
+  // 5-minute candles, 100 periods = ~8 hours of data for solid RSI warmup.
+  // Each cron tick (every 5 min) closes a fresh candle → RSI reacts to every move.
   const creds = await getBrokerCredentials(admin, user_id);
-  const candles = await fetchHourlyCandles(creds, symbol, 30);
+  const candles = await fetchCandles(creds, symbol, 100, "FIVE_MINUTE");
   const rsiValue = currentRsi(candles, 14);
   const currentPrice = candles[candles.length - 1].close;
 

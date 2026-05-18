@@ -19,21 +19,45 @@ export interface Candle {
 
 // ── Candle fetch ─────────────────────────────────────────────
 
+// Coinbase granularity strings and their duration in seconds
+export type CandleGranularity =
+  | "ONE_MINUTE"
+  | "FIVE_MINUTE"
+  | "FIFTEEN_MINUTE"
+  | "THIRTY_MINUTE"
+  | "ONE_HOUR"
+  | "TWO_HOUR"
+  | "SIX_HOUR"
+  | "ONE_DAY";
+
+const GRANULARITY_SECONDS: Record<CandleGranularity, number> = {
+  ONE_MINUTE:    60,
+  FIVE_MINUTE:   300,
+  FIFTEEN_MINUTE: 900,
+  THIRTY_MINUTE: 1800,
+  ONE_HOUR:      3600,
+  TWO_HOUR:      7200,
+  SIX_HOUR:      21600,
+  ONE_DAY:       86400,
+};
+
 /**
- * Fetch hourly candles from Coinbase Advanced Trade API.
+ * Fetch candles from Coinbase Advanced Trade API.
+ * Defaults to FIVE_MINUTE granularity — ideal for intra-day / scalping.
  * Returns candles sorted oldest → newest.
  * Requires Coinbase JWT auth.
  */
-export async function fetchHourlyCandles(
+export async function fetchCandles(
   creds: BrokerCredentials,
   symbol: string,
-  count = 30,
+  count = 100,
+  granularity: CandleGranularity = "FIVE_MINUTE",
 ): Promise<Candle[]> {
   const now = Math.floor(Date.now() / 1000);
-  const start = now - count * 3600;
+  const start = now - count * GRANULARITY_SECONDS[granularity];
 
   const jwt = await signCoinbaseJwt(creds.apiKeyName, creds.apiKeyPrivatePem);
-  const url = `${CB_BASE}/api/v3/brokerage/products/${symbol}/candles?granularity=ONE_HOUR&start=${start}&end=${now}`;
+  const url = `${CB_BASE}/api/v3/brokerage/products/${symbol}/candles?granularity=${granularity}&start=${start}&end=${now}`;
 
   const r = await fetch(url, { headers: { Authorization: `Bearer ${jwt}` } });
   if (!r.ok) {
@@ -117,3 +141,10 @@ export function currentRsi(candles: Candle[], period = 14): number {
   const values = rsi(closes, period);
   return values[values.length - 1];
 }
+
+/** @deprecated Use fetchCandles instead */
+export const fetchHourlyCandles = (
+  creds: BrokerCredentials,
+  symbol: string,
+  count = 30,
+) => fetchCandles(creds, symbol, count, "ONE_HOUR");

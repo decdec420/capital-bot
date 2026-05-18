@@ -33,9 +33,9 @@ export default function Settings() {
   const qc = useQueryClient();
 
   const [form, setForm] = useState<BotSettings>({
-    symbol: "BTC-USD", buy_amount_usd: 10, rsi_buy_threshold: 30,
-    rsi_sell_threshold: 70, enabled: false, live_trading: false,
-    stop_loss_pct: 5, take_profit_pct: 10, trailing_stop_pct: 3,
+    symbol: "BTC-USD", buy_amount_usd: 10, rsi_buy_threshold: 40,
+    rsi_sell_threshold: 60, enabled: false, live_trading: false,
+    stop_loss_pct: 2, take_profit_pct: 5, trailing_stop_pct: 1.5,
   });
   const [apiKeyName, setApiKeyName] = useState("");
   const [privatePem, setPrivatePem] = useState("");
@@ -221,12 +221,12 @@ export default function Settings() {
               <span className="text-sm font-medium tabular-nums">{form.rsi_buy_threshold}</span>
             </div>
             <input
-              type="range" min="10" max="45" step="1"
+              type="range" min="20" max="50" step="1"
               value={form.rsi_buy_threshold}
               onChange={(e) => set("rsi_buy_threshold")(Number(e.target.value))}
               className="w-full"
             />
-            <Hint>Buy when RSI drops below this value (oversold). Default 30 is conservative.</Hint>
+            <Hint>Buy when RSI drops below this. 40 catches short dips (day trading). Lower = rarer, deeper dips only.</Hint>
           </Field>
 
           <Field>
@@ -235,12 +235,12 @@ export default function Settings() {
               <span className="text-sm font-medium tabular-nums">{form.rsi_sell_threshold}</span>
             </div>
             <input
-              type="range" min="55" max="90" step="1"
+              type="range" min="50" max="85" step="1"
               value={form.rsi_sell_threshold}
               onChange={(e) => set("rsi_sell_threshold")(Number(e.target.value))}
               className="w-full"
             />
-            <Hint>Sell when RSI rises above this value (overbought). Default 70.</Hint>
+            <Hint>Sell when RSI rises above this. 60 exits quickly at the peak (day trading). Higher = holds longer for bigger moves.</Hint>
           </Field>
 
           <Field>
@@ -249,12 +249,12 @@ export default function Settings() {
               <span className="text-sm font-medium tabular-nums">{form.stop_loss_pct === 0 ? "Off" : `${form.stop_loss_pct}%`}</span>
             </div>
             <input
-              type="range" min="0" max="20" step="0.5"
+              type="range" min="0" max="10" step="0.5"
               value={form.stop_loss_pct}
               onChange={(e) => set("stop_loss_pct")(Number(e.target.value))}
               className="w-full"
             />
-            <Hint>Close position if price drops this % below entry. 0 = disabled. Default 5%.</Hint>
+            <Hint>Hard exit if price falls this % below entry. 2% is tight for day trading — cuts losers fast. 0 = disabled.</Hint>
           </Field>
 
           <Field>
@@ -263,12 +263,12 @@ export default function Settings() {
               <span className="text-sm font-medium tabular-nums">{form.trailing_stop_pct === 0 ? "Off" : `${form.trailing_stop_pct}%`}</span>
             </div>
             <input
-              type="range" min="0" max="15" step="0.5"
+              type="range" min="0" max="10" step="0.5"
               value={form.trailing_stop_pct}
               onChange={(e) => set("trailing_stop_pct")(Number(e.target.value))}
               className="w-full"
             />
-            <Hint>Sell if price drops this % below its peak since entry. Locks in gains on the way up. Default 3%.</Hint>
+            <Hint>Sell if price drops this % from its peak since entry. 1.5% locks in gains on short moves. 0 = disabled.</Hint>
           </Field>
 
           <Field>
@@ -277,12 +277,12 @@ export default function Settings() {
               <span className="text-sm font-medium tabular-nums">{form.take_profit_pct === 0 ? "Off" : `${form.take_profit_pct}%`}</span>
             </div>
             <input
-              type="range" min="0" max="50" step="0.5"
+              type="range" min="0" max="20" step="0.5"
               value={form.take_profit_pct}
               onChange={(e) => set("take_profit_pct")(Number(e.target.value))}
               className="w-full"
             />
-            <Hint>Close position if price rises this % above entry. 0 = disabled. Default 10%.</Hint>
+            <Hint>Hard exit once up this % from entry. 5% is a solid day-trade target. 0 = disabled (rely on RSI/trailing stop).</Hint>
           </Field>
 
           <div className="pt-1">
@@ -357,7 +357,7 @@ export default function Settings() {
         </section>
 
         <div className="border-t border-border pt-6 text-xs text-muted-foreground space-y-1">
-          <p>• Bot checks RSI every 5 minutes via scheduled cron.</p>
+          <p>• Bot checks RSI on 5-minute candles every 5 minutes — each tick sees fresh data.</p>
           <p>• Only one position open at a time per account.</p>
           <p>• Paper mode simulates trades without touching real funds.</p>
           <p>• Run "Test connection" before enabling live trading.</p>
