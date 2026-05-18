@@ -43,6 +43,8 @@ interface Trade {
   notes?: string;
 }
 
+type DecisionState = "WATCHING" | "SETUP FORMING" | "ENTRY CANDIDATE" | "RISK BLOCKED";
+
 interface TickLog {
   id: string;
   symbol: string;
@@ -51,6 +53,17 @@ interface TickLog {
   action: string;
   reason?: string;
   created_at: string;
+  decision_state?: string | null;
+  decision?: string | null;
+  rsi_interpretation?: string | null;
+  trade_score?: number | string | null;
+  score?: number | string | null;
+  top_reasons?: string[] | string | null;
+  reasons?: string[] | string | null;
+  top_blockers?: string[] | string | null;
+  blockers?: string[] | string | null;
+  next_likely_trigger?: string | null;
+  next_trigger?: string | null;
 }
 
 interface BotSettings {
@@ -115,6 +128,55 @@ function fmtDuration(fromIso: string, toIso?: string | null): string {
 function fmtTime(iso?: string | null): string {
   if (!iso) return "—";
   return new Date(iso).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+}
+
+function normalizeDecisionState(value?: string | null): DecisionState | null {
+  if (!value) return null;
+  const normalized = value.trim().replace(/[\s_-]+/g, " ").toUpperCase();
+  if (normalized === "WATCHING") return "WATCHING";
+  if (normalized === "SETUP FORMING") return "SETUP FORMING";
+  if (normalized === "ENTRY CANDIDATE") return "ENTRY CANDIDATE";
+  if (normalized === "RISK BLOCKED") return "RISK BLOCKED";
+  return null;
+}
+
+function decisionPillClass(state: DecisionState): string {
+  switch (state) {
+    case "ENTRY CANDIDATE": return "pill-green";
+    case "SETUP FORMING":   return "pill-amber";
+    case "RISK BLOCKED":    return "pill-red";
+    case "WATCHING":
+    default:                 return "pill-blue";
+  }
+}
+
+function parseTickList(value?: string[] | string | null): string[] {
+  if (Array.isArray(value)) return value.map(String).filter(Boolean).slice(0, 3);
+  if (!value) return [];
+  const trimmed = value.trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return parsed.map(String).filter(Boolean).slice(0, 3);
+    } catch {
+      // Fall through to delimiter parsing.
+    }
+  }
+  return trimmed.split(/\s*(?:\n|;|\|)\s*/).map((v) => v.trim()).filter(Boolean).slice(0, 3);
+}
+
+function fmtScore(value?: number | string | null): string {
+  if (value == null || value === "") return "—";
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(Number.isInteger(n) ? 0 : 1) : String(value);
+}
+
+function interpretRSI(value: number | null): string {
+  if (value == null) return "Awaiting RSI data";
+  if (value < 30) return "Oversold range";
+  if (value > 70) return "Overbought range";
+  return "Neutral range";
 }
 
 function closeReasonLabel(r?: string): string {
@@ -509,43 +571,89 @@ function BotMark({ size = 18 }: { size?: number }) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function PositionPanel({
-  openTrade, spot, settings, currentRSI, onClose, closing,
+  openTrade, spot, settings, currentRSI, tickLogs, onClose, closing,
 }: {
   openTrade: Trade | null;
   spot: number | null;
   settings: BotSettings | undefined;
   currentRSI: number | null;
+  tickLogs: TickLog[];
   onClose: () => void;
   closing: boolean;
 }) {
   if (!openTrade) {
-    const buyT = settings?.rsi_buy_threshold ?? 25;
-    const distance = currentRSI != null ? currentRSI - buyT : null;
-    const close = distance != null && distance < 8;
+    const latestTick = tickLogs.find((t) => !settings?.symbol || t.symbol === settings.symbol) ?? tickLogs[0];
+    const persistedState = normalizeDecisionState(latestTick?.decision_state ?? latestTick?.decision);
+    const decisionState: DecisionState = persistedState ?? "WATCHING";
+    const rsiValue = latestTick?.rsi != null ? Number(latestTick.rsi) : currentRSI;
+    const rsiText = Number.isFinite(Number(rsiValue)) ? Number(rsiValue).toFixed(2) : "—";
+    const rsiInterpretation = latestTick?.rsi_interpretation ?? interpretRSI(rsiValue);
+    const tradeScore = fmtScore(latestTick?.trade_score ?? latestTick?.score);
+    const topReasons = parseTickList(latestTick?.top_reasons ?? latestTick?.reasons);
+    const topBlockers = parseTickList(latestTick?.top_blockers ?? latestTick?.blockers);
+    const nextTrigger = latestTick?.next_likely_trigger ?? latestTick?.next_trigger ?? "Awaiting backend entry evaluation";
+    const hasBackendDecision = Boolean(persistedState || latestTick?.trade_score != null || latestTick?.score != null || latestTick?.next_likely_trigger || latestTick?.next_trigger || topReasons.length || topBlockers.length);
+
+    function EmptyList({ label }: { label: string }) {
+      return <span className="dim">No {label} reported by backend</span>;
+    }
+
     return (
       <div className="t-panel" style={{ padding: 16 }}>
-        <div className="kicker" style={{ marginBottom: 12 }}>NO POSITION · WATCHING</div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 12 }}>
+          <span className="kicker">NO POSITION</span>
+          <span className={`pill ${decisionPillClass(decisionState)}`}>{decisionState}</span>
+        </div>
+
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 14 }}>
           <div style={{ width: 36, height: 36, borderRadius: 8, background: "var(--bg-2)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={close ? "var(--green)" : "var(--text-3)"} strokeWidth="2">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={decisionState === "RISK BLOCKED" ? "var(--red)" : "var(--text-3)"} strokeWidth="2">
               <circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 3" />
             </svg>
           </div>
           <div>
-            <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>Waiting for entry</div>
-            <div className="mono dim" style={{ fontSize: 11 }}>Buy on RSI &lt; {buyT}</div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>Waiting for backend decision</div>
+            <div className="mono dim" style={{ fontSize: 11 }}>Signal details come from tick status when available</div>
           </div>
         </div>
+
         <div style={{ background: "var(--bg-2)", borderRadius: 7, padding: 12 }}>
-          <div className="kicker" style={{ marginBottom: 6 }}>NEXT ACTION</div>
-          <div className="mono" style={{ fontSize: 12, lineHeight: 1.6, color: "var(--text-2)" }}>
-            <div>RSI now: <span style={{ color: close ? "var(--green)" : "var(--text)", fontWeight: 600 }}>{currentRSI?.toFixed(2) ?? "—"}</span></div>
-            <div className="dim">Trigger at RSI &lt; {buyT}</div>
-            {distance != null && (
-              <div style={{ marginTop: 4 }}>
-                Distance: <span style={{ color: close ? "var(--green)" : "var(--amber)", fontWeight: 600 }}>
-                  {distance > 0 ? "+" : ""}{distance.toFixed(2)} pts
-                </span>
+          <div className="kicker" style={{ marginBottom: 8 }}>ENTRY STATUS</div>
+          <div className="mono" style={{ fontSize: 12, lineHeight: 1.65, color: "var(--text-2)" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px 12px", marginBottom: 10 }}>
+              <div>
+                <div className="dim" style={{ fontSize: 10 }}>RSI</div>
+                <div style={{ color: "var(--text)", fontWeight: 600 }}>{rsiText}</div>
+              </div>
+              <div>
+                <div className="dim" style={{ fontSize: 10 }}>Trade score</div>
+                <div style={{ color: tradeScore === "—" ? "var(--text-3)" : "var(--text)", fontWeight: 600 }}>{tradeScore}</div>
+              </div>
+            </div>
+
+            <div style={{ marginBottom: 8 }}>
+              <span className="dim">RSI interpretation: </span>
+              <span style={{ color: "var(--text)" }}>{rsiInterpretation}</span>
+            </div>
+
+            <div style={{ marginBottom: 8 }}>
+              <div className="dim" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.05em" }}>Top reasons</div>
+              {topReasons.length ? topReasons.map((reason) => <div key={reason}>• {reason}</div>) : <EmptyList label="reasons" />}
+            </div>
+
+            <div style={{ marginBottom: 8 }}>
+              <div className="dim" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.05em" }}>Top blockers</div>
+              {topBlockers.length ? topBlockers.map((blocker) => <div key={blocker}>• {blocker}</div>) : <EmptyList label="blockers" />}
+            </div>
+
+            <div>
+              <span className="dim">Next likely trigger: </span>
+              <span style={{ color: "var(--text)" }}>{nextTrigger}</span>
+            </div>
+
+            {!hasBackendDecision && (
+              <div className="dim" style={{ marginTop: 8, fontSize: 10.5 }}>
+                Backend decision metadata is not available yet; RSI is display-only and not shown as the sole entry condition.
               </div>
             )}
           </div>
@@ -1095,6 +1203,7 @@ export default function Dashboard() {
               spot={spot}
               settings={settings}
               currentRSI={currentRSI}
+              tickLogs={tickLogs}
               onClose={() => closeTrade.mutate()}
               closing={closeTrade.isPending}
             />
