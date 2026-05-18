@@ -9,6 +9,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 interface BotSettings {
   symbol: string;
   buy_amount_usd: number;
+  entry_score_threshold: number;
   rsi_buy_threshold: number;
   rsi_sell_threshold: number;
   enabled: boolean;
@@ -17,6 +18,19 @@ interface BotSettings {
   take_profit_pct: number;
   trailing_stop_pct: number;
 }
+
+const DEFAULT_BOT_SETTINGS: BotSettings = {
+  symbol: "BTC-USD",
+  buy_amount_usd: 10,
+  entry_score_threshold: 65,
+  rsi_buy_threshold: 40,
+  rsi_sell_threshold: 60,
+  enabled: false,
+  live_trading: false,
+  stop_loss_pct: 2,
+  take_profit_pct: 5,
+  trailing_stop_pct: 1.5,
+};
 
 function Label({ children }: { children: React.ReactNode }) {
   return <label className="block text-sm font-medium mb-1">{children}</label>;
@@ -32,11 +46,7 @@ export default function Settings() {
   const { user } = useAuth();
   const qc = useQueryClient();
 
-  const [form, setForm] = useState<BotSettings>({
-    symbol: "BTC-USD", buy_amount_usd: 10, rsi_buy_threshold: 40,
-    rsi_sell_threshold: 60, enabled: false, live_trading: false,
-    stop_loss_pct: 2, take_profit_pct: 5, trailing_stop_pct: 1.5,
-  });
+  const [form, setForm] = useState<BotSettings>(DEFAULT_BOT_SETTINGS);
   const [apiKeyName, setApiKeyName] = useState("");
   const [privatePem, setPrivatePem] = useState("");
   const [showPem, setShowPem] = useState(false);
@@ -61,7 +71,7 @@ export default function Settings() {
   });
 
   useEffect(() => {
-    if (savedSettings) setForm(savedSettings as BotSettings);
+    if (savedSettings) setForm({ ...DEFAULT_BOT_SETTINGS, ...savedSettings } as BotSettings);
   }, [savedSettings]);
 
   useEffect(() => {
@@ -217,31 +227,52 @@ export default function Settings() {
 
           <Field>
             <div className="flex items-center justify-between">
-              <Label>RSI buy threshold</Label>
-              <span className="text-sm font-medium tabular-nums">{form.rsi_buy_threshold}</span>
+              <Label>Minimum setup quality</Label>
+              <span className="text-sm font-medium tabular-nums">{form.entry_score_threshold}</span>
             </div>
             <input
-              type="range" min="20" max="50" step="1"
-              value={form.rsi_buy_threshold}
-              onChange={(e) => set("rsi_buy_threshold")(Number(e.target.value))}
+              type="range" min="0" max="100" step="5"
+              value={form.entry_score_threshold}
+              onChange={(e) => set("entry_score_threshold")(Number(e.target.value))}
               className="w-full"
             />
-            <Hint>Buy when RSI drops below this. 40 catches short dips (day trading). Lower = rarer, deeper dips only.</Hint>
+            <Hint>Higher = fewer, stricter entries. Lower = more frequent, earlier entries.</Hint>
           </Field>
 
-          <Field>
-            <div className="flex items-center justify-between">
-              <Label>RSI sell threshold</Label>
-              <span className="text-sm font-medium tabular-nums">{form.rsi_sell_threshold}</span>
+          <details className="rounded-lg border border-border/60 bg-muted/20 p-3">
+            <summary className="cursor-pointer text-sm font-medium text-muted-foreground">
+              Advanced/internal tuning
+            </summary>
+            <div className="mt-4 space-y-5">
+              <Field>
+                <div className="flex items-center justify-between">
+                  <Label>RSI buy threshold</Label>
+                  <span className="text-sm font-medium tabular-nums">{form.rsi_buy_threshold}</span>
+                </div>
+                <input
+                  type="range" min="20" max="50" step="1"
+                  value={form.rsi_buy_threshold}
+                  onChange={(e) => set("rsi_buy_threshold")(Number(e.target.value))}
+                  className="w-full"
+                />
+                <Hint>Internal RSI tuning used by the legacy signal path. Lower = rarer, deeper dips only.</Hint>
+              </Field>
+
+              <Field>
+                <div className="flex items-center justify-between">
+                  <Label>RSI sell threshold</Label>
+                  <span className="text-sm font-medium tabular-nums">{form.rsi_sell_threshold}</span>
+                </div>
+                <input
+                  type="range" min="50" max="85" step="1"
+                  value={form.rsi_sell_threshold}
+                  onChange={(e) => set("rsi_sell_threshold")(Number(e.target.value))}
+                  className="w-full"
+                />
+                <Hint>Internal RSI tuning used by the legacy signal path. Higher = holds longer for bigger moves.</Hint>
+              </Field>
             </div>
-            <input
-              type="range" min="50" max="85" step="1"
-              value={form.rsi_sell_threshold}
-              onChange={(e) => set("rsi_sell_threshold")(Number(e.target.value))}
-              className="w-full"
-            />
-            <Hint>Sell when RSI rises above this. 60 exits quickly at the peak (day trading). Higher = holds longer for bigger moves.</Hint>
-          </Field>
+          </details>
 
           <Field>
             <div className="flex items-center justify-between">
