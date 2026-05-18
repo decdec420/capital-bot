@@ -1,11 +1,24 @@
-import { useEffect, useState, useCallback } from "react";
+// Dashboard.tsx — capital-bot trading terminal
+//
+// Architecture:
+//   • ALL trade data comes from Supabase (real paper/live records only)
+//   • Market data (spot, candles) from public Coinbase API — display only
+//   • RSI computed from those candles — display only (the Fly.io worker
+//     uses its own RSI series for actual trading decisions)
+//   • ZERO simulation, ZERO mock data — paper trades are real DB records
+//   • The Fly.io worker is the single source of truth for trade execution
+
+import { useEffect, useRef, useMemo, useState, useCallback } from "react";
 import { Link } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
-import { Settings, RefreshCw, TrendingUp, TrendingDown, Minus, Power, LogOut } from "lucide-react";
-import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
+import { Settings, LogOut, Power, RefreshCw } from "lucide-react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Types
+// ─────────────────────────────────────────────────────────────────────────────
 
 interface Trade {
   id: string;
@@ -26,27 +39,8 @@ interface Trade {
   close_reason?: string;
   created_at: string;
   closed_at?: string;
+  entry_fees_usd?: number;
   notes?: string;
-}
-
-function closeReasonLabel(reason?: string): string {
-  switch (reason) {
-    case "rsi_signal":    return "RSI signal";
-    case "trailing_stop": return "Trailing stop";
-    case "stop_loss":     return "Stop-loss";
-    case "take_profit":   return "Take-profit";
-    case "manual":        return "Manual close";
-    default:              return "—";
-  }
-}
-
-function duration(from: string, to?: string): string {
-  const ms = new Date(to ?? new Date()).getTime() - new Date(from).getTime();
-  const h = Math.floor(ms / 3600000);
-  if (h < 24) return `${h}h`;
-  const d = Math.floor(h / 24);
-  const rem = h % 24;
-  return rem > 0 ? `${d}d ${rem}h` : `${d}d`;
 }
 
 interface TickLog {
@@ -68,21 +62,725 @@ interface BotSettings {
   rsi_sell_threshold: number;
   stop_loss_pct: number;
   take_profit_pct: number;
+  trailing_stop_pct?: number;
 }
 
-function fmt(n?: number | null, decimals = 2) {
-  if (n == null) return "—";
-  return n.toLocaleString("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+interface Candle {
+  t: number;       // unix ms
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  vol: number;
 }
 
-function pnlColor(n?: number | null) {
-  if (n == null) return "text-muted-foreground";
-  return n > 0 ? "text-green-600 dark:text-green-400" : n < 0 ? "text-red-500" : "text-muted-foreground";
+interface ChartTrade {
+  id: string;
+  entry: number;
+  entry_i: number;
+  exit: number;
+  exit_i: number;
+  pnl: number;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Format helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+function fmtUSD(n?: number | null, dec = 2): string {
+  if (n == null || isNaN(n)) return "—";
+  const s = Math.abs(n).toLocaleString("en-US", { minimumFractionDigits: dec, maximumFractionDigits: dec });
+  return (n < 0 ? "-$" : "$") + s;
+}
+function fmtPct(n?: number | null, dec = 2): string {
+  if (n == null || isNaN(n)) return "—";
+  return (n >= 0 ? "+" : "") + n.toFixed(dec) + "%";
+}
+function fmtRelTime(t?: string | null): string {
+  if (!t) return "—";
+  const diff = Date.now() - new Date(t).getTime();
+  if (diff < 60_000)     return Math.floor(diff / 1000) + "s ago";
+  if (diff < 3_600_000)  return Math.floor(diff / 60_000) + "m ago";
+  if (diff < 86_400_000) return Math.floor(diff / 3_600_000) + "h ago";
+  return Math.floor(diff / 86_400_000) + "d ago";
+}
+function fmtDuration(fromIso: string, toIso?: string | null): string {
+  const ms = new Date(toIso ?? new Date()).getTime() - new Date(fromIso).getTime();
+  const m = Math.floor(ms / 60_000);
+  if (m < 60)  return m + "m";
+  const h = Math.floor(m / 60);
+  if (h < 24)  return h + "h " + (m % 60) + "m";
+  return Math.floor(h / 24) + "d " + (h % 24) + "h";
+}
+function fmtTime(iso?: string | null): string {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+}
+
+function closeReasonLabel(r?: string): string {
+  switch (r) {
+    case "rsi_signal":    return "RSI";
+    case "trailing_stop": return "TRAIL";
+    case "stop_loss":     return "STOP";
+    case "take_profit":   return "TP";
+    case "manual":        return "MANUAL";
+    default:              return "—";
+  }
+}
+function closeReasonClass(r?: string): string {
+  switch (r) {
+    case "trailing_stop": return "pill-amber";
+    case "stop_loss":     return "pill-red";
+    case "take_profit":   return "pill-green";
+    case "rsi_signal":    return "pill-blue";
+    default:              return "pill-muted";
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RSI computation (Wilder's smoothed) — for display only
+// ─────────────────────────────────────────────────────────────────────────────
+
+function computeRSISeries(closes: number[], period = 14): (number | null)[] {
+  const out: (number | null)[] = new Array(closes.length).fill(null);
+  if (closes.length < period + 1) return out;
+  let avgGain = 0, avgLoss = 0;
+  for (let i = 1; i <= period; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d > 0) avgGain += d; else avgLoss -= d;
+  }
+  avgGain /= period;
+  avgLoss /= period;
+  out[period] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  for (let i = period + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    avgGain = (avgGain * (period - 1) + Math.max(d, 0)) / period;
+    avgLoss = (avgLoss * (period - 1) + Math.max(-d, 0)) / period;
+    out[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  }
+  return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Market data hook — public Coinbase API, display only, no trade logic
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface MarketData {
+  candles: Candle[];
+  spot: number | null;
+  prevSpot: number | null;
+  rsiSeries: (number | null)[];
+  currentRSI: number | null;
+  change24h: { abs: number; pct: number } | null;
+  sparkline: number[];
+  loading: boolean;
+  error: string | null;
+  lastUpdate: number | null;
+}
+
+function useMarketData(symbol = "BTC-USD"): MarketData {
+  const [candles, setCandles] = useState<Candle[]>([]);
+  const [spot, setSpot] = useState<number | null>(null);
+  const [prevSpot, setPrevSpot] = useState<number | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [lastUpdate, setLastUpdate] = useState<number | null>(null);
+
+  // Candle fetch — public Coinbase Exchange endpoint
+  useEffect(() => {
+    let cancelled = false;
+    const productId = symbol.replace("-", "-"); // e.g. BTC-USD
+    async function loadCandles() {
+      try {
+        const r = await fetch(`https://api.exchange.coinbase.com/products/${productId}/candles?granularity=300`);
+        if (!r.ok) throw new Error(`candles ${r.status}`);
+        const arr: [number, number, number, number, number, number][] = await r.json();
+        if (cancelled) return;
+        const parsed = arr
+          .map((c) => ({ t: c[0] * 1000, low: c[1], high: c[2], open: c[3], close: c[4], vol: c[5] }))
+          .sort((a, b) => a.t - b.t);
+        setCandles(parsed);
+        setLoading(false);
+        setError(null);
+        setLastUpdate(Date.now());
+      } catch (e) {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : "fetch failed");
+        setLoading(false);
+      }
+    }
+    loadCandles();
+    const id = setInterval(loadCandles, 60_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [symbol]);
+
+  // Spot price — public Coinbase API, refreshes every 5s
+  useEffect(() => {
+    let cancelled = false;
+    async function fetchSpot() {
+      try {
+        const r = await fetch(`https://api.coinbase.com/v2/prices/${symbol}/spot`);
+        if (!r.ok) throw new Error("spot " + r.status);
+        const j = await r.json();
+        if (cancelled) return;
+        const price = Number(j.data.amount);
+        setSpot((prev) => { setPrevSpot(prev); return price; });
+        setLastUpdate(Date.now());
+      } catch {/* swallow — spot failure is non-critical */}
+    }
+    fetchSpot();
+    const id = setInterval(fetchSpot, 5_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [symbol]);
+
+  const closes = useMemo(() => candles.map((c) => c.close), [candles]);
+  const rsiSeries = useMemo(() => computeRSISeries(closes), [closes]);
+  const currentRSI = useMemo(() => {
+    const last = [...rsiSeries].reverse().find((v) => v != null);
+    return last ?? null;
+  }, [rsiSeries]);
+
+  const change24h = useMemo(() => {
+    if (!candles.length || !spot) return null;
+    const idx = Math.max(0, candles.length - 288); // 288 × 5min = 24h
+    const past = candles[idx]?.close;
+    if (!past) return null;
+    return { abs: spot - past, pct: (spot / past - 1) * 100 };
+  }, [candles, spot]);
+
+  const sparkline = useMemo(() => candles.slice(-12).map((c) => c.close), [candles]);
+
+  return { candles, spot, prevSpot, rsiSeries, currentRSI, change24h, sparkline, loading, error, lastUpdate };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Map real trades to candle indices (for chart markers)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function closestCandleIndex(candles: Candle[], tsMs: number): number {
+  let best = 0, bestDiff = Infinity;
+  for (let i = 0; i < candles.length; i++) {
+    const diff = Math.abs(candles[i].t - tsMs);
+    if (diff < bestDiff) { bestDiff = diff; best = i; }
+  }
+  return best;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sparkline component
+// ─────────────────────────────────────────────────────────────────────────────
+
+function Sparkline({ data, width = 110, height = 34 }: { data: number[]; width?: number; height?: number }) {
+  if (!data || data.length < 2) return <div style={{ width, height }} />;
+  const min = Math.min(...data), max = Math.max(...data);
+  const pad = (max - min) * 0.15 || 1;
+  const lo = min - pad, hi = max + pad;
+  const n = data.length;
+  const xAt = (i: number) => (i / (n - 1)) * width;
+  const yAt = (v: number) => height - ((v - lo) / (hi - lo)) * height;
+  const pts = data.map((d, i) => `${xAt(i).toFixed(2)},${yAt(d).toFixed(2)}`).join(" ");
+  const up = data[n - 1] >= data[0];
+  const col = up ? "var(--green)" : "var(--red)";
+  return (
+    <svg width={width} height={height} style={{ display: "block" }}>
+      <defs>
+        <linearGradient id="sparkG" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={col} stopOpacity="0.25" />
+          <stop offset="100%" stopColor={col} stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      <polygon points={`0,${height} ${pts} ${width},${height}`} fill="url(#sparkG)" />
+      <polyline points={pts} fill="none" stroke={col} strokeWidth="1.25" />
+      <circle cx={xAt(n - 1)} cy={yAt(data[n - 1])} r="2" fill={col} />
+    </svg>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RSI Gauge — semicircular dial
+// ─────────────────────────────────────────────────────────────────────────────
+
+function RSIGauge({ value, buyT = 30, sellT = 70, size = 180 }: {
+  value: number | null;
+  buyT?: number;
+  sellT?: number;
+  size?: number;
+}) {
+  const r = size / 2 - 18;
+  const cx = size / 2;
+  const cy = size / 2 + 6;
+  const v = Math.max(0, Math.min(100, value ?? 50));
+  // Angles: RSI 0 → π (left), RSI 100 → 0 (right), arc over the top
+  const rsiToAngle = (rsi: number) => Math.PI - (rsi / 100) * Math.PI;
+  const polar = (a: number, radius: number) => [cx + radius * Math.cos(a), cy - radius * Math.sin(a)] as [number, number];
+  const arcPath = (rsi0: number, rsi1: number) => {
+    const a0 = rsiToAngle(rsi0), a1 = rsiToAngle(rsi1);
+    const [x0, y0] = polar(a0, r);
+    const [x1, y1] = polar(a1, r);
+    const large = Math.abs(rsi1 - rsi0) > 50 ? 1 : 0;
+    return `M ${x0} ${y0} A ${r} ${r} 0 ${large} 1 ${x1} ${y1}`;
+  };
+
+  const valAngle = rsiToAngle(v);
+  const [nx, ny] = polar(valAngle, r - 6);
+  const needleColor = v < buyT ? "var(--green)" : v > sellT ? "var(--red)" : "var(--text-2)";
+  const zone = v < buyT ? "BUY ZONE" : v > sellT ? "SELL ZONE" : "NEUTRAL";
+  const zonePill = v < buyT ? "pill-green" : v > sellT ? "pill-red" : "pill-muted";
+
+  const svgH = size * 0.62;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+      <svg width={size} height={svgH} viewBox={`0 0 ${size} ${svgH}`} style={{ overflow: "visible" }}>
+        {/* Track */}
+        <path d={arcPath(0, 100)} fill="none" stroke="var(--bg-3)" strokeWidth="10" strokeLinecap="butt" />
+        {/* Buy zone */}
+        <path d={arcPath(0, buyT)} fill="none" stroke="var(--green)" strokeWidth="10" strokeLinecap="butt" opacity="0.85" />
+        {/* Sell zone */}
+        <path d={arcPath(sellT, 100)} fill="none" stroke="var(--red)" strokeWidth="10" strokeLinecap="butt" opacity="0.85" />
+        {/* Tick marks at 0, 25, 50, 75, 100 */}
+        {[0, 25, 50, 75, 100].map((t) => {
+          const a = rsiToAngle(t);
+          const [x1, y1] = polar(a, r - 14);
+          const [x2, y2] = polar(a, r - 8);
+          const [tx, ty] = polar(a, r - 26);
+          return (
+            <g key={t}>
+              <line x1={x1} y1={y1} x2={x2} y2={y2} stroke="var(--text-4)" strokeWidth="1" />
+              <text x={tx} y={ty + 3} fontSize="8" fill="var(--text-4)" textAnchor="middle" className="mono">{t}</text>
+            </g>
+          );
+        })}
+        {/* Needle */}
+        <line x1={cx} y1={cy} x2={nx} y2={ny} stroke={needleColor} strokeWidth="2.5" strokeLinecap="round" />
+        <circle cx={cx} cy={cy} r="5" fill={needleColor} />
+        <circle cx={cx} cy={cy} r="2.5" fill="var(--bg)" />
+        {/* Value */}
+        <text x={cx} y={cy - 22} fontSize={size * 0.17} fill="var(--text)" textAnchor="middle" className="mono hero-num" fontWeight="500">
+          {value != null ? value.toFixed(1) : "—"}
+        </text>
+        <text x={cx} y={cy - 7} fontSize="9" fill="var(--text-3)" textAnchor="middle" className="mono">RSI(14)</text>
+      </svg>
+      <span className={`pill ${zonePill}`}>{zone}</span>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Price chart with RSI subplot — adapted from uploaded design
+// ─────────────────────────────────────────────────────────────────────────────
+
+function PriceChart({
+  candles, trades, rsiSeries, openTrade, height = 360, spot,
+}: {
+  candles: Candle[];
+  trades: ChartTrade[];
+  rsiSeries: (number | null)[];
+  openTrade: { entry_i: number; entry: number } | null;
+  height?: number;
+  spot: number | null;
+}) {
+  const rsiH = Math.round(height * 0.26);
+  const priceH = height - rsiH - 12;
+  const W = 1000;
+
+  if (!candles.length) {
+    return (
+      <div style={{ height, display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <span className="mono dimmer" style={{ fontSize: 11 }}>loading market data…</span>
+      </div>
+    );
+  }
+
+  const closes = candles.map((c) => c.close);
+  const minP = Math.min(...closes), maxP = Math.max(...closes);
+  const padP = (maxP - minP) * 0.08 || 1;
+  const lo = minP - padP, hi = maxP + padP;
+  const n = candles.length;
+  const xAt = (i: number) => (i / (n - 1)) * W;
+  const yAt = (p: number) => priceH - ((p - lo) / (hi - lo)) * priceH;
+  const yRSI = (r: number) => rsiH - (r / 100) * rsiH;
+
+  const linePts = candles.map((c, i) => `${xAt(i).toFixed(2)},${yAt(c.close).toFixed(2)}`).join(" ");
+  const areaPath = `M0,${priceH} L${linePts.split(" ").join(" L")} L${W},${priceH} Z`;
+  const rsiPts = rsiSeries
+    .map((v, i) => v == null ? null : `${xAt(i).toFixed(2)},${yRSI(v).toFixed(2)}`)
+    .filter(Boolean).join(" ");
+
+  const lastClose = spot ?? closes[n - 1];
+  const lastY = yAt(lastClose);
+
+  return (
+    <svg viewBox={`0 0 ${W} ${height}`} preserveAspectRatio="none"
+      style={{ width: "100%", height, display: "block", overflow: "visible" }}>
+      {/* Price grid */}
+      {[0.25, 0.5, 0.75].map((f) => (
+        <line key={f} x1={0} x2={W} y1={priceH * f} y2={priceH * f}
+          stroke="var(--grid-line)" strokeWidth="1" strokeDasharray="2 4" />
+      ))}
+      <defs>
+        <linearGradient id="priceGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="var(--text)" stopOpacity="0.14" />
+          <stop offset="100%" stopColor="var(--text)" stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      <path d={areaPath} fill="url(#priceGrad)" />
+      <polyline points={linePts} fill="none" stroke="var(--text)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
+
+      {/* Live price dashed line + pulsing dot */}
+      <line x1={0} x2={W} y1={lastY} y2={lastY} stroke="var(--text-3)" strokeWidth="1"
+        strokeDasharray="3 5" vectorEffect="non-scaling-stroke" opacity="0.5" />
+      <circle cx={W} cy={lastY} r="3" fill="var(--text)" />
+      <circle cx={W} cy={lastY} r="6" fill="var(--text)" opacity="0.2">
+        <animate attributeName="r" from="3" to="10" dur="1.6s" repeatCount="indefinite" />
+        <animate attributeName="opacity" from="0.4" to="0" dur="1.6s" repeatCount="indefinite" />
+      </circle>
+
+      {/* Closed trade markers */}
+      {trades.map((t) => {
+        const ex = xAt(t.entry_i), ey = yAt(t.entry);
+        const xx = xAt(t.exit_i),  xy = yAt(t.exit);
+        const c = t.pnl >= 0 ? "var(--green)" : "var(--red)";
+        return (
+          <g key={t.id}>
+            <line x1={ex} y1={ey} x2={xx} y2={xy} stroke={c} strokeWidth="1"
+              strokeDasharray="2 3" opacity="0.45" vectorEffect="non-scaling-stroke" />
+            <circle cx={ex} cy={ey} r="5" fill="var(--bg)" stroke="var(--green)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
+            <path d={`M ${ex-2.5} ${ey+1} L ${ex} ${ey-2} L ${ex+2.5} ${ey+1} Z`} fill="var(--green)" />
+            <circle cx={xx} cy={xy} r="5" fill="var(--bg)" stroke="var(--red)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
+            <path d={`M ${xx-2.5} ${xy-1} L ${xx} ${xy+2} L ${xx+2.5} ${xy-1} Z`} fill="var(--red)" />
+          </g>
+        );
+      })}
+
+      {/* Open trade — pulsing amber dot */}
+      {openTrade && (
+        <g>
+          <circle cx={xAt(openTrade.entry_i)} cy={yAt(openTrade.entry)} r="6"
+            fill="var(--bg)" stroke="var(--amber)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
+          <circle cx={xAt(openTrade.entry_i)} cy={yAt(openTrade.entry)} r="6"
+            fill="var(--amber)" opacity="0.3">
+            <animate attributeName="r" from="6" to="14" dur="1.4s" repeatCount="indefinite" />
+            <animate attributeName="opacity" from="0.5" to="0" dur="1.4s" repeatCount="indefinite" />
+          </circle>
+        </g>
+      )}
+
+      {/* Y-axis labels */}
+      <text x={W-4} y={12}         fontSize="9"   fill="var(--text-3)" textAnchor="end" className="mono">{maxP.toFixed(0)}</text>
+      <text x={W-4} y={priceH-4}   fontSize="9"   fill="var(--text-3)" textAnchor="end" className="mono">{minP.toFixed(0)}</text>
+      <text x={W-4} y={lastY-4}    fontSize="9.5" fill="var(--text)"   textAnchor="end" className="mono" fontWeight="600">{Math.round(lastClose).toLocaleString()}</text>
+
+      {/* RSI subplot */}
+      <g transform={`translate(0, ${priceH + 12})`}>
+        <rect x={0} y={yRSI(70)} width={W} height={yRSI(0) - yRSI(70)} fill="var(--red)"   opacity="0.04" />
+        <rect x={0} y={yRSI(30)} width={W} height={yRSI(0) - yRSI(30)} fill="var(--green)" opacity="0.04" />
+        <line x1={0} x2={W} y1={yRSI(70)} y2={yRSI(70)} stroke="var(--red)"   strokeWidth="1" strokeDasharray="2 4" opacity="0.4" />
+        <line x1={0} x2={W} y1={yRSI(30)} y2={yRSI(30)} stroke="var(--green)" strokeWidth="1" strokeDasharray="2 4" opacity="0.4" />
+        <line x1={0} x2={W} y1={yRSI(50)} y2={yRSI(50)} stroke="var(--grid-line)" strokeWidth="1" />
+        {rsiPts && <polyline points={rsiPts} fill="none" stroke="var(--blue)" strokeWidth="1.25" vectorEffect="non-scaling-stroke" />}
+        <text x={4}   y={yRSI(70)-2} fontSize="8.5" fill="var(--red)"   className="mono">70</text>
+        <text x={4}   y={yRSI(30)+8} fontSize="8.5" fill="var(--green)" className="mono">30</text>
+        <text x={W-4} y={12}         fontSize="8.5" fill="var(--text-3)" textAnchor="end" className="mono">RSI(14)</text>
+      </g>
+    </svg>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bot icon mark
+// ─────────────────────────────────────────────────────────────────────────────
+
+function BotMark({ size = 18 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 18 18" fill="none">
+      <rect x="3" y="5" width="12" height="9" rx="2" stroke="var(--green)" strokeWidth="1.4" />
+      <rect x="6" y="8" width="2" height="2" rx="0.5" fill="var(--green)" />
+      <rect x="10" y="8" width="2" height="2" rx="0.5" fill="var(--green)" />
+      <line x1="9" y1="2" x2="9" y2="5" stroke="var(--green)" strokeWidth="1.4" strokeLinecap="round" />
+      <circle cx="9" cy="1.5" r="1" fill="var(--green)" />
+      <line x1="1" y1="9" x2="3" y2="9" stroke="var(--green)" strokeWidth="1.4" strokeLinecap="round" />
+      <line x1="15" y1="9" x2="17" y2="9" stroke="var(--green)" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Position panel
+// ─────────────────────────────────────────────────────────────────────────────
+
+function PositionPanel({
+  openTrade, spot, settings, currentRSI, onClose, closing,
+}: {
+  openTrade: Trade | null;
+  spot: number | null;
+  settings: BotSettings | undefined;
+  currentRSI: number | null;
+  onClose: () => void;
+  closing: boolean;
+}) {
+  if (!openTrade) {
+    const buyT = settings?.rsi_buy_threshold ?? 25;
+    const distance = currentRSI != null ? currentRSI - buyT : null;
+    const close = distance != null && distance < 8;
+    return (
+      <div className="t-panel" style={{ padding: 16 }}>
+        <div className="kicker" style={{ marginBottom: 12 }}>NO POSITION · WATCHING</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 14 }}>
+          <div style={{ width: 36, height: 36, borderRadius: 8, background: "var(--bg-2)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={close ? "var(--green)" : "var(--text-3)"} strokeWidth="2">
+              <circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 3" />
+            </svg>
+          </div>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>Waiting for entry</div>
+            <div className="mono dim" style={{ fontSize: 11 }}>Buy on RSI &lt; {buyT}</div>
+          </div>
+        </div>
+        <div style={{ background: "var(--bg-2)", borderRadius: 7, padding: 12 }}>
+          <div className="kicker" style={{ marginBottom: 6 }}>NEXT ACTION</div>
+          <div className="mono" style={{ fontSize: 12, lineHeight: 1.6, color: "var(--text-2)" }}>
+            <div>RSI now: <span style={{ color: close ? "var(--green)" : "var(--text)", fontWeight: 600 }}>{currentRSI?.toFixed(2) ?? "—"}</span></div>
+            <div className="dim">Trigger at RSI &lt; {buyT}</div>
+            {distance != null && (
+              <div style={{ marginTop: 4 }}>
+                Distance: <span style={{ color: close ? "var(--green)" : "var(--amber)", fontWeight: 600 }}>
+                  {distance > 0 ? "+" : ""}{distance.toFixed(2)} pts
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const entry = Number(openTrade.entry_price);
+  const cur = spot ?? entry;
+  const unreal = { pnl: (cur - entry) * Number(openTrade.size), pct: (cur / entry - 1) * 100 };
+  const slPrice = (settings?.stop_loss_pct ?? 0) > 0 ? entry * (1 - (settings!.stop_loss_pct / 100)) : null;
+  const tpPrice = (settings?.take_profit_pct ?? 0) > 0 ? entry * (1 + (settings!.take_profit_pct / 100)) : null;
+  const tHigh = openTrade.trailing_high ? Number(openTrade.trailing_high) : entry;
+  const tsPrice = (settings?.trailing_stop_pct ?? 0) > 0 ? tHigh * (1 - (settings!.trailing_stop_pct! / 100)) : null;
+  const stop = slPrice ?? entry * 0.97;
+  const target = tpPrice ?? entry * 1.05;
+  const progress = Math.max(0, Math.min(1, (cur - stop) / (target - stop)));
+
+  function DataRow({ label, value, color }: { label: string; value: string; color?: string }) {
+    return (
+      <div>
+        <div style={{ fontSize: 9.5, color: "var(--text-3)", marginBottom: 1 }}>{label}</div>
+        <div className="mono" style={{ fontSize: 11.5, color: color || "var(--text)" }}>{value}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="t-panel" style={{ padding: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+        <span className="kicker">OPEN POSITION</span>
+        <button className="t-btn t-btn-danger" onClick={() => { if (confirm("Close this position now?")) onClose(); }} disabled={closing} style={{ height: 26, padding: "0 10px", fontSize: 11 }}>
+          {closing ? "Closing…" : "Close now"}
+        </button>
+      </div>
+
+      {/* Unrealized P&L */}
+      <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 4 }}>
+        <span className="hero-num" style={{ fontSize: 32, color: unreal.pnl >= 0 ? "var(--green)" : "var(--red)" }}>
+          {unreal.pnl >= 0 ? "+" : "−"}{fmtUSD(Math.abs(unreal.pnl))}
+        </span>
+        <span className="mono" style={{ fontSize: 13, color: unreal.pct >= 0 ? "var(--green)" : "var(--red)" }}>
+          {fmtPct(unreal.pct)}
+        </span>
+      </div>
+      <div className="mono dim" style={{ fontSize: 10.5, marginBottom: 14 }}>
+        unrealized · {fmtRelTime(openTrade.created_at)}
+      </div>
+
+      {/* Progress bar: stop → entry → spot → target */}
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ height: 5, background: "var(--bg-3)", borderRadius: 3, position: "relative", overflow: "hidden" }}>
+          <div style={{
+            position: "absolute", top: 0, bottom: 0, left: 0,
+            width: `${progress * 100}%`,
+            background: unreal.pnl >= 0 ? "var(--green)" : "var(--red)",
+            borderRadius: 3,
+          }} />
+          <div style={{
+            position: "absolute", top: 0, bottom: 0,
+            left: `${((entry - stop) / (target - stop)) * 100}%`,
+            width: 1, background: "var(--text-4)",
+          }} />
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4, fontSize: 9.5, fontFamily: "JetBrains Mono, monospace" }}>
+          <span style={{ color: "var(--red)" }}>STOP {fmtUSD(stop, 0)}</span>
+          <span className="dim">ENTRY {fmtUSD(entry, 0)}</span>
+          <span style={{ color: "var(--green)" }}>TGT {fmtUSD(target, 0)}</span>
+        </div>
+      </div>
+
+      {/* Grid of details */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px 16px" }}>
+        <DataRow label="Entry"       value={fmtUSD(entry)} />
+        <DataRow label="Current"     value={fmtUSD(cur)} />
+        <DataRow label="Size"        value={Number(openTrade.size).toFixed(8) + " BTC"} />
+        <DataRow label="Invested"    value={fmtUSD(openTrade.quote_size)} />
+        <DataRow label="RSI @ entry" value={openTrade.rsi_at_entry?.toFixed(1) ?? "—"} />
+        <DataRow label="Peak high"   value={fmtUSD(tHigh)} />
+        {slPrice && <DataRow label="Stop-loss"   value={fmtUSD(slPrice)} color="var(--red)" />}
+        {tpPrice && <DataRow label="Take-profit" value={fmtUSD(tpPrice)} color="var(--green)" />}
+        {tsPrice && <DataRow label="Trail stop"  value={fmtUSD(tsPrice)} color="var(--amber)" />}
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live tick feed — real DB records only
+// ─────────────────────────────────────────────────────────────────────────────
+
+function TickFeed({ ticks }: { ticks: TickLog[] }) {
+  return (
+    <div className="t-panel" style={{ display: "flex", flexDirection: "column", maxHeight: 300 }}>
+      <div className="t-panel-hd">
+        <span className="kicker">LIVE FEED</span>
+        <span className="mono dim" style={{ fontSize: 10 }}>{ticks.length} events</span>
+      </div>
+      <div style={{ overflowY: "auto", flex: 1 }}>
+        {ticks.length === 0 ? (
+          <div className="mono dim" style={{ padding: "16px 14px", fontSize: 11, textAlign: "center" }}>
+            no events yet…
+          </div>
+        ) : ticks.map((t, i) => (
+          <div key={t.id} style={{
+            padding: "7px 14px",
+            borderBottom: i < ticks.length - 1 ? "1px solid var(--t-border)" : "none",
+            fontFamily: "JetBrains Mono, monospace",
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 2 }}>
+              <span style={{
+                fontSize: 10, fontWeight: 600, letterSpacing: "0.05em", textTransform: "uppercase",
+                color: t.action === "buy" ? "var(--green)" : t.action === "sell" ? "var(--red)" : t.action === "error" ? "var(--red)" : "var(--text-3)",
+              }}>
+                {t.action}
+              </span>
+              <span style={{ fontSize: 10, color: "var(--text-4)" }}>{fmtTime(t.created_at)}</span>
+            </div>
+            {t.reason && (
+              <div style={{ fontSize: 11, color: "var(--text-3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={t.reason}>
+                {t.reason}
+              </div>
+            )}
+            {(t.price != null || t.rsi != null) && (
+              <div style={{ fontSize: 10.5, color: "var(--text-4)", marginTop: 1 }}>
+                {t.price != null ? `$${Number(t.price).toLocaleString("en-US", { maximumFractionDigits: 0 })}` : ""}
+                {t.rsi != null ? ` · RSI ${Number(t.rsi).toFixed(1)}` : ""}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trade history — compact table, expandable
+// Default: show 5 most recent. "Show all" expands.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function TradeHistory({ trades }: { trades: Trade[] }) {
+  const [expanded, setExpanded] = useState(false);
+  const PAGE = 5;
+  const visible = expanded ? trades : trades.slice(0, PAGE);
+  const more = trades.length - PAGE;
+
+  if (!trades.length) {
+    return (
+      <div className="t-panel" style={{ padding: 18, textAlign: "center" }}>
+        <span className="mono dim" style={{ fontSize: 11 }}>no closed trades yet · watching for first RSI signal</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="t-panel" style={{ overflow: "hidden" }}>
+      <div className="t-panel-hd">
+        <span className="kicker">TRADE HISTORY</span>
+        <span className="mono dim" style={{ fontSize: 10 }}>
+          {trades.length} closed trade{trades.length !== 1 ? "s" : ""}
+        </span>
+      </div>
+      <div style={{ overflowX: "auto" }}>
+        <table className="t-table">
+          <thead>
+            <tr>
+              <th style={{ textAlign: "left"  }}>#</th>
+              <th style={{ textAlign: "left"  }}>Pair</th>
+              <th style={{ textAlign: "right" }}>Entry</th>
+              <th style={{ textAlign: "right" }}>Exit</th>
+              <th style={{ textAlign: "right" }}>P&L</th>
+              <th style={{ textAlign: "right" }}>Δ%</th>
+              <th style={{ textAlign: "right" }}>Held</th>
+              <th style={{ textAlign: "right" }}>RSI in</th>
+              <th style={{ textAlign: "left",  paddingLeft: 16 }}>Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            {visible.map((t, idx) => {
+              const pnl    = Number(t.effective_pnl ?? t.pnl_usd ?? 0);
+              const pnlPct = Number(t.pnl_pct ?? 0);
+              return (
+                <tr key={t.id}>
+                  <td style={{ color: "var(--text-4)" }}>{trades.length - idx}</td>
+                  <td style={{ textAlign: "left" }}>
+                    <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      {pnl >= 0
+                        ? <svg width="10" height="10" viewBox="0 0 10 10"><polygon points="5,1 9,9 1,9" fill="var(--green)" /></svg>
+                        : <svg width="10" height="10" viewBox="0 0 10 10"><polygon points="1,1 9,1 5,9" fill="var(--red)" /></svg>}
+                      <span style={{ fontWeight: 500 }}>{t.symbol}</span>
+                    </span>
+                  </td>
+                  <td>{fmtUSD(t.entry_price)}</td>
+                  <td>{fmtUSD(t.exit_price)}</td>
+                  <td style={{ color: pnl >= 0 ? "var(--green)" : "var(--red)", fontWeight: 600 }}>
+                    {pnl >= 0 ? "+" : "−"}{fmtUSD(Math.abs(pnl))}
+                  </td>
+                  <td style={{ color: pnlPct >= 0 ? "var(--green)" : "var(--red)" }}>{fmtPct(pnlPct)}</td>
+                  <td style={{ color: "var(--text-3)" }}>{fmtDuration(t.created_at, t.closed_at)}</td>
+                  <td style={{ color: "var(--text-3)" }}>{t.rsi_at_entry?.toFixed(1) ?? "—"}</td>
+                  <td style={{ textAlign: "left", paddingLeft: 16 }}>
+                    <span className={`pill ${closeReasonClass(t.close_reason)}`} style={{ fontSize: "10px", padding: "1px 7px" }}>
+                      {closeReasonLabel(t.close_reason)}
+                    </span>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      {trades.length > PAGE && (
+        <div style={{ borderTop: "1px solid var(--t-border)", padding: "10px 14px", textAlign: "center" }}>
+          <button className="t-btn" onClick={() => setExpanded((e) => !e)} style={{ fontSize: 11 }}>
+            {expanded ? "Show less" : `Show ${more} older trade${more !== 1 ? "s" : ""}`}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main Dashboard
+// ─────────────────────────────────────────────────────────────────────────────
 
 export default function Dashboard() {
   const { user, signOut } = useAuth();
   const qc = useQueryClient();
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => { const id = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(id); }, []);
+
+  // ── Supabase queries — all real data ─────────────────────────────────────
 
   const { data: settings } = useQuery<BotSettings>({
     queryKey: ["settings"],
@@ -94,7 +792,7 @@ export default function Dashboard() {
     enabled: !!user,
   });
 
-  const { data: openTrade } = useQuery<Trade | null>({
+  const { data: openTrade = null } = useQuery<Trade | null>({
     queryKey: ["open-trade"],
     queryFn: async () => {
       const { data, error } = await supabase.from("trades").select("*").eq("user_id", user!.id).eq("status", "open").maybeSingle();
@@ -102,13 +800,15 @@ export default function Dashboard() {
       return data ?? null;
     },
     enabled: !!user,
-    refetchInterval: 30_000,
+    refetchInterval: 20_000,
   });
 
   const { data: closedTrades = [] } = useQuery<Trade[]>({
     queryKey: ["closed-trades"],
     queryFn: async () => {
-      const { data, error } = await supabase.from("trades").select("*").eq("user_id", user!.id).eq("status", "closed").order("closed_at", { ascending: false }).limit(20);
+      const { data, error } = await supabase.from("trades").select("*")
+        .eq("user_id", user!.id).eq("status", "closed")
+        .order("closed_at", { ascending: false }).limit(50);
       if (error) throw error;
       return data ?? [];
     },
@@ -118,339 +818,299 @@ export default function Dashboard() {
   const { data: tickLogs = [] } = useQuery<TickLog[]>({
     queryKey: ["tick-log"],
     queryFn: async () => {
-      const { data, error } = await supabase.from("tick_log").select("*").eq("user_id", user!.id).order("created_at", { ascending: false }).limit(10);
+      const { data, error } = await supabase.from("tick_log").select("*")
+        .eq("user_id", user!.id).order("created_at", { ascending: false }).limit(20);
       if (error) throw error;
       return data ?? [];
     },
     enabled: !!user,
-    refetchInterval: 60_000,
+    refetchInterval: 30_000,
   });
 
-  // Run bot now
-  const runNow = useMutation({
-    mutationFn: async () => {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session) throw new Error("Session expired — please log in again");
-      const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
-      const r = await fetch(`${SUPABASE_URL}/functions/v1/signal-tick`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${session.access_token}`, "Content-Type": "application/json" },
-        body: "{}",
-      });
-      const json = await r.json();
-      if (!r.ok || !json.ok) throw new Error(json.error ?? "Tick failed");
-      return json;
-    },
-    onSuccess: (data) => {
-      const actionLabel = data.action === "buy" ? "📈 Bought" : data.action === "sell" ? "📉 Sold" : "Checked";
-      toast.success(`${actionLabel} — RSI ${data.rsi?.toFixed(1)} @ $${data.price?.toFixed(0)}`);
-      qc.invalidateQueries({ queryKey: ["open-trade"] });
-      qc.invalidateQueries({ queryKey: ["closed-trades"] });
-      qc.invalidateQueries({ queryKey: ["tick-log"] });
-    },
-    onError: (e) => toast.error(e instanceof Error ? e.message : "Tick error"),
-  });
+  // ── Market data — display only ────────────────────────────────────────────
+  const market = useMarketData(settings?.symbol ?? "BTC-USD");
+  const { candles, spot, prevSpot, rsiSeries, currentRSI, change24h, sparkline, lastUpdate } = market;
 
-  // Manual close
+  // Spot price tick animation
+  const spotTickClass = useMemo(() => {
+    if (prevSpot == null || spot == null) return "";
+    return spot > prevSpot ? "tick-up" : spot < prevSpot ? "tick-down" : "";
+  }, [spot, prevSpot]);
+
+  // ── Map real trades to candle indices for chart markers ───────────────────
+  const chartTrades = useMemo<ChartTrade[]>(() => {
+    if (!candles.length) return [];
+    return closedTrades
+      .filter((t) => t.exit_price != null)
+      .map((t) => ({
+        id: t.id,
+        entry: Number(t.entry_price),
+        entry_i: closestCandleIndex(candles, new Date(t.created_at).getTime()),
+        exit:  Number(t.exit_price!),
+        exit_i: closestCandleIndex(candles, new Date(t.closed_at ?? t.created_at).getTime()),
+        pnl: Number(t.effective_pnl ?? t.pnl_usd ?? 0),
+      }))
+      .filter((t) => t.entry_i !== t.exit_i); // only trades that span at least one candle
+  }, [closedTrades, candles]);
+
+  const openTradeForChart = useMemo(() => {
+    if (!openTrade || !candles.length) return null;
+    return {
+      entry: Number(openTrade.entry_price),
+      entry_i: closestCandleIndex(candles, new Date(openTrade.created_at).getTime()),
+    };
+  }, [openTrade, candles]);
+
+  // ── Aggregates ────────────────────────────────────────────────────────────
+  const totalPnl  = closedTrades.reduce((s, t) => s + Number(t.effective_pnl ?? t.pnl_usd ?? 0), 0);
+  const wins      = closedTrades.filter((t) => Number(t.pnl_usd ?? 0) > 0).length;
+  const losses    = closedTrades.length - wins;
+  const winRate   = closedTrades.length ? (wins / closedTrades.length) * 100 : null;
+  const avgTrade  = closedTrades.length ? totalPnl / closedTrades.length : null;
+  const totalInvested = closedTrades.length * (settings?.buy_amount_usd ?? 0);
+  const roi       = totalInvested ? (totalPnl / totalInvested) * 100 : null;
+
+  // Bot state label
+  const buyT = settings?.rsi_buy_threshold ?? 25;
+  const sellT = settings?.rsi_sell_threshold ?? 75;
+  const stateLabel = openTrade ? "IN POSITION"
+    : currentRSI != null && currentRSI < buyT ? "BUYING SOON"
+    : "WATCHING";
+  const statePill = openTrade ? "pill-amber"
+    : currentRSI != null && currentRSI < buyT ? "pill-green"
+    : "pill-muted";
+
+  // ── Close trade mutation ───────────────────────────────────────────────────
   const closeTrade = useMutation({
-    mutationFn: async (tradeId: string) => {
+    mutationFn: async () => {
+      if (!openTrade) return;
       const { data: { session } } = await supabase.auth.getSession();
-      if (!session) throw new Error("Session expired — please log in again");
+      if (!session) throw new Error("Session expired");
       const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
       const r = await fetch(`${SUPABASE_URL}/functions/v1/trade-close`, {
         method: "POST",
         headers: { Authorization: `Bearer ${session.access_token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ tradeId }),
+        body: JSON.stringify({ tradeId: openTrade.id }),
       });
       const json = await r.json();
       if (!r.ok || !json.ok) throw new Error(json.error ?? "Close failed");
       return json;
     },
     onSuccess: (data) => {
-      toast.success(`Position closed — P&L $${data.grossPnl?.toFixed(2)}`);
+      toast.success(`Position closed — P&L ${fmtUSD(data?.grossPnl)}`);
       qc.invalidateQueries({ queryKey: ["open-trade"] });
       qc.invalidateQueries({ queryKey: ["closed-trades"] });
+      qc.invalidateQueries({ queryKey: ["tick-log"] });
     },
     onError: (e) => toast.error(e instanceof Error ? e.message : "Close failed"),
   });
 
-  // P&L chart data from closed trades
-  const chartData = [...closedTrades].reverse().map((t, i) => ({
-    i,
-    date: new Date(t.closed_at!).toLocaleDateString("en-US", { month: "short", day: "numeric" }),
-    pnl: Number(t.effective_pnl ?? t.pnl_usd ?? 0),
-    cumulative: 0,
-  })).reduce((acc, d, i) => {
-    const prev = acc[i - 1]?.cumulative ?? 0;
-    acc.push({ ...d, cumulative: prev + d.pnl });
-    return acc;
-  }, [] as typeof chartData);
+  // Refresh all live data
+  const handleRefresh = useCallback(() => {
+    qc.invalidateQueries({ queryKey: ["settings"] });
+    qc.invalidateQueries({ queryKey: ["open-trade"] });
+    qc.invalidateQueries({ queryKey: ["closed-trades"] });
+    qc.invalidateQueries({ queryKey: ["tick-log"] });
+  }, [qc]);
 
-  const totalPnl = closedTrades.reduce((s, t) => s + Number(t.effective_pnl ?? t.pnl_usd ?? 0), 0);
-  const wins = closedTrades.filter((t) => Number(t.pnl_usd ?? 0) > 0).length;
-  const winRate = closedTrades.length ? (wins / closedTrades.length) * 100 : null;
-  const avgTrade = closedTrades.length ? totalPnl / closedTrades.length : null;
-  const lastTick = tickLogs[0];
+  // ─────────────────────────────────────────────────────────────────────────
+  // Render
+  // ─────────────────────────────────────────────────────────────────────────
 
   return (
-    <div className="min-h-screen bg-background">
-      {/* Top bar */}
-      <header className="border-b border-border px-6 py-3 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <span className="font-semibold text-base">Capital Bot</span>
-          {settings?.live_trading ? (
-            <span className="text-[11px] font-medium px-2 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300">LIVE</span>
-          ) : (
-            <span className="text-[11px] font-medium px-2 py-0.5 rounded-full bg-yellow-100 text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300">PAPER</span>
-          )}
+    <div style={{ minHeight: "100vh", background: "var(--bg)", color: "var(--text)" }} className="app-grid">
+
+      {/* ── Top bar ── */}
+      <header style={{
+        borderBottom: "1px solid var(--t-border)",
+        padding: "10px 24px",
+        display: "flex", alignItems: "center", justifyContent: "space-between",
+        background: "var(--bg)",
+        position: "sticky", top: 0, zIndex: 30,
+        backdropFilter: "blur(8px)",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <BotMark size={18} />
+            <span className="mono" style={{ fontSize: 12, fontWeight: 600, letterSpacing: "0.04em" }}>CAPITAL_BOT</span>
+          </div>
+          <span style={{ height: 14, width: 1, background: "var(--t-border)" }} />
+          <span className={`pill ${settings?.live_trading ? "pill-red" : "pill-amber"}`}>
+            <span className="dot dot-amber" style={{ width: 5, height: 5 }} />
+            {settings?.live_trading ? "LIVE" : "PAPER"}
+          </span>
           {settings?.enabled && (
-            <span className="text-[11px] font-medium px-2 py-0.5 rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300 flex items-center gap-1">
-              <Power className="w-2.5 h-2.5" /> on
+            <span className="pill pill-green">
+              <span className="dot dot-green" style={{ width: 5, height: 5 }} /> BOT ON
             </span>
           )}
+          {!settings?.enabled && (
+            <span className="pill pill-muted">BOT OFF</span>
+          )}
+          <span className={`pill ${statePill}`}>{stateLabel}</span>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => runNow.mutate()}
-            disabled={runNow.isPending || !settings?.enabled}
-            className="flex items-center gap-1.5 text-sm px-3 h-8 rounded-md border border-border hover:bg-muted disabled:opacity-40 transition-colors"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${runNow.isPending ? "animate-spin" : ""}`} />
-            {runNow.isPending ? "Running…" : "Run now"}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span className="mono dim" style={{ fontSize: 11, marginRight: 4 }}>
+            {new Date(now).toLocaleTimeString("en-US", { hour12: false })}
+            {lastUpdate ? ` · synced ${Math.floor((now - lastUpdate) / 1000)}s` : " · connecting"}
+          </span>
+          <button className="t-btn" onClick={handleRefresh} title="Sync DB data">
+            <RefreshCw size={11} /> Sync
           </button>
-          <Link to="/settings" className="flex items-center gap-1.5 text-sm px-3 h-8 rounded-md border border-border hover:bg-muted transition-colors">
-            <Settings className="w-3.5 h-3.5" /> Settings
+          <Link to="/settings" className="t-btn" style={{ textDecoration: "none", display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <Settings size={12} /> Settings
           </Link>
-          <button onClick={signOut} className="flex items-center gap-1 text-sm px-2 h-8 rounded-md hover:bg-muted text-muted-foreground transition-colors">
-            <LogOut className="w-3.5 h-3.5" />
+          <button className="t-btn" onClick={signOut} title={`Sign out (${user?.email})`}>
+            <LogOut size={12} />
           </button>
         </div>
       </header>
 
-      <main className="max-w-5xl mx-auto px-6 py-6 space-y-6">
+      <main style={{ padding: "20px 24px", maxWidth: 1480, margin: "0 auto", width: "100%" }}>
 
-        {/* 4-stat summary row */}
-        <div className="grid grid-cols-4 gap-3">
-          <div className="rounded-lg border border-border p-3.5">
-            <p className="text-xs text-muted-foreground mb-1">Total P&L</p>
-            <p className={`text-xl font-semibold ${pnlColor(totalPnl)}`}>
-              {totalPnl >= 0 ? "+" : ""}${fmt(totalPnl)}
-            </p>
-            <p className="text-xs text-muted-foreground mt-0.5">{closedTrades.length} trades closed</p>
-          </div>
-          <div className="rounded-lg border border-border p-3.5">
-            <p className="text-xs text-muted-foreground mb-1">Win rate</p>
-            <p className="text-xl font-semibold">{winRate != null ? `${fmt(winRate, 0)}%` : "—"}</p>
-            <p className="text-xs text-muted-foreground mt-0.5">{wins}W / {closedTrades.length - wins}L</p>
-          </div>
-          <div className="rounded-lg border border-border p-3.5">
-            <p className="text-xs text-muted-foreground mb-1">Avg trade</p>
-            <p className={`text-xl font-semibold ${pnlColor(avgTrade)}`}>
-              {avgTrade != null ? `${avgTrade >= 0 ? "+" : ""}$${fmt(Math.abs(avgTrade))}` : "—"}
-            </p>
-            <p className="text-xs text-muted-foreground mt-0.5">per closed trade</p>
-          </div>
-          <div className="rounded-lg border border-border p-3.5">
-            <p className="text-xs text-muted-foreground mb-1">Last tick</p>
-            {lastTick ? (
-              <>
-                <p className={`text-sm font-semibold capitalize ${lastTick.action === "buy" ? "text-green-600" : lastTick.action === "sell" ? "text-red-500" : lastTick.action === "error" ? "text-red-500" : ""}`}>
-                  {lastTick.action}
-                </p>
-                <p className="text-xs text-muted-foreground mt-0.5">{new Date(lastTick.created_at).toLocaleTimeString()}</p>
-              </>
-            ) : <p className="text-sm text-muted-foreground">—</p>}
-          </div>
-        </div>
+        {/* ── Hero row: P&L + Live BTC + RSI gauge ── */}
+        <div style={{ display: "grid", gridTemplateColumns: "1.5fr 1fr 220px", gap: 12, marginBottom: 12 }}>
 
-        {/* Two-column middle: position+chart left, ticks right */}
-        <div className="grid grid-cols-[1fr_320px] gap-4 items-start">
-
-          {/* LEFT: open position + P&L chart */}
-          <div className="space-y-4">
-            {openTrade ? (
-              <div className="rounded-lg border border-border p-4">
-                <div className="flex items-center justify-between mb-3">
-                  <h2 className="font-medium text-sm">Open position</h2>
-                  <button
-                    onClick={() => { if (confirm("Close this position?")) closeTrade.mutate(openTrade.id); }}
-                    disabled={closeTrade.isPending}
-                    className="text-xs px-3 h-7 rounded-md border border-border hover:bg-destructive hover:text-destructive-foreground hover:border-destructive disabled:opacity-40 transition-colors"
-                  >
-                    {closeTrade.isPending ? "Closing…" : "Close position"}
-                  </button>
+          {/* P&L Hero */}
+          <div className="t-panel" style={{ padding: "18px 22px" }}>
+            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 8 }}>
+              <span className="kicker">REALIZED P&L · ALL TIME</span>
+              <span className="mono dim" style={{ fontSize: 10.5 }}>{closedTrades.length} trades · {fmtUSD(totalInvested, 0)} cycled</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 14, flexWrap: "wrap", marginBottom: 14 }}>
+              <span className="hero-num" style={{ fontSize: 52, color: totalPnl >= 0 ? "var(--green)" : "var(--red)" }}>
+                {totalPnl >= 0 ? "+" : "−"}{fmtUSD(Math.abs(totalPnl))}
+              </span>
+              {openTrade && spot && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                  <span className="kicker" style={{ fontSize: 9 }}>UNREALIZED</span>
+                  <span className="mono" style={{ fontSize: 15, color: (spot - Number(openTrade.entry_price)) >= 0 ? "var(--green)" : "var(--red)" }}>
+                    {(spot - Number(openTrade.entry_price)) >= 0 ? "+" : "−"}
+                    {fmtUSD(Math.abs((spot - Number(openTrade.entry_price)) * Number(openTrade.size)))}
+                  </span>
                 </div>
-                <div className="grid grid-cols-4 gap-3 text-sm">
-                  <div>
-                    <p className="text-xs text-muted-foreground">Symbol</p>
-                    <p className="font-medium">{openTrade.symbol}</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-muted-foreground">Entry</p>
-                    <p className="font-medium">${fmt(openTrade.entry_price)}</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-muted-foreground">Current</p>
-                    <p className="font-medium">{openTrade.current_price ? `$${fmt(openTrade.current_price)}` : "—"}</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-muted-foreground">Unreal. P&L</p>
-                    <p className={`font-medium ${pnlColor(openTrade.unrealized_pnl)}`}>
-                      {openTrade.unrealized_pnl != null
-                        ? `${openTrade.unrealized_pnl >= 0 ? "+" : ""}$${fmt(openTrade.unrealized_pnl)}`
-                        : "—"}
-                    </p>
-                  </div>
-                </div>
-                <div className="mt-2.5 pt-2.5 border-t border-border flex gap-5 text-xs text-muted-foreground">
-                  <span>{Number(openTrade.size).toFixed(8)} BTC</span>
-                  <span>Invested ${fmt(openTrade.quote_size)}</span>
-                  <span>RSI {openTrade.rsi_at_entry?.toFixed(1) ?? "—"} at entry</span>
-                  {openTrade.unrealized_pnl_pct != null && (
-                    <span className={pnlColor(openTrade.unrealized_pnl_pct)}>
-                      ({openTrade.unrealized_pnl_pct >= 0 ? "+" : ""}{fmt(openTrade.unrealized_pnl_pct)}%)
-                    </span>
-                  )}
-                </div>
-              </div>
-            ) : (
-              <div className="rounded-lg border border-dashed border-border p-5 text-center text-sm text-muted-foreground">
-                No open position — watching for RSI &lt; {settings?.rsi_buy_threshold ?? 25}
-              </div>
-            )}
-
-            {/* P&L chart */}
-            {chartData.length > 1 ? (
-              <div className="rounded-lg border border-border p-4">
-                <h2 className="font-medium text-sm mb-3">Cumulative P&L</h2>
-                <ResponsiveContainer width="100%" height={150}>
-                  <AreaChart data={chartData} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
-                    <defs>
-                      <linearGradient id="pnlGrad" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor={totalPnl >= 0 ? "#16a34a" : "#dc2626"} stopOpacity={0.15} />
-                        <stop offset="95%" stopColor={totalPnl >= 0 ? "#16a34a" : "#dc2626"} stopOpacity={0} />
-                      </linearGradient>
-                    </defs>
-                    <XAxis dataKey="date" tick={{ fontSize: 10 }} tickLine={false} axisLine={false} />
-                    <YAxis tick={{ fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={(v) => `$${v.toFixed(2)}`} width={56} />
-                    <Tooltip formatter={(v: number) => [`$${v.toFixed(4)}`, "Cumulative P&L"]} />
-                    <Area type="monotone" dataKey="cumulative" stroke={totalPnl >= 0 ? "#16a34a" : "#dc2626"} fill="url(#pnlGrad)" strokeWidth={1.5} dot={false} />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
-            ) : (
-              <div className="rounded-lg border border-dashed border-border p-5 text-center text-xs text-muted-foreground">
-                P&L chart will appear after 2+ closed trades
-              </div>
-            )}
-          </div>
-
-          {/* RIGHT: recent ticks */}
-          <div className="rounded-lg border border-border overflow-hidden">
-            <div className="px-4 py-3 border-b border-border flex items-center justify-between">
-              <h2 className="font-medium text-sm">Live feed</h2>
-              {lastTick && (
-                <span className="text-xs text-muted-foreground">{new Date(lastTick.created_at).toLocaleTimeString()}</span>
               )}
             </div>
-            {tickLogs.length > 0 ? (
-              <div className="divide-y divide-border">
-                {tickLogs.map((t) => (
-                  <div key={t.id} className="px-4 py-2 text-xs">
-                    <div className="flex items-center justify-between gap-2 mb-0.5">
-                      <span className={`font-semibold capitalize ${
-                        t.action === "buy"   ? "text-green-600 dark:text-green-400"
-                        : t.action === "sell"  ? "text-red-500"
-                        : t.action === "error" ? "text-red-500"
-                        : "text-muted-foreground"
-                      }`}>{t.action}</span>
-                      <span className="text-muted-foreground shrink-0">{new Date(t.created_at).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}</span>
-                    </div>
-                    {t.reason && (
-                      <p className="text-muted-foreground truncate" title={t.reason}>{t.reason}</p>
-                    )}
-                    {(t.rsi != null || t.price != null) && (
-                      <p className="text-muted-foreground">
-                        {t.price != null ? `$${Number(t.price).toLocaleString("en-US", { maximumFractionDigits: 0 })}` : ""}
-                        {t.rsi != null ? ` · RSI ${Number(t.rsi).toFixed(1)}` : ""}
-                      </p>
-                    )}
-                  </div>
-                ))}
+            <div style={{ display: "flex", gap: 28, flexWrap: "wrap" }}>
+              {[
+                { label: "Win rate", value: winRate != null ? `${winRate.toFixed(0)}%` : "—", sub: `${wins}W · ${losses}L`, color: undefined },
+                { label: "Avg trade", value: avgTrade != null ? `${avgTrade >= 0 ? "+" : "−"}${fmtUSD(Math.abs(avgTrade))}` : "—", sub: "per trade", color: avgTrade != null ? (avgTrade >= 0 ? "var(--green)" : "var(--red)") : undefined },
+                { label: "ROI on capital", value: roi != null ? fmtPct(roi) : "—", sub: "vs amount cycled", color: roi != null ? (roi >= 0 ? "var(--green)" : "var(--red)") : undefined },
+                { label: "Best trade", value: closedTrades.length ? `+${fmtUSD(Math.max(...closedTrades.map((t) => Number(t.effective_pnl ?? t.pnl_usd ?? 0))))}` : "—", sub: "single close", color: "var(--green)" },
+              ].map(({ label, value, sub, color }) => (
+                <div key={label}>
+                  <div className="kicker" style={{ fontSize: 9.5 }}>{label}</div>
+                  <div className="mono" style={{ fontSize: 15, fontWeight: 500, marginTop: 2, color: color || "var(--text)" }}>{value}</div>
+                  {sub && <div className="mono dim" style={{ fontSize: 10, marginTop: 1 }}>{sub}</div>}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Live BTC price */}
+          <div className="t-panel" style={{ padding: "18px 20px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 6 }}>
+              <div>
+                <div className="kicker">{settings?.symbol ?? "BTC-USD"} · LIVE</div>
+                <div className="mono" style={{ fontSize: 10, color: "var(--text-3)", marginTop: 2 }}>
+                  {lastUpdate
+                    ? <><span className="dot dot-green" style={{ width: 5, height: 5, marginRight: 5, verticalAlign: "middle" }} />syncing</>
+                    : "connecting…"}
+                </div>
               </div>
-            ) : (
-              <p className="px-4 py-6 text-center text-xs text-muted-foreground">No ticks yet</p>
-            )}
+              <Sparkline data={sparkline} width={110} height={34} />
+            </div>
+            <div className={`hero-num mono ${spotTickClass}`} style={{ fontSize: 34, marginTop: 4 }}>
+              {spot != null ? "$" + Math.round(spot).toLocaleString() : "— — —"}
+              {spot != null && (
+                <span style={{ fontSize: 16, color: "var(--text-3)" }}>
+                  .{((spot * 100) % 100).toFixed(0).padStart(2, "0")}
+                </span>
+              )}
+            </div>
+            <div style={{ marginTop: 10, display: "flex", gap: 14, fontSize: 11, fontFamily: "JetBrains Mono, monospace" }}>
+              <div>
+                <span className="dim">24h </span>
+                <span style={{ color: (change24h?.pct ?? 0) >= 0 ? "var(--green)" : "var(--red)", fontWeight: 600 }}>
+                  {change24h ? fmtPct(change24h.pct) : "—"}
+                </span>
+              </div>
+              <div>
+                <span className="dim">Δ </span>
+                <span style={{ color: (change24h?.abs ?? 0) >= 0 ? "var(--green)" : "var(--red)" }}>
+                  {change24h ? (change24h.abs >= 0 ? "+" : "−") + fmtUSD(Math.abs(change24h.abs), 0) : "—"}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* RSI Gauge */}
+          <div className="t-panel" style={{ padding: "14px 16px 12px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+            <div className="kicker" style={{ alignSelf: "flex-start", marginBottom: 4 }}>RSI(14) · 5M</div>
+            <RSIGauge value={currentRSI} buyT={buyT} sellT={sellT} size={170} />
           </div>
         </div>
 
-        {/* Trade history — compact table */}
-        {closedTrades.length > 0 && (
-          <div className="rounded-lg border border-border overflow-hidden">
-            <div className="px-5 py-3 border-b border-border">
-              <h2 className="font-medium text-sm">Trade history</h2>
+        {/* ── Chart + right rail ── */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 340px", gap: 12, marginBottom: 12 }}>
+
+          {/* Price chart */}
+          <div className="t-panel" style={{ padding: 16 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                <span className="kicker">{settings?.symbol ?? "BTC-USD"} · 5m · {candles.length} candles</span>
+                <div style={{ display: "flex", gap: 10, fontSize: 10.5, fontFamily: "JetBrains Mono, monospace" }}>
+                  <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <svg width="9" height="9" viewBox="0 0 9 9"><polygon points="4.5,1 8,7 1,7" fill="var(--green)" /></svg>
+                    <span className="dim">BUY</span>
+                  </span>
+                  <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <svg width="9" height="9" viewBox="0 0 9 9"><polygon points="1,2 8,2 4.5,8" fill="var(--red)" /></svg>
+                    <span className="dim">SELL</span>
+                  </span>
+                  <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <span className="dot dot-amber" style={{ width: 6, height: 6 }} />
+                    <span className="dim">OPEN</span>
+                  </span>
+                </div>
+              </div>
+              <span className="mono dim" style={{ fontSize: 10 }}>
+                {closedTrades.length} closed · {openTrade ? "1 open" : "0 open"}
+              </span>
             </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="border-b border-border bg-muted/40">
-                    <th className="text-left px-4 py-2 font-medium text-muted-foreground w-8">#</th>
-                    <th className="text-left px-2 py-2 font-medium text-muted-foreground">Symbol</th>
-                    <th className="text-right px-2 py-2 font-medium text-muted-foreground">Entry</th>
-                    <th className="text-right px-2 py-2 font-medium text-muted-foreground">Exit</th>
-                    <th className="text-right px-2 py-2 font-medium text-muted-foreground">P&L</th>
-                    <th className="text-right px-2 py-2 font-medium text-muted-foreground">Held</th>
-                    <th className="text-right px-2 py-2 font-medium text-muted-foreground">RSI</th>
-                    <th className="text-left px-4 py-2 font-medium text-muted-foreground">Reason</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-border">
-                  {closedTrades.map((t, idx) => {
-                    const pnl    = Number(t.effective_pnl ?? t.pnl_usd ?? 0);
-                    const pnlPct = Number(t.pnl_pct ?? 0);
-                    const held   = duration(t.created_at, t.closed_at);
-                    return (
-                      <tr key={t.id} className="hover:bg-muted/30 transition-colors">
-                        <td className="px-4 py-2.5 text-muted-foreground">{closedTrades.length - idx}</td>
-                        <td className="px-2 py-2.5">
-                          <div className="flex items-center gap-1.5">
-                            {pnl > 0
-                              ? <TrendingUp className="w-3 h-3 text-green-500 shrink-0" />
-                              : pnl < 0
-                                ? <TrendingDown className="w-3 h-3 text-red-500 shrink-0" />
-                                : <Minus className="w-3 h-3 text-muted-foreground shrink-0" />}
-                            <span className="font-medium">{t.symbol}</span>
-                          </div>
-                        </td>
-                        <td className="px-2 py-2.5 text-right tabular-nums">${fmt(t.entry_price)}</td>
-                        <td className="px-2 py-2.5 text-right tabular-nums">${fmt(t.exit_price)}</td>
-                        <td className={`px-2 py-2.5 text-right tabular-nums font-medium ${pnlColor(pnl)}`}>
-                          {pnl >= 0 ? "+" : ""}${fmt(pnl)}
-                          <span className="font-normal text-muted-foreground ml-1">({pnl >= 0 ? "+" : ""}{fmt(pnlPct)}%)</span>
-                        </td>
-                        <td className="px-2 py-2.5 text-right text-muted-foreground">{held}</td>
-                        <td className="px-2 py-2.5 text-right text-muted-foreground">{t.rsi_at_entry?.toFixed(1) ?? "—"}</td>
-                        <td className="px-4 py-2.5">
-                          {t.close_reason ? (
-                            <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded-full ${
-                              t.close_reason === "trailing_stop" ? "bg-orange-100 text-orange-700 dark:bg-orange-900 dark:text-orange-300"
-                              : t.close_reason === "stop_loss"   ? "bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300"
-                              : t.close_reason === "take_profit" ? "bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300"
-                              : t.close_reason === "rsi_signal"  ? "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300"
-                              : "bg-muted text-muted-foreground"
-                            }`}>
-                              {closeReasonLabel(t.close_reason)}
-                            </span>
-                          ) : <span className="text-muted-foreground">—</span>}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+            <PriceChart
+              candles={candles}
+              trades={chartTrades}
+              rsiSeries={rsiSeries}
+              openTrade={openTradeForChart}
+              height={360}
+              spot={spot}
+            />
           </div>
-        )}
+
+          {/* Right rail: position + tick feed */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <PositionPanel
+              openTrade={openTrade}
+              spot={spot}
+              settings={settings}
+              currentRSI={currentRSI}
+              onClose={() => closeTrade.mutate()}
+              closing={closeTrade.isPending}
+            />
+            <TickFeed ticks={tickLogs} />
+          </div>
+        </div>
+
+        {/* ── Trade history ── */}
+        <TradeHistory trades={closedTrades} />
+
+        {/* ── Footer ── */}
+        <div style={{ marginTop: 12, padding: "10px 4px", display: "flex", justifyContent: "space-between", fontSize: 10, color: "var(--text-4)", fontFamily: "JetBrains Mono, monospace", borderTop: "1px solid var(--t-border)" }}>
+          <span>CAPITAL_BOT · {settings?.symbol ?? "BTC-USD"} · COINBASE</span>
+          <span>RSI({14}) · 5m · FLY.IO WORKER</span>
+          <span>STRATEGY: BUY &lt; RSI {buyT} · SELL &gt; RSI {sellT}</span>
+        </div>
       </main>
     </div>
   );

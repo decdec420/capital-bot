@@ -48,3 +48,146 @@
   * { @apply border-border; }
   body { @apply bg-background text-foreground; font-feature-settings: "rlig" 1, "calt" 1; }
 }
+
+/* ── Terminal theme variables (always-dark trading terminal) ── */
+:root {
+  --bg:        #0a0b0d;
+  --bg-1:      #0f1114;
+  --bg-2:      #14171b;
+  --bg-3:      #1a1e23;
+  --t-border:  #1f2429;
+  --border-2:  #2a3036;
+  --text:      #e7ecf1;
+  --text-2:    #a7afba;
+  --text-3:    #6c747f;
+  --text-4:    #454c55;
+  --green:     #4ade80;
+  --green-2:   #22c55e;
+  --green-bg:  rgba(74, 222, 128, 0.08);
+  --red:       #f87171;
+  --red-2:     #ef4444;
+  --red-bg:    rgba(248, 113, 113, 0.08);
+  --amber:     #fbbf24;
+  --amber-bg:  rgba(251, 191, 36, 0.08);
+  --blue:      #60a5fa;
+  --blue-bg:   rgba(96, 165, 250, 0.08);
+  --grid-line: rgba(255, 255, 255, 0.035);
+  --t-shadow:  0 1px 2px rgba(0,0,0,.5), 0 4px 16px rgba(0,0,0,.4);
+}
+
+/* ── Utility: mono font ── */
+.mono {
+  font-family: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+.kicker {
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  font-family: inherit;
+}
+.dim    { color: var(--text-3); }
+.dimmer { color: var(--text-4); }
+.hero-num { font-variant-numeric: tabular-nums; line-height: 1; }
+
+/* ── Pills ── */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.pill-green { background: var(--green-bg); color: var(--green); border: 1px solid rgba(74,222,128,.18); }
+.pill-red   { background: var(--red-bg);   color: var(--red);   border: 1px solid rgba(248,113,113,.18); }
+.pill-amber { background: var(--amber-bg); color: var(--amber); border: 1px solid rgba(251,191,36,.18); }
+.pill-blue  { background: var(--blue-bg);  color: var(--blue);  border: 1px solid rgba(96,165,250,.18); }
+.pill-muted { background: rgba(255,255,255,.04); color: var(--text-3); border: 1px solid rgba(255,255,255,.07); }
+.pill-danger{ background: var(--red-bg);   color: var(--red);   border: 1px solid rgba(248,113,113,.18); cursor: pointer; }
+.pill-danger:hover { background: var(--red); color: #000; }
+
+/* ── Status dots ── */
+.dot {
+  display: inline-block;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.dot-green { background: var(--green); box-shadow: 0 0 5px var(--green); animation: dotpulse 2s ease-in-out infinite; }
+.dot-red   { background: var(--red); }
+.dot-amber { background: var(--amber); }
+
+@keyframes dotpulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.45; }
+}
+
+/* ── Price tick flash ── */
+@keyframes tickUp   { 0%,100%{color:var(--text)} 25%{color:var(--green)} }
+@keyframes tickDown { 0%,100%{color:var(--text)} 25%{color:var(--red)}   }
+.tick-up   { animation: tickUp   0.7s ease-out; }
+.tick-down { animation: tickDown 0.7s ease-out; }
+
+/* ── Background grid ── */
+.app-grid {
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 48px 48px;
+  background-position: -1px -1px;
+}
+
+/* ── Panel base ── */
+.t-panel {
+  background: var(--bg-1);
+  border: 1px solid var(--t-border);
+  border-radius: 10px;
+}
+.t-panel-hd {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--t-border);
+}
+
+/* ── Buttons ── */
+.t-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 7px;
+  border: 1px solid var(--t-border);
+  background: var(--bg-2);
+  color: var(--text-2);
+  font-size: 11.5px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background .15s, color .15s;
+  white-space: nowrap;
+}
+.t-btn:hover  { background: var(--bg-3); color: var(--text); }
+.t-btn:disabled { opacity: 0.35; cursor: default; }
+.t-btn-danger { border-color: rgba(248,113,113,.25); color: var(--red); }
+.t-btn-danger:hover { background: var(--red-bg); }
+
+/* ── Table ── */
+.t-table { width: 100%; border-collapse: collapse; font-size: 12px; font-family: 'JetBrains Mono', monospace; }
+.t-table th { padding: 7px 12px; text-align: right; font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-3); font-weight: 600; white-space: nowrap; border-bottom: 1px solid var(--t-border); background: var(--bg-2); }
+.t-table th:first-child, .t-table td:first-child { text-align: left; }
+.t-table td { padding: 8px 12px; text-align: right; border-bottom: 1px solid rgba(255,255,255,.04); white-space: nowrap; color: var(--text); }
+.t-table tr:last-child td { border-bottom: none; }
+.t-table tr:hover td { background: rgba(255,255,255,.025); }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 4px; border: 2px solid var(--bg); }
+::-webkit-scrollbar-thumb:hover { background: var(--text-4); }
