@@ -13,13 +13,16 @@ export interface TradeHandler {
 export class CoinbaseWs {
   private symbols: string[];
   private onTrade: TradeHandler;
+  private onReconnect: (() => void) | null;
   private ws: WebSocket | null = null;
   private reconnectDelay = 1000;
   private stopped = false;
+  private isFirstConnect = true;
 
-  constructor(symbols: string[], onTrade: TradeHandler) {
+  constructor(symbols: string[], onTrade: TradeHandler, onReconnect?: () => void) {
     this.symbols = symbols;
     this.onTrade = onTrade;
+    this.onReconnect = onReconnect ?? null;
   }
 
   start() {
@@ -40,6 +43,10 @@ export class CoinbaseWs {
     this.ws = ws;
 
     ws.onopen = () => {
+      if (!this.isFirstConnect && this.onReconnect) {
+        this.onReconnect();
+      }
+      this.isFirstConnect = false;
       console.log("[ws] connected");
       this.reconnectDelay = 1000; // reset backoff
       // Subscribe to market_trades (public channel — no auth required)

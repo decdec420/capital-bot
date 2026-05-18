@@ -36,6 +36,7 @@ interface SymbolState {
   recentCandles: Candle[]; // last N candles for volume filter
   lastRsi:      number;
   currentPrice: number;
+  lastTickMs:   number;    // wall-clock ms of most recent trade tick (for dead-man's switch)
 }
 
 // ── Per-user state ──────────────────────────────────────────
@@ -67,6 +68,7 @@ async function warmupSymbol(symbol: string, creds: Credentials): Promise<void> {
       recentCandles: candles.slice(-20),
       lastRsi,
       currentPrice: closePrices[closePrices.length - 1] ?? 0,
+      lastTickMs: Date.now(),
     });
     console.log(`[warmup] ${symbol} — ${candles.length} candles, RSI=${lastRsi.toFixed(2)}`);
   } catch (e) {
@@ -78,6 +80,7 @@ async function warmupSymbol(symbol: string, creds: Credentials): Promise<void> {
       recentCandles: [],
       lastRsi: 50,
       currentPrice: 0,
+      lastTickMs: Date.now(),
     });
   }
 }
@@ -315,6 +318,7 @@ async function onTrade(symbol: string, price: number, size: number): Promise<voi
   if (!symState) return;
 
   symState.currentPrice = price;
+  symState.lastTickMs = Date.now();
   const closedCandle = symState.builder.addTick(price, size);
 
   // Every tick: check risk exits for all users on this symbol
@@ -444,25 +448,47 @@ async function main() {
       await probeAuth(creds); // verify JWT signing works for order placement
     } else {
       console.warn(`[main] no credentials available for ${symbol} warmup — starting cold`);
-      symbolStates.set(symbol, { builder: new CandleBuilder(), closePrices: [], recentCandles: [], lastRsi: 50, currentPrice: 0 });
+      symbolStates.set(symbol, { builder: new CandleBuilder(), closePrices: [], recentCandles: [], lastRsi: 50, currentPrice: 0, lastTickMs: Date.now() });
     }
   }
 
-  // Start WebSocket
-  const ws = new CoinbaseWs([...symbols], (symbol, price, size) => {
-    onTrade(symbol, price, size).catch(console.error);
-  });
+  // Start WebSocket — alert on reconnection so we know if it was unstable
+  const ws = new CoinbaseWs(
+    [...symbols],
+    (symbol, price, size) => { onTrade(symbol, price, size).catch(console.error); },
+    () => {
+      console.warn("[ws] reconnected after disconnect");
+      sendTelegram("⚠️ capital-bot: WebSocket reconnected after a disconnect. Bot is back online.").catch(console.error);
+    },
+  );
   ws.start();
 
-  // Reload settings periodically
+  const STALE_TICK_MS = 10 * 60 * 1000; // alert if no tick for 10 minutes
+  let lastStalertMs = 0; // rate-limit stale alerts to once per 30 min
+
+  // Reload settings + dead-man's switch check
   setInterval(async () => {
     await reloadSettings();
+
+    // Dead-man's switch: alert via Telegram if a symbol has gone silent
+    const now = Date.now();
+    for (const [symbol, s] of symbolStates) {
+      const silentMs = now - s.lastTickMs;
+      if (silentMs > STALE_TICK_MS && now - lastStalertMs > 30 * 60 * 1000) {
+        const mins = Math.floor(silentMs / 60_000);
+        console.warn(`[watchdog] ${symbol} — no ticks for ${mins} min`);
+        await sendTelegram(
+          `⚠️ capital-bot watchdog: no ticks for ${symbol} in ${mins} minutes.\n` +
+          `WebSocket may be disconnected. Check: fly logs --app capital-bot-worker-black-moonrise-2383`
+        ).catch(console.error);
+        lastStalertMs = now;
+      }
+    }
+
     // Subscribe to any new symbols
     for (const u of userStates.values()) {
       if (!symbolStates.has(u.settings.symbol)) {
         console.log(`[main] new symbol detected: ${u.settings.symbol}`);
-        // Restart WS with new symbol set (simple approach)
-        // In production you'd send a new subscribe message
         ws.stop();
         setTimeout(() => ws.start(), 1000);
       }
