@@ -8,12 +8,12 @@
 //   • ZERO simulation, ZERO mock data — paper trades are real DB records
 //   • The Fly.io worker is the single source of truth for trade execution
 
-import { useEffect, useRef, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useState, useCallback } from "react";
 import { Link } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
-import { Settings, LogOut, Power, RefreshCw } from "lucide-react";
+import { Settings, LogOut, RefreshCw } from "lucide-react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 
 // ─────────────────────────────────────────────────────────────────────────────

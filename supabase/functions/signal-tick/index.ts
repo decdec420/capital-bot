@@ -1,3 +1,4 @@
+// deno-lint-ignore-file no-explicit-any
 // ============================================================
 // signal-tick — the bot's core trading loop
 // ============================================================
@@ -18,8 +19,8 @@
 // trades table. No ghost trades.
 // ============================================================
 
-import { getBrokerCredentials, placeMarketBuy, placeMarketSell } from "../_shared/broker.ts";
-import { fetchCandles, currentRsi } from "../_shared/indicators.ts";
+import { fetchBestBidAsk, getBrokerCredentials, placeMarketBuy, placeMarketSell } from "../_shared/broker.ts";
+import { fetchCandles, currentRsi, type Candle } from "../_shared/indicators.ts";
 import { corsHeaders, makeCorsHeaders } from "../_shared/cors.ts";
 import { log } from "../_shared/logger.ts";
 import { sendTelegram, fmtBuy, fmtSell } from "../_shared/telegram.ts";
@@ -45,6 +46,11 @@ interface Settings {
   stop_loss_pct: number;      // e.g. 5 = close if down 5% from entry
   take_profit_pct: number;    // e.g. 10 = close if up 10% from entry
   trailing_stop_pct: number;  // e.g. 3 = close if price drops 3% from its peak
+  daily_loss_limit_usd: number;
+  max_drawdown_pct: number;
+  max_spread_pct: number;
+  max_volatility_pct: number;
+  entry_score_threshold: number;
 }
 
 /**
@@ -61,6 +67,99 @@ function volumeFilterPass(candles: { volume: number }[]): boolean {
   return latest >= median * 0.5;
 }
 
+
+function volatilityPct(candle: { high: number; low: number }): number {
+  const mid = (candle.high + candle.low) / 2;
+  return mid > 0 ? ((candle.high - candle.low) / mid) * 100 : Number.POSITIVE_INFINITY;
+}
+
+function drawdownPct(rows: Array<{ effective_pnl: number; pnl_pct: number; quote_size: number }>): number {
+  let cumulativeReturnPct = 0;
+  let peakReturnPct = 0;
+  let maxDrawdownPct = 0;
+  for (const row of rows) {
+    const tradeReturnPct = row.quote_size > 0 ? (row.effective_pnl / row.quote_size) * 100 : row.pnl_pct;
+    cumulativeReturnPct += Number.isFinite(tradeReturnPct) ? tradeReturnPct : 0;
+    peakReturnPct = Math.max(peakReturnPct, cumulativeReturnPct);
+    maxDrawdownPct = Math.max(maxDrawdownPct, peakReturnPct - cumulativeReturnPct);
+  }
+  return maxDrawdownPct;
+}
+
+async function riskBlocked(admin: any, userId: string, symbol: string, rsiValue: number, price: number, blocker: string) {
+  const reason = `RISK_BLOCKED: ${blocker}`;
+  log("warn", "RISK_BLOCKED", { fn: FN, user_id: userId, symbol, blocker });
+  await logTick(admin, userId, symbol, rsiValue, price, "RISK_BLOCKED", reason);
+  return { action: "RISK_BLOCKED", rsi: rsiValue, price, reason };
+}
+
+async function loadClosedRiskRows(admin: any, userId: string) {
+  const { data, error } = await admin
+    .from("trades")
+    .select("effective_pnl, pnl_usd, pnl_pct, quote_size, closed_at, created_at")
+    .eq("user_id", userId)
+    .eq("status", "closed")
+    .order("closed_at", { ascending: true, nullsFirst: false })
+    .order("created_at", { ascending: true });
+  if (error) throw new Error(`[signal-tick] DB error loading risk history: ${error.message}`);
+  return (data ?? []).map((row: any) => ({
+    effective_pnl: Number(row.effective_pnl ?? row.pnl_usd ?? 0),
+    pnl_pct: Number(row.pnl_pct ?? 0),
+    quote_size: Number(row.quote_size ?? 0),
+    closed_at: row.closed_at ?? null,
+    created_at: row.created_at,
+  }));
+}
+
+async function entryRiskBlocker(admin: any, settings: Settings, openTrade: any, candles: Array<{ start: number; high: number; low: number }>, rsiValue: number, currentPrice: number): Promise<string | null> {
+  if (openTrade) return `existing_open_position:${openTrade.id}`;
+
+  if (!currentPrice || !Number.isFinite(currentPrice)) return "stale_market_data:invalid_price";
+  if (candles.length < 15) return `missing_candles:have_${candles.length}_need_15`;
+  const latestCandle = candles[candles.length - 1];
+  const candleAgeSeconds = Math.floor(Date.now() / 1000) - latestCandle.start;
+  if (candleAgeSeconds > 10 * 60) return `stale_market_data:last_candle_${candleAgeSeconds}s_old`;
+
+  if (settings.max_volatility_pct > 0) {
+    const volPct = volatilityPct(latestCandle);
+    if (volPct > settings.max_volatility_pct) return `high_volatility_spike:${volPct.toFixed(2)}pct>${settings.max_volatility_pct}pct`;
+  }
+
+  const rows = await loadClosedRiskRows(admin, settings.user_id);
+  if (settings.daily_loss_limit_usd > 0) {
+    const startOfUtcDay = new Date();
+    startOfUtcDay.setUTCHours(0, 0, 0, 0);
+    const dailyPnl = rows
+      .filter((row) => new Date(row.closed_at ?? row.created_at).getTime() >= startOfUtcDay.getTime())
+      .reduce((sum, row) => sum + row.effective_pnl, 0);
+    if (dailyPnl <= -settings.daily_loss_limit_usd) return `daily_loss_limit:${dailyPnl.toFixed(2)}<=-${settings.daily_loss_limit_usd}`;
+  }
+
+  if (settings.max_drawdown_pct > 0) {
+    const maxDd = drawdownPct(rows);
+    if (maxDd >= settings.max_drawdown_pct) return `max_drawdown:${maxDd.toFixed(2)}pct>=${settings.max_drawdown_pct}pct`;
+  }
+
+  let spreadPct = 0;
+  try {
+    const quote = await fetchBestBidAsk(settings.symbol);
+    spreadPct = quote.spreadPct;
+    if (settings.max_spread_pct > 0 && spreadPct > settings.max_spread_pct) {
+      return `unacceptable_spread:${spreadPct.toFixed(3)}pct>${settings.max_spread_pct}pct`;
+    }
+  } catch (e) {
+    return `stale_market_data:bid_ask_unavailable:${e instanceof Error ? e.message : String(e)}`;
+  }
+
+  if (settings.entry_score_threshold > 0) {
+    const entryScore = settings.rsi_buy_threshold - rsiValue;
+    const netEntryScore = entryScore - spreadPct / 2;
+    if (netEntryScore < settings.entry_score_threshold) return `fee_slippage_drag:score_${netEntryScore.toFixed(2)}<${settings.entry_score_threshold}`;
+  }
+
+  return null;
+}
+
 // deno-lint-ignore no-explicit-any
 async function runTickForUser(admin: any, settings: Settings): Promise<{
   action: string;
@@ -74,7 +173,12 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
   // 5-minute candles, 100 periods = ~8 hours of data for solid RSI warmup.
   // Each cron tick (every 5 min) closes a fresh candle → RSI reacts to every move.
   const creds = await getBrokerCredentials(admin, user_id);
-  const candles = await fetchCandles(creds, symbol, 100, "FIVE_MINUTE");
+  let candles: Candle[];
+  try {
+    candles = await fetchCandles(creds, symbol, 100, "FIVE_MINUTE");
+  } catch (e) {
+    return riskBlocked(admin, user_id, symbol, 0, 0, `missing_candles:${e instanceof Error ? e.message : String(e)}`);
+  }
   const rsiValue = currentRsi(candles, 14);
   const currentPrice = candles[candles.length - 1].close;
 
@@ -167,8 +271,15 @@ async function runTickForUser(admin: any, settings: Settings): Promise<{
   const hasBuySignal  = rsiValue < rsi_buy_threshold;
   const hasSellSignal = rsiValue > rsi_sell_threshold;
 
+  if (hasBuySignal && openTrade) {
+    return riskBlocked(admin, user_id, symbol, rsiValue, currentPrice, `existing_open_position:${openTrade.id}`);
+  }
+
   // ── BUY ──────────────────────────────────────────────────
   if (hasBuySignal && !openTrade) {
+    const blocker = await entryRiskBlocker(admin, settings, openTrade, candles, rsiValue, currentPrice);
+    if (blocker) return riskBlocked(admin, user_id, symbol, rsiValue, currentPrice, blocker);
+
     log("info", "buy_signal", { fn: FN, user_id, symbol, rsi: rsiValue.toFixed(2), amount: buy_amount_usd, live: live_trading });
 
     if (!live_trading) {
@@ -301,7 +412,7 @@ Deno.serve(async (req) => {
     if (CRON_TOKEN && bearer === CRON_TOKEN) {
       const { data: allSettings, error } = await admin
         .from("settings")
-        .select("user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, stop_loss_pct, take_profit_pct, trailing_stop_pct")
+        .select("user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, stop_loss_pct, take_profit_pct, trailing_stop_pct, daily_loss_limit_usd, max_drawdown_pct, max_spread_pct, max_volatility_pct, entry_score_threshold")
         .eq("enabled", true);
 
       if (error) return json({ ok: false, error: error.message }, 500, cors);
@@ -333,7 +444,7 @@ Deno.serve(async (req) => {
 
     const { data: settings, error: settingsErr } = await admin
       .from("settings")
-      .select("user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, enabled, stop_loss_pct, take_profit_pct, trailing_stop_pct")
+      .select("user_id, symbol, buy_amount_usd, rsi_buy_threshold, rsi_sell_threshold, live_trading, enabled, stop_loss_pct, take_profit_pct, trailing_stop_pct, daily_loss_limit_usd, max_drawdown_pct, max_spread_pct, max_volatility_pct, entry_score_threshold")
       .eq("user_id", user.id)
       .maybeSingle();
 

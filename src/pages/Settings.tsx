@@ -16,6 +16,11 @@ interface BotSettings {
   stop_loss_pct: number;
   take_profit_pct: number;
   trailing_stop_pct: number;
+  daily_loss_limit_usd: number;
+  max_drawdown_pct: number;
+  max_spread_pct: number;
+  max_volatility_pct: number;
+  entry_score_threshold: number;
 }
 
 function Label({ children }: { children: React.ReactNode }) {
@@ -36,6 +41,8 @@ export default function Settings() {
     symbol: "BTC-USD", buy_amount_usd: 10, rsi_buy_threshold: 40,
     rsi_sell_threshold: 60, enabled: false, live_trading: false,
     stop_loss_pct: 2, take_profit_pct: 5, trailing_stop_pct: 1.5,
+    daily_loss_limit_usd: 25, max_drawdown_pct: 10, max_spread_pct: 0.25,
+    max_volatility_pct: 3, entry_score_threshold: 1,
   });
   const [apiKeyName, setApiKeyName] = useState("");
   const [privatePem, setPrivatePem] = useState("");
@@ -61,7 +68,7 @@ export default function Settings() {
   });
 
   useEffect(() => {
-    if (savedSettings) setForm(savedSettings as BotSettings);
+    if (savedSettings) setForm((prev) => ({ ...prev, ...(savedSettings as BotSettings) }));
   }, [savedSettings]);
 
   useEffect(() => {
@@ -271,6 +278,84 @@ export default function Settings() {
             <Hint>Sell if price drops this % from its peak since entry. 1.5% locks in gains on short moves. 0 = disabled.</Hint>
           </Field>
 
+
+
+          <div className="border-t border-border pt-5 space-y-5">
+            <div>
+              <h3 className="text-sm font-semibold">Entry risk gates</h3>
+              <Hint>Hard blockers checked immediately before any buy. Set a value to 0 to disable that gate.</Hint>
+            </div>
+
+            <Field>
+              <Label>Daily loss limit (USD)</Label>
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-muted-foreground">$</span>
+                <input
+                  type="number" min="0" max="10000" step="1"
+                  value={form.daily_loss_limit_usd}
+                  onChange={(e) => set("daily_loss_limit_usd")(Number(e.target.value))}
+                  className="h-9 w-32 rounded-md border border-input bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring"
+                />
+              </div>
+              <Hint>Block new entries once today’s closed net P&amp;L is below this loss amount.</Hint>
+            </Field>
+
+            <Field>
+              <div className="flex items-center justify-between">
+                <Label>Max drawdown %</Label>
+                <span className="text-sm font-medium tabular-nums">{form.max_drawdown_pct === 0 ? "Off" : `${form.max_drawdown_pct}%`}</span>
+              </div>
+              <input
+                type="range" min="0" max="50" step="0.5"
+                value={form.max_drawdown_pct}
+                onChange={(e) => set("max_drawdown_pct")(Number(e.target.value))}
+                className="w-full"
+              />
+              <Hint>Block entries if the closed-trade equity curve has drawn down this far from peak.</Hint>
+            </Field>
+
+            <Field>
+              <div className="flex items-center justify-between">
+                <Label>Max spread %</Label>
+                <span className="text-sm font-medium tabular-nums">{form.max_spread_pct === 0 ? "Off" : `${form.max_spread_pct}%`}</span>
+              </div>
+              <input
+                type="range" min="0" max="2" step="0.01"
+                value={form.max_spread_pct}
+                onChange={(e) => set("max_spread_pct")(Number(e.target.value))}
+                className="w-full"
+              />
+              <Hint>Block buys when Coinbase bid/ask spread is too wide.</Hint>
+            </Field>
+
+            <Field>
+              <div className="flex items-center justify-between">
+                <Label>Max candle volatility %</Label>
+                <span className="text-sm font-medium tabular-nums">{form.max_volatility_pct === 0 ? "Off" : `${form.max_volatility_pct}%`}</span>
+              </div>
+              <input
+                type="range" min="0" max="10" step="0.1"
+                value={form.max_volatility_pct}
+                onChange={(e) => set("max_volatility_pct")(Number(e.target.value))}
+                className="w-full"
+              />
+              <Hint>Block entries during high-volatility spikes measured by the latest candle high/low range.</Hint>
+            </Field>
+
+            <Field>
+              <div className="flex items-center justify-between">
+                <Label>Entry score threshold</Label>
+                <span className="text-sm font-medium tabular-nums">{form.entry_score_threshold === 0 ? "Off" : form.entry_score_threshold}</span>
+              </div>
+              <input
+                type="range" min="0" max="10" step="0.5"
+                value={form.entry_score_threshold}
+                onChange={(e) => set("entry_score_threshold")(Number(e.target.value))}
+                className="w-full"
+              />
+              <Hint>Require RSI edge after estimated spread/slippage drag. Higher = fewer, stronger entries.</Hint>
+            </Field>
+          </div>
           <Field>
             <div className="flex items-center justify-between">
               <Label>Take-profit %</Label>

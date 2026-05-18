@@ -22,7 +22,21 @@ export interface Settings {
   stop_loss_pct: number;
   take_profit_pct: number;
   trailing_stop_pct: number;
+  daily_loss_limit_usd: number;
+  max_drawdown_pct: number;
+  max_spread_pct: number;
+  max_volatility_pct: number;
+  entry_score_threshold: number;
   enabled: boolean;
+}
+
+export interface ClosedTradeRiskRow {
+  effective_pnl: number;
+  pnl_usd: number;
+  pnl_pct: number;
+  quote_size: number;
+  closed_at: string | null;
+  created_at: string;
 }
 
 export interface OpenTrade {
@@ -51,7 +65,7 @@ async function rest(method: string, path: string, body?: unknown): Promise<any> 
 
 /** Load all enabled users' settings */
 export async function loadAllSettings(): Promise<Settings[]> {
-  return rest("GET", "/settings?enabled=eq.true&select=user_id,symbol,buy_amount_usd,rsi_buy_threshold,rsi_sell_threshold,live_trading,stop_loss_pct,take_profit_pct,trailing_stop_pct,enabled");
+  return rest("GET", "/settings?enabled=eq.true&select=user_id,symbol,buy_amount_usd,rsi_buy_threshold,rsi_sell_threshold,live_trading,stop_loss_pct,take_profit_pct,trailing_stop_pct,daily_loss_limit_usd,max_drawdown_pct,max_spread_pct,max_volatility_pct,entry_score_threshold,enabled");
 }
 
 /** Load open trade for a user (null if none) */
@@ -68,6 +82,19 @@ export async function loadOpenTrade(userId: string): Promise<OpenTrade | null> {
     trailing_high: r.trailing_high ? Number(r.trailing_high) : null,
     rsi_at_entry: Number(r.rsi_at_entry ?? 0),
   };
+}
+
+/** Load closed trades for loss and drawdown gates */
+export async function loadClosedTradeRiskRows(userId: string): Promise<ClosedTradeRiskRow[]> {
+  const rows = await rest("GET", `/trades?user_id=eq.${userId}&status=eq.closed&select=effective_pnl,pnl_usd,pnl_pct,quote_size,closed_at,created_at&order=closed_at.asc.nullslast,created_at.asc`);
+  return (rows ?? []).map((r: any) => ({
+    effective_pnl: Number(r.effective_pnl ?? r.pnl_usd ?? 0),
+    pnl_usd: Number(r.pnl_usd ?? r.effective_pnl ?? 0),
+    pnl_pct: Number(r.pnl_pct ?? 0),
+    quote_size: Number(r.quote_size ?? 0),
+    closed_at: r.closed_at ?? null,
+    created_at: r.created_at,
+  }));
 }
 
 /** Get Coinbase credentials for a user from Vault */

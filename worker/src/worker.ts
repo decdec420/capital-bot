@@ -14,11 +14,11 @@
 
 import { CoinbaseWs } from "./coinbase-ws.ts";
 import { CandleBuilder, computeRsi, volumeFilterPass, type Candle } from "./indicators.ts";
-import { fetchHistoricalCandles, placeMarketBuy, placeMarketSell, probeAuth, type Credentials } from "./broker.ts";
+import { fetchBestBidAsk, fetchHistoricalCandles, placeMarketBuy, placeMarketSell, probeAuth, type Credentials } from "./broker.ts";
 import {
   loadAllSettings, loadOpenTrade, getCoinbaseCredentials,
   insertTrade, insertPendingTrade, confirmTrade, deleteTrade,
-  loadPendingTrades, closeTrade, updateTrailingHigh, logTick,
+  loadPendingTrades, closeTrade, updateTrailingHigh, logTick, loadClosedTradeRiskRows,
   type Settings, type OpenTrade,
 } from "./supabase.ts";
 import { sendTelegram, fmtBuy, fmtSell } from "./telegram.ts";
@@ -132,6 +132,112 @@ async function reloadSettings(): Promise<void> {
   }
 }
 
+
+interface EntryRiskContext {
+  currentPrice: number;
+  lastRsi: number;
+  recentCandles: Candle[];
+  closedCandle?: Candle;
+}
+
+function calcVolatilityPct(candle: Candle): number {
+  const mid = (candle.high + candle.low) / 2;
+  return mid > 0 ? ((candle.high - candle.low) / mid) * 100 : Number.POSITIVE_INFINITY;
+}
+
+function maxClosedTradeDrawdownPct(rows: Awaited<ReturnType<typeof loadClosedTradeRiskRows>>): number {
+  let cumulativeReturnPct = 0;
+  let peakReturnPct = 0;
+  let maxDrawdownPct = 0;
+  for (const row of rows) {
+    const quoteSize = row.quote_size > 0 ? row.quote_size : 0;
+    const tradeReturnPct = quoteSize > 0 ? (row.effective_pnl / quoteSize) * 100 : row.pnl_pct;
+    cumulativeReturnPct += Number.isFinite(tradeReturnPct) ? tradeReturnPct : 0;
+    peakReturnPct = Math.max(peakReturnPct, cumulativeReturnPct);
+    maxDrawdownPct = Math.max(maxDrawdownPct, peakReturnPct - cumulativeReturnPct);
+  }
+  return maxDrawdownPct;
+}
+
+async function blockEntry(userId: string, symbol: string, rsi: number, price: number, blocker: string): Promise<boolean> {
+  const reason = `RISK_BLOCKED: ${blocker}`;
+  console.warn(`[risk] ${userId} ${reason}`);
+  await logTick(userId, symbol, rsi, price, "RISK_BLOCKED", reason);
+  return true;
+}
+
+async function entryRiskBlocked(userId: string, state: UserState, ctx: EntryRiskContext): Promise<boolean> {
+  const { settings, openTrade } = state;
+  const { currentPrice, lastRsi, recentCandles, closedCandle } = ctx;
+
+  if (openTrade) return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `existing_open_position:${openTrade.id}`);
+
+  const now = Date.now();
+  const latestCandle = closedCandle ?? recentCandles[recentCandles.length - 1];
+  if (!latestCandle || recentCandles.length < RSI_PERIOD + 1) {
+    return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `missing_candles:have_${recentCandles.length}_need_${RSI_PERIOD + 1}`);
+  }
+  if (!currentPrice || !Number.isFinite(currentPrice) || now - symStateLastTickMs(settings.symbol) > 2 * 60_000) {
+    return blockEntry(userId, settings.symbol, lastRsi, currentPrice, "stale_market_data:no_recent_ticks");
+  }
+  const candleAgeMs = now - latestCandle.startTime * 1000;
+  if (candleAgeMs > 10 * 60_000) {
+    return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `stale_market_data:last_candle_${Math.round(candleAgeMs / 1000)}s_old`);
+  }
+
+  if (settings.max_volatility_pct > 0) {
+    const volatilityPct = calcVolatilityPct(latestCandle);
+    if (volatilityPct > settings.max_volatility_pct) {
+      return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `high_volatility_spike:${volatilityPct.toFixed(2)}pct>${settings.max_volatility_pct}pct`);
+    }
+  }
+
+  const rows = await loadClosedTradeRiskRows(userId);
+  if (settings.daily_loss_limit_usd > 0) {
+    const startOfUtcDay = new Date();
+    startOfUtcDay.setUTCHours(0, 0, 0, 0);
+    const dailyPnl = rows
+      .filter((row) => new Date(row.closed_at ?? row.created_at).getTime() >= startOfUtcDay.getTime())
+      .reduce((sum, row) => sum + row.effective_pnl, 0);
+    if (dailyPnl <= -settings.daily_loss_limit_usd) {
+      return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `daily_loss_limit:${dailyPnl.toFixed(2)}<=-${settings.daily_loss_limit_usd}`);
+    }
+  }
+
+  if (settings.max_drawdown_pct > 0) {
+    const drawdownPct = maxClosedTradeDrawdownPct(rows);
+    if (drawdownPct >= settings.max_drawdown_pct) {
+      return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `max_drawdown:${drawdownPct.toFixed(2)}pct>=${settings.max_drawdown_pct}pct`);
+    }
+  }
+
+  let spreadPct = 0;
+  try {
+    const quote = await fetchBestBidAsk(settings.symbol);
+    spreadPct = quote.spreadPct;
+    if (settings.max_spread_pct > 0 && quote.spreadPct > settings.max_spread_pct) {
+      return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `unacceptable_spread:${quote.spreadPct.toFixed(3)}pct>${settings.max_spread_pct}pct`);
+    }
+  } catch (e) {
+    return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `stale_market_data:bid_ask_unavailable:${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  if (settings.entry_score_threshold > 0) {
+    const entryScore = settings.rsi_buy_threshold - lastRsi;
+    const estimatedOneWaySlippagePct = spreadPct / 2;
+    const netEntryScore = entryScore - estimatedOneWaySlippagePct;
+    if (netEntryScore < settings.entry_score_threshold) {
+      return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `fee_slippage_drag:score_${netEntryScore.toFixed(2)}<${settings.entry_score_threshold}`);
+    }
+  }
+
+  return false;
+}
+
+function symStateLastTickMs(symbol: string): number {
+  return symbolStates.get(symbol)?.lastTickMs ?? 0;
+}
+
 // ── Risk exits: checked on EVERY price tick ────────────────
 
 async function checkRiskExits(userId: string, state: UserState, price: number, rsi: number): Promise<boolean> {
@@ -217,8 +323,13 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
   const buySignal  = lastRsi < settings.rsi_buy_threshold;
   const sellSignal = lastRsi > settings.rsi_sell_threshold;
 
+  if (buySignal && openTrade) {
+    await blockEntry(userId, settings.symbol, lastRsi, currentPrice, `existing_open_position:${openTrade.id}`);
+  }
+
   // ── BUY ─────────────────────────────────────────────────
   if (buySignal && !openTrade) {
+    if (await entryRiskBlocked(userId, state, { currentPrice, lastRsi, recentCandles, closedCandle })) return;
     console.log(`[signal] ${userId} BUY — RSI ${lastRsi.toFixed(2)} < ${settings.rsi_buy_threshold} @ $${currentPrice.toFixed(2)}`);
     try {
       if (!settings.live_trading) {
