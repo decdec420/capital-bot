@@ -551,12 +551,7 @@ export default function Settings() {
           </div>
         </SectionCard>
 
-        <div className="border-t border-border pt-4 pb-8 text-xs text-muted-foreground space-y-1">
-          <p>• Worker evaluates 5-minute candles in real time via WebSocket — no polling delay.</p>
-          <p>• Only one position open at a time per account.</p>
-          <p>• Paper mode simulates trades without touching real funds.</p>
-          <p>• Run "Test connection" before enabling live trading.</p>
-        </div>
+        <div className="pb-8" />
       </main>
     </div>
   );
