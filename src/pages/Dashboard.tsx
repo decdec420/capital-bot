@@ -793,103 +793,128 @@ function PositionPanel({
 
 type Severity = "success" | "warn" | "error" | "info";
 
-function parseReason(action: string, reason: string): { headline: string; detail: string; severity: Severity } {
+interface ParsedFactor { points: number; label: string; blurb: string; }
+interface ParsedReason { headline: string; detail: string; severity: Severity; factors: ParsedFactor[]; blockerList: string[]; scoreStr: string | null; }
+
+// Short human descriptions for each scoring factor (fuzzy matched by prefix)
+const FACTOR_BLURBS: [string, string][] = [
+  ["RSI below 25",         "Extremely oversold — strongest buy signal possible"],
+  ["RSI below 30",         "Oversold — solid buy zone, historically good entries"],
+  ["RSI below 35",         "Approaching oversold — getting interesting"],
+  ["RSI rising from",      "RSI bouncing back up — momentum turning positive"],
+  ["RSI falling fast",     "Dropping hard — better to wait for it to stabilize first"],
+  ["price above EMA 200",  "Price above the 200-day average — long-term trend is up (bullish)"],
+  ["price below EMA 200",  "Price below the 200-day average — long-term trend is down (bearish backdrop)"],
+  ["EMA 50 above EMA 200", "Golden cross — medium-term trend above long-term (bullish structure)"],
+  ["EMA 50 rising",        "Medium-term trend is improving"],
+  ["volume above average", "Volume confirms the move — buyers/sellers are active"],
+  ["support held",         "Price bounced off a key level — buyers stepped in and defended it"],
+  ["price near support",   "Approaching a price floor where buyers have shown up before"],
+  ["high volatility spike","Candle was too wild — erratic moves increase stop-loss risk"],
+];
+
+function factorBlurb(label: string): string {
+  for (const [prefix, blurb] of FACTOR_BLURBS) {
+    if (label.toLowerCase().startsWith(prefix.toLowerCase())) return blurb;
+  }
+  return label;
+}
+
+function parseFactors(parts: string[]): { factors: ParsedFactor[]; blockerList: string[] } {
+  const factors: ParsedFactor[] = [];
+  const blockerList: string[] = [];
+  for (const part of parts) {
+    if (part.startsWith("BLOCKED:")) {
+      blockerList.push(part.slice(8).trim());
+    } else {
+      const m = part.match(/^([+-]?\d+)\s+(.+)$/);
+      if (m) factors.push({ points: Number(m[1]), label: m[2], blurb: factorBlurb(m[2]) });
+    }
+  }
+  return { factors, blockerList };
+}
+
+function parseReason(action: string, reason: string): ParsedReason {
   const r = reason ?? "";
+  const empty = { factors: [] as ParsedFactor[], blockerList: [] as string[], scoreStr: null };
 
   if (action === "buy") {
     const rsiMatch = r.match(/RSI ([\d.]+)/);
     const isPaper = r.includes("PAPER");
-    return {
-      headline: isPaper ? "Paper buy executed" : "Live buy executed",
+    return { headline: isPaper ? "Paper buy executed" : "Live buy executed",
       detail: `Bot entered a ${isPaper ? "paper " : "live "}position when RSI dropped to ${rsiMatch?.[1] ?? "oversold"} — below your buy threshold. ${isPaper ? "No real money moved." : "A real market buy order was placed on Coinbase."}`,
-      severity: "success",
-    };
+      severity: "success", ...empty };
   }
 
   if (action === "sell") {
     const pnlMatch = r.match(/P&L \$?([-\d.]+)/);
     const pnl = pnlMatch ? Number(pnlMatch[1]) : null;
     const exitType = r.includes("trailing") ? "trailing stop" : r.includes("stop_loss") ? "stop-loss" : r.includes("take_profit") ? "take-profit" : "RSI signal";
-    return {
-      headline: pnl != null && pnl >= 0 ? "Position closed — profit" : "Position closed — loss",
+    return { headline: pnl != null && pnl >= 0 ? "Position closed — profit" : "Position closed — loss",
       detail: `Exit triggered by ${exitType}. ${pnl != null ? `P&L: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}.` : ""} ${r.includes("PAPER") ? "Paper trade — no real money." : "Live fill confirmed on Coinbase."}`,
-      severity: pnl == null ? "info" : pnl >= 0 ? "success" : "warn",
-    };
+      severity: pnl == null ? "info" : pnl >= 0 ? "success" : "warn", ...empty };
   }
 
   if (action === "RISK_BLOCKED" || r.startsWith("RISK_BLOCKED")) {
     const blocker = r.replace(/^RISK_BLOCKED:\s*/i, "").split(":")[0].trim();
     const msgs: Record<string, { headline: string; detail: string }> = {
-      bid_ask_unavailable: {
-        headline: "Spread check failed — API error",
-        detail: "Bot tried to fetch the live bid/ask spread from Coinbase before buying, but the API returned an error (was a bug — now fixed in worker). To prevent this from blocking entries in the meantime, you can set Max Bid/Ask Spread to 0% in Settings to skip the spread gate entirely.",
-      },
-      unacceptable_spread: {
-        headline: "Spread too wide — entry skipped",
-        detail: "The gap between Coinbase's buy price (ask) and sell price (bid) exceeded your Max Spread setting. A wide spread means you'd immediately be down by the full spread amount the moment you buy. Bot waited for a tighter market.",
-      },
-      high_volatility_spike: {
-        headline: "Candle too volatile — entry skipped",
-        detail: "The most recent 5-minute candle's price range (high minus low, as % of price) exceeded your Max Candle Volatility setting. Buying into an erratic candle increases the chance of an immediate stop-loss hit. Bot waits for a calmer candle.",
-      },
-      daily_loss_limit: {
-        headline: "Daily loss limit hit — buys paused",
-        detail: "Your closed trades today have lost more than your Daily Loss Limit setting. Bot will not open new positions until midnight UTC resets the daily counter. This protects against a bad session spiraling out of control.",
-      },
-      max_drawdown: {
-        headline: "Max drawdown reached — buys paused",
-        detail: "The total drawdown across all your closed trades has reached your Max Portfolio Drawdown setting. This is a long-term capital protection gate. You can raise or disable it in Settings under Risk Gates.",
-      },
-      existing_open_position: {
-        headline: "Already in a position",
-        detail: "The bot only holds one position at a time. A trade is currently open, so no new buy will be placed until it's closed by a sell signal, stop-loss, or take-profit.",
-      },
-      stale_market_data: {
-        headline: "Market data went stale",
-        detail: "No fresh price ticks arrived from the Coinbase WebSocket for more than 2 minutes. Bot pauses new entries rather than buying on an outdated price. This usually resolves automatically when the WebSocket reconnects.",
-      },
-      missing_candles: {
-        headline: "Not enough candle history yet",
-        detail: "The worker needs at least 15 historical candles to compute a reliable RSI. This normally only happens right after the worker starts — it resolves on its own after a few 5-minute candle closes.",
-      },
+      bid_ask_unavailable: { headline: "Spread check failed — API error",
+        detail: "Bot tried to fetch the live bid/ask spread before buying but Coinbase returned an error (bug now fixed in worker). Set Max Bid/Ask Spread to 0% in Settings to skip the spread gate if this keeps appearing." },
+      unacceptable_spread: { headline: "Spread too wide — entry skipped",
+        detail: "The gap between Coinbase's buy price and sell price exceeded your Max Spread setting. A wide spread means you'd be immediately underwater the moment you buy." },
+      high_volatility_spike: { headline: "Candle too volatile — entry skipped",
+        detail: "The most recent 5-minute candle's range exceeded your Max Candle Volatility setting. Buying into an erratic candle increases the chance of an immediate stop-loss hit." },
+      daily_loss_limit: { headline: "Daily loss limit hit — buys paused",
+        detail: "Closed trades today have lost more than your Daily Loss Limit. No new buys until midnight UTC resets the counter." },
+      max_drawdown: { headline: "Max drawdown reached — buys paused",
+        detail: "Total drawdown across all trades hit your Max Portfolio Drawdown setting. Raise or disable it in Settings → Risk Gates." },
+      existing_open_position: { headline: "Already in a position",
+        detail: "Bot holds one position at a time. A trade is open — no new buy until it closes." },
+      stale_market_data: { headline: "Market data went stale",
+        detail: "No fresh price ticks for 2+ minutes. Bot pauses new entries rather than buying on an outdated price. Usually resolves when WebSocket reconnects." },
+      missing_candles: { headline: "Not enough candle history yet",
+        detail: "Need at least 15 candles to compute RSI reliably. Resolves automatically after a few 5-minute closes." },
     };
-    const found = msgs[blocker] ?? {
-      headline: `Entry blocked by risk gate`,
-      detail: `The gate that fired: "${blocker}". Full reason string is shown below.`,
-    };
-    return { ...found, severity: "error" };
+    const found = msgs[blocker] ?? { headline: "Entry blocked by risk gate", detail: `Gate: "${blocker}"` };
+    return { ...found, severity: "error", ...empty };
   }
 
-  if (r.startsWith("tick-check:")) {
-    const scoreMatch = r.match(/score=(\d+)\/(\d+)/);
-    const rsiMatch   = r.match(/RSI=([\d.]+)/);
+  // ── Score-based hold events (tick-check or candle-close) ──────────────────
+  // Both use ;; to embed per-factor data: header;;+2 factor;;BLOCKED:blocker
+  if (r.includes(";;")) {
+    const parts = r.split(";;");
+    const header = parts[0];
+    const { factors, blockerList } = parseFactors(parts.slice(1));
+    const scoreMatch  = header.match(/score=(\d+)\/(\d+)/);
+    const rsiMatch    = header.match(/RSI[= ]([\d.]+)/);
+    const nextMatch   = header.match(/next=(.+)$/);
+    const scoreStr    = scoreMatch ? `${scoreMatch[1]} / ${scoreMatch[2]}` : null;
+    const isTick      = header.startsWith("tick-check");
+    const hasScore    = scoreMatch && Number(scoreMatch[1]) > 0;
+
     return {
-      headline: "RSI in range — entry score too low",
-      detail: `RSI (${rsiMatch?.[1] ?? "—"}) is below your buy threshold, so bot ran a full quality check. The trade score (${scoreMatch ? `${scoreMatch[1]} out of ${scoreMatch[2]}` : "low"}) didn't clear your Entry Quality Threshold. Score factors include: EMA trend, volume vs. average, RSI momentum slope, and distance from support. Bot rechecks every 60 seconds while RSI stays low.`,
-      severity: "warn",
+      headline: isTick ? "RSI in range — checking entry quality" : "Candle close — evaluating entry",
+      detail: `RSI (${rsiMatch?.[1] ?? "—"}) is ${isTick ? "below" : "near"} your buy threshold. ${hasScore ? `Score is ${scoreStr}` : "Score is low"} — needs to clear your Entry Quality Threshold to trigger a buy. ${isTick ? "Rechecks every 60 seconds while RSI stays low." : `Next: ${nextMatch?.[1] ?? "watching."}`}`,
+      severity: blockerList.length ? "error" : "warn",
+      factors, blockerList, scoreStr,
     };
   }
 
   if (r.includes("holding")) {
     const rsiMatch = r.match(/RSI ([\d.]+)/);
-    return {
-      headline: "Holding open position",
-      detail: `RSI is at ${rsiMatch?.[1] ?? "—"}, below your sell threshold. Bot is keeping the position open and checking for an exit signal on each 5-minute candle.`,
-      severity: "info",
-    };
+    return { headline: "Holding open position",
+      detail: `RSI is at ${rsiMatch?.[1] ?? "—"}, below your sell threshold. Bot is keeping the position open.`,
+      severity: "info", ...empty };
   }
 
   if (r.includes("waiting") || r.includes("watching") || action === "hold") {
-    const rsiMatch = r.match(/RSI ([\d.]+)/);
-    const scoreMatch = r.match(/score (\d+)/);
-    return {
-      headline: "Watching for entry",
-      detail: `RSI is at ${rsiMatch?.[1] ?? "—"}, above your buy threshold. No action taken. ${scoreMatch ? `Current score: ${scoreMatch[1]}.` : ""} Bot will evaluate a buy when RSI drops into oversold territory.`,
-      severity: "info",
-    };
+    const rsiMatch = r.match(/RSI[ =]([\d.]+)/);
+    return { headline: "Watching — RSI not in buy range yet",
+      detail: `RSI is at ${rsiMatch?.[1] ?? "—"}, above your buy threshold. Bot is monitoring and will evaluate a buy when RSI drops into range.`,
+      severity: "info", ...empty };
   }
 
-  return { headline: action.toUpperCase(), detail: r || "No additional details available.", severity: "info" };
+  return { headline: action.toUpperCase(), detail: r || "No additional details.", severity: "info", ...empty };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -965,16 +990,65 @@ function TickFeed({ ticks }: { ticks: TickLog[] }) {
                   borderTop: "1px solid var(--t-border)",
                   fontFamily: "JetBrains Mono, monospace",
                 }}>
-                  <div style={{ fontSize: 11.5, fontWeight: 600, color: severityColor, marginBottom: 6 }}>
+                  <div style={{ fontSize: 11.5, fontWeight: 600, color: severityColor, marginBottom: 4 }}>
                     {parsed.headline}
+                    {parsed.scoreStr && (
+                      <span style={{ marginLeft: 8, fontSize: 10, fontWeight: 400, color: "var(--text-3)" }}>
+                        score {parsed.scoreStr}
+                      </span>
+                    )}
                   </div>
-                  <div style={{ fontSize: 11, color: "var(--text-2)", lineHeight: 1.65, marginBottom: 8 }}>
+                  <div style={{ fontSize: 11, color: "var(--text-2)", lineHeight: 1.65, marginBottom: parsed.factors.length ? 10 : 8 }}>
                     {parsed.detail}
                   </div>
+
+                  {/* Per-factor checklist */}
+                  {parsed.factors.length > 0 && (
+                    <div style={{ marginBottom: 8 }}>
+                      <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 5 }}>
+                        What the bot checked
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                        {parsed.factors.map((f, fi) => (
+                          <div key={fi} style={{ display: "flex", alignItems: "flex-start", gap: 7 }}>
+                            <span style={{
+                              minWidth: 30, fontSize: 10, fontWeight: 700, textAlign: "right",
+                              color: f.points > 0 ? "var(--green)" : f.points < 0 ? "var(--red)" : "var(--text-4)",
+                            }}>
+                              {f.points > 0 ? `+${f.points}` : f.points}
+                            </span>
+                            <div>
+                              <div style={{ fontSize: 10.5, color: "var(--text)", lineHeight: 1.3 }}>{f.label}</div>
+                              <div style={{ fontSize: 10, color: "var(--text-3)", lineHeight: 1.4 }}>{f.blurb}</div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Blockers */}
+                  {parsed.blockerList.length > 0 && (
+                    <div style={{ marginBottom: 8 }}>
+                      <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 5 }}>
+                        Blockers (must clear to buy)
+                      </div>
+                      {parsed.blockerList.map((b, bi) => (
+                        <div key={bi} style={{ display: "flex", alignItems: "flex-start", gap: 7, marginBottom: 4 }}>
+                          <span style={{ color: "var(--red)", fontSize: 11, minWidth: 14 }}>✕</span>
+                          <div style={{ fontSize: 10.5, color: "var(--red)" }}>{b}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Raw log */}
                   {t.reason && (
                     <div style={{ padding: "6px 8px", background: "var(--bg-3)", borderRadius: 4 }}>
                       <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 3 }}>Raw log</div>
-                      <div style={{ fontSize: 10, color: "var(--text-3)", wordBreak: "break-all", lineHeight: 1.5 }}>{t.reason}</div>
+                      <div style={{ fontSize: 10, color: "var(--text-3)", wordBreak: "break-all", lineHeight: 1.5 }}>
+                        {t.reason.replace(/;;/g, " · ")}
+                      </div>
                     </div>
                   )}
                 </div>

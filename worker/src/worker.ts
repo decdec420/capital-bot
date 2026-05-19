@@ -16,7 +16,7 @@
 
 import { CoinbaseWs } from "./coinbase-ws.ts";
 import { CandleBuilder, computeRsi, computeRsiSeries, volumeFilterPass, type Candle } from "./indicators.ts";
-import { evaluateTradeDecision } from "./trade-decision.ts";
+import { evaluateTradeDecision, MAX_INTERNAL_SCORE } from "./trade-decision.ts";
 import { fetchHistoricalCandles, fetchBestBidAsk, fetchUSDBalance, placeMarketBuy, placeMarketSell, probeAuth, type Credentials } from "./broker.ts";
 import {
   loadAllSettings, loadOpenTrade, loadClosedTradeRiskRows, getCoinbaseCredentials,
@@ -354,9 +354,16 @@ async function checkTickEntry(userId: string, state: UserState, symState: Symbol
   });
 
   if (decision.state !== "TRADE_ALLOWED" || decision.riskBlocked) {
-    // Score too low or blocked — log and wait for next tick window
-    await logTick(userId, settings.symbol, lastRsi, currentPrice, "hold",
-      `tick-check: ${decision.state} score=${decision.score}/${decision.maxScore} RSI=${lastRsi.toFixed(1)} — waiting for candle`);
+    // Score too low or blocked — log per-factor breakdown for dashboard display
+    // Format: header;;factor1;;factor2;;BLOCKED:blocker1;;BLOCKED:blocker2
+    const factorParts = decision.reasons.map((r) => r);
+    const blockerParts = decision.blockers.map((b) => `BLOCKED:${b}`);
+    const logReason = [
+      `tick-check: ${decision.state} score=${decision.score}/${MAX_INTERNAL_SCORE} RSI=${lastRsi.toFixed(1)}`,
+      ...factorParts,
+      ...blockerParts,
+    ].join(";;");
+    await logTick(userId, settings.symbol, lastRsi, currentPrice, "hold", logReason);
     return;
   }
 
@@ -527,9 +534,19 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
   }
 
   // ── HOLD ────────────────────────────────────────────────
-  const holdReason = openTrade
-    ? `holding — RSI ${lastRsi.toFixed(1)} (sell > ${settings.rsi_sell_threshold})`
-    : `${decision.state.toLowerCase()} — score ${decision.score}; next: ${decision.nextTrigger}`;
+  let holdReason: string;
+  if (openTrade) {
+    holdReason = `holding — RSI ${lastRsi.toFixed(1)} (sell > ${settings.rsi_sell_threshold})`;
+  } else {
+    // Embed per-factor breakdown for dashboard display (;; separated)
+    const factorParts = decision.reasons.map((r) => r);
+    const blockerParts = decision.blockers.map((b) => `BLOCKED:${b}`);
+    holdReason = [
+      `${decision.state.toLowerCase()} score=${decision.score}/${MAX_INTERNAL_SCORE} next=${decision.nextTrigger}`,
+      ...factorParts,
+      ...blockerParts,
+    ].join(";;");
+  }
   await logTick(userId, settings.symbol, lastRsi, currentPrice, "hold", holdReason);
 }
 

@@ -33,7 +33,7 @@ const EMA_SHORT_PERIOD = 50;
 const EMA_LONG_PERIOD = 200;
 // MAX_INTERNAL_SCORE ≈ 12 (RSI+EMA+volume+support factors).
 // entry_score_threshold (0-100 UI) maps to this scale.
-const MAX_INTERNAL_SCORE = 12;
+export const MAX_INTERNAL_SCORE = 12;
 function minTradeScore(settings: Settings): number {
   return Math.max(1, Math.round((settings.entry_score_threshold / 100) * MAX_INTERNAL_SCORE));
 }
