@@ -7,8 +7,10 @@
 //   • One WebSocket connection per unique symbol across all users
 //   • Synthetic 5-min candles built from real-time trade ticks
 //   • Risk exits (stop-loss, trailing stop) checked on EVERY tick — no lag
-//   • RSI buy/sell signals checked on EVERY candle close (every 5 min)
-//   • Settings reloaded from Supabase every 60 seconds
+//   • Tick-level entry: if RSI already below threshold, evaluate & buy on
+//     each price tick (debounced to max once/min) — no candle-close wait
+//   • RSI buy/sell signals also checked on EVERY candle close (every 5 min)
+//   • Settings reloaded from Supabase every 15 seconds
 //   • Tiny HTTP health endpoint on :8080 for Fly.io health checks
 // ─────────────────────────────────────────────────────────────
 
@@ -69,10 +71,13 @@ interface SymbolState {
 // ── Per-user state ──────────────────────────────────────────
 
 interface UserState {
-  settings:   Settings;
-  openTrade:  OpenTrade | null;
-  credentials: Credentials | null; // null = paper mode or not yet loaded
+  settings:         Settings;
+  openTrade:        OpenTrade | null;
+  credentials:      Credentials | null; // null = paper mode or not yet loaded
+  lastEntryCheckMs: number;             // debounce: last time tick-entry was evaluated
 }
+
+const TICK_ENTRY_DEBOUNCE_MS = 60_000; // max one tick-level entry check per minute per user
 
 const symbolStates = new Map<string, SymbolState>();
 const userStates   = new Map<string, UserState>();
@@ -141,7 +146,7 @@ async function reloadSettings(): Promise<void> {
             console.warn(`[settings] no creds for ${s.user_id}:`, e instanceof Error ? e.message : String(e));
           }
         }
-        userStates.set(s.user_id, { settings: s, openTrade, credentials: creds });
+        userStates.set(s.user_id, { settings: s, openTrade, credentials: creds, lastEntryCheckMs: 0 });
         console.log(`[settings] loaded user ${s.user_id} — openTrade=${openTrade?.id ?? "none"}`);
       } else {
         // Update settings, preserve openTrade and credentials
@@ -319,6 +324,90 @@ async function checkRiskExits(userId: string, state: UserState, price: number, r
   return true;
 }
 
+// ── Tick-level entry: fire a buy without waiting for candle close ──────────
+// Runs on every price tick when RSI is already below buy threshold.
+// Debounced to once per TICK_ENTRY_DEBOUNCE_MS per user to avoid hammering.
+// Uses last known RSI (still accurate) + live price for the order.
+
+async function checkTickEntry(userId: string, state: UserState, symState: SymbolState): Promise<void> {
+  const { settings, openTrade } = state;
+
+  if (!settings.enabled) return;
+  if (openTrade) return; // position already open — risk exits handle it
+
+  const { lastRsi, currentPrice, recentCandles, closePrices, rsiHistory } = symState;
+
+  // Pre-check: RSI must be below buy threshold (caller already checks, but guard anyway)
+  if (lastRsi >= settings.rsi_buy_threshold) return;
+
+  // Need at least one historical candle for risk-gate stale-data checks
+  const lastCandle = recentCandles[recentCandles.length - 1];
+  if (!lastCandle) return;
+
+  // Debounce: mark immediately so concurrent ticks don't both pass the check
+  const now = Date.now();
+  if (now - state.lastEntryCheckMs < TICK_ENTRY_DEBOUNCE_MS) return;
+  state.lastEntryCheckMs = now;
+
+  const decision = evaluateTradeDecision({
+    settings, openTrade, lastRsi, rsiHistory, closePrices, recentCandles, currentPrice,
+  });
+
+  if (decision.state !== "TRADE_ALLOWED" || decision.riskBlocked) {
+    // Score too low or blocked — log and wait for next tick window
+    await logTick(userId, settings.symbol, lastRsi, currentPrice, "hold",
+      `tick-check: ${decision.state} score=${decision.score}/${decision.maxScore} RSI=${lastRsi.toFixed(1)} — waiting for candle`);
+    return;
+  }
+
+  // Hard entry-risk gates (daily loss, drawdown, spread, volatility, stale data)
+  if (await entryRiskBlocked(userId, state, symState, lastCandle)) return;
+
+  console.log(`[tick-entry] ${userId} BUY on tick — RSI=${lastRsi.toFixed(2)} score=${decision.score} @ $${currentPrice.toFixed(2)}`);
+
+  try {
+    if (!settings.live_trading) {
+      const orderUsd = await resolveOrderSize(settings, state.credentials, currentPrice);
+      const size = orderUsd / currentPrice;
+      const id = await insertTrade({
+        user_id: userId, symbol: settings.symbol,
+        entry_price: currentPrice, size, quote_size: orderUsd,
+        entry_fees_usd: 0, rsi_at_entry: lastRsi,
+        notes: `[PAPER] TICK BUY — RSI ${lastRsi.toFixed(1)} < ${settings.rsi_buy_threshold}${settings.compound_mode ? ` [compound $${orderUsd.toFixed(2)}]` : ""}`,
+      });
+      state.openTrade = { id, entry_price: currentPrice, size, quote_size: orderUsd, entry_fees_usd: 0, trailing_high: null, rsi_at_entry: lastRsi };
+      await sendTelegram(fmtBuy(settings.symbol, lastRsi, currentPrice, size, orderUsd, false));
+      await logTick(userId, settings.symbol, lastRsi, currentPrice, "buy", `PAPER TICK BUY — RSI ${lastRsi.toFixed(1)}`);
+    } else {
+      if (!state.credentials) throw new Error("live mode but no credentials");
+      const orderUsd = await resolveOrderSize(settings, state.credentials, currentPrice);
+      const clientOrderId = crypto.randomUUID();
+      const pendingId = await insertPendingTrade({
+        user_id: userId, symbol: settings.symbol,
+        quote_size: orderUsd, rsi_at_entry: lastRsi, client_order_id: clientOrderId,
+      });
+      let fill;
+      try {
+        fill = await placeMarketBuy(state.credentials, settings.symbol, orderUsd.toFixed(2), clientOrderId);
+      } catch (e) {
+        await deleteTrade(pendingId).catch(console.error);
+        throw e;
+      }
+      await confirmTrade(pendingId, {
+        entry_price: fill.fillPrice, size: fill.filledBaseSize,
+        quote_size: fill.filledQuoteSize, entry_fees_usd: fill.feesUsd,
+        coinbase_order_id: fill.orderId,
+        notes: `LIVE TICK BUY — RSI ${lastRsi.toFixed(1)} filled @ $${fill.fillPrice.toFixed(2)}`,
+      });
+      state.openTrade = { id: pendingId, entry_price: fill.fillPrice, size: fill.filledBaseSize, quote_size: fill.filledQuoteSize, entry_fees_usd: fill.feesUsd, trailing_high: null, rsi_at_entry: lastRsi };
+      await sendTelegram(fmtBuy(settings.symbol, lastRsi, fill.fillPrice, fill.filledBaseSize, fill.filledQuoteSize, true));
+      await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "buy", `LIVE TICK BUY filled @ $${fill.fillPrice.toFixed(2)}`);
+    }
+  } catch (e) {
+    console.error(`[tick-entry] buy failed for ${userId}:`, e instanceof Error ? e.message : String(e));
+  }
+}
+
 // ── RSI signals: checked on candle close ──────────────────
 
 async function checkSignals(userId: string, state: UserState, symState: SymbolState, closedCandle: Candle): Promise<void> {
@@ -464,6 +553,25 @@ async function onTrade(symbol: string, price: number, size: number): Promise<voi
       await checkRiskExits(userId, userState, price, symState.lastRsi);
     } finally {
       userInFlight.delete(userId);
+    }
+  }
+
+  // Every tick: fast-path entry check for users without an open position.
+  // If RSI is already below threshold, evaluate and buy immediately instead of
+  // waiting up to 5 min for the next candle close. Debounced to once per minute.
+  if (symState.recentCandles.length > 0) {
+    for (const [userId, userState] of userStates) {
+      if (userState.settings.symbol !== symbol) continue;
+      if (!userState.settings.enabled) continue;
+      if (userState.openTrade) continue; // has position — handled above
+      if (symState.lastRsi >= userState.settings.rsi_buy_threshold) continue; // RSI not in range
+      if (userInFlight.has(userId)) continue;
+      userInFlight.add(userId);
+      try {
+        await checkTickEntry(userId, userState, symState);
+      } finally {
+        userInFlight.delete(userId);
+      }
     }
   }
 
