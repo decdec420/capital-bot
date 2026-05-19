@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
-import { ArrowLeft, Eye, EyeOff, Save, Zap } from "lucide-react";
+import { ArrowLeft, Eye, EyeOff, Save, Zap, Shield, TrendingUp, LogOut, Sliders } from "lucide-react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 
 interface BotSettings {
@@ -17,6 +17,10 @@ interface BotSettings {
   stop_loss_pct: number;
   take_profit_pct: number;
   trailing_stop_pct: number;
+  daily_loss_limit_usd: number;
+  max_drawdown_pct: number;
+  max_spread_pct: number;
+  max_volatility_pct: number;
 }
 
 const DEFAULT_BOT_SETTINGS: BotSettings = {
@@ -30,16 +34,135 @@ const DEFAULT_BOT_SETTINGS: BotSettings = {
   stop_loss_pct: 2,
   take_profit_pct: 5,
   trailing_stop_pct: 1.5,
+  daily_loss_limit_usd: 25,
+  max_drawdown_pct: 10,
+  max_spread_pct: 0.25,
+  max_volatility_pct: 3,
 };
 
+const PRESETS = {
+  loose: {
+    label: "Loose",
+    description: "More trades, good for validation",
+    values: {
+      rsi_buy_threshold: 38,
+      entry_score_threshold: 30,
+      stop_loss_pct: 3,
+      take_profit_pct: 2,
+      trailing_stop_pct: 1.5,
+      max_volatility_pct: 5,
+      max_spread_pct: 0.5,
+    },
+  },
+  balanced: {
+    label: "Balanced",
+    description: "Moderate frequency, quality entries",
+    values: {
+      rsi_buy_threshold: 32,
+      entry_score_threshold: 55,
+      stop_loss_pct: 2.5,
+      take_profit_pct: 4,
+      trailing_stop_pct: 2,
+      max_volatility_pct: 3,
+      max_spread_pct: 0.25,
+    },
+  },
+  strict: {
+    label: "Strict",
+    description: "Fewer, higher-conviction trades",
+    values: {
+      rsi_buy_threshold: 25,
+      entry_score_threshold: 70,
+      stop_loss_pct: 2,
+      take_profit_pct: 6,
+      trailing_stop_pct: 2.5,
+      max_volatility_pct: 2,
+      max_spread_pct: 0.15,
+    },
+  },
+} as const;
+
+function SectionCard({ icon, title, description, children }: {
+  icon: React.ReactNode;
+  title: string;
+  description?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="rounded-xl border border-border bg-card p-5 space-y-5">
+      <div className="flex items-start gap-3">
+        <div className="mt-0.5 text-muted-foreground">{icon}</div>
+        <div>
+          <h2 className="text-sm font-semibold">{title}</h2>
+          {description && <p className="text-xs text-muted-foreground mt-0.5">{description}</p>}
+        </div>
+      </div>
+      <div className="space-y-5">
+        {children}
+      </div>
+    </section>
+  );
+}
+
 function Label({ children }: { children: React.ReactNode }) {
-  return <label className="block text-sm font-medium mb-1">{children}</label>;
+  return <label className="block text-sm font-medium">{children}</label>;
 }
 function Hint({ children }: { children: React.ReactNode }) {
   return <p className="text-xs text-muted-foreground mt-1">{children}</p>;
 }
 function Field({ children }: { children: React.ReactNode }) {
-  return <div className="space-y-1">{children}</div>;
+  return <div className="space-y-1.5">{children}</div>;
+}
+
+function SliderField({
+  label, hint, value, min, max, step, format, onChange,
+}: {
+  label: string;
+  hint: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  format: (v: number) => string;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <Field>
+      <div className="flex items-center justify-between">
+        <Label>{label}</Label>
+        <span className="text-sm font-semibold tabular-nums text-foreground">{format(value)}</span>
+      </div>
+      <div className="relative">
+        <input
+          type="range" min={min} max={max} step={step}
+          value={value}
+          onChange={(e) => onChange(Number(e.target.value))}
+          className="w-full accent-primary"
+        />
+        <div className="flex justify-between text-[10px] text-muted-foreground mt-0.5">
+          <span>{format(min)}</span>
+          <span>{format(max)}</span>
+        </div>
+      </div>
+      <Hint>{hint}</Hint>
+    </Field>
+  );
+}
+
+function Toggle({ checked, onChange, danger }: { checked: boolean; onChange: (v: boolean) => void; danger?: boolean }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      onClick={() => onChange(!checked)}
+      className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+        checked ? (danger ? "bg-red-600" : "bg-primary") : "bg-muted"
+      }`}
+    >
+      <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${checked ? "translate-x-6" : "translate-x-1"}`} />
+    </button>
+  );
 }
 
 export default function Settings() {
@@ -93,15 +216,11 @@ export default function Settings() {
     mutationFn: async () => {
       if (!apiKeyName.trim()) throw new Error("API key name is required");
       const vaultSecretName = `coinbase_pem_${user!.id}`;
-
-      // Save or update the vault secret
       const { error: vaultErr } = await supabase.rpc("upsert_coinbase_pem", {
         p_secret_name: vaultSecretName,
         p_pem: privatePem.trim(),
       });
       if (vaultErr) throw new Error(`Vault error: ${vaultErr.message}`);
-
-      // Save key name + vault reference
       const { error } = await supabase.from("broker_credentials").upsert({
         user_id: user!.id,
         api_key_name: apiKeyName.trim(),
@@ -139,9 +258,17 @@ export default function Settings() {
   const set = (k: keyof BotSettings) => (v: BotSettings[keyof BotSettings]) =>
     setForm((prev) => ({ ...prev, [k]: v }));
 
+  function applyPreset(key: keyof typeof PRESETS) {
+    setForm((prev) => ({ ...prev, ...PRESETS[key].values }));
+    toast.success(`${PRESETS[key].label} preset applied — save to confirm`);
+  }
+
+  const pct = (v: number) => v === 0 ? "Off" : `${v}%`;
+  const usd = (v: number) => `$${v}`;
+
   return (
     <div className="min-h-screen bg-background">
-      <header className="border-b border-border px-6 py-3 flex items-center gap-3">
+      <header className="sticky top-0 z-10 border-b border-border bg-background/95 backdrop-blur px-6 py-3 flex items-center gap-3">
         <Link to="/" className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors">
           <ArrowLeft className="w-4 h-4" /> Dashboard
         </Link>
@@ -149,24 +276,34 @@ export default function Settings() {
         <span className="text-sm font-medium">Settings</span>
       </header>
 
-      <main className="max-w-xl mx-auto px-6 py-8 space-y-10">
+      <main className="max-w-xl mx-auto px-4 py-8 space-y-4">
 
-        {/* Bot controls */}
-        <section className="space-y-5">
-          <h2 className="text-base font-semibold">Bot controls</h2>
+        {/* Presets */}
+        <div className="rounded-xl border border-border bg-card p-5">
+          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">Quick presets</p>
+          <div className="grid grid-cols-3 gap-2">
+            {(Object.keys(PRESETS) as (keyof typeof PRESETS)[]).map((key) => (
+              <button
+                key={key}
+                onClick={() => applyPreset(key)}
+                className="rounded-lg border border-border p-3 text-left hover:bg-muted/60 transition-colors"
+              >
+                <p className="text-sm font-medium">{PRESETS[key].label}</p>
+                <p className="text-[11px] text-muted-foreground mt-0.5">{PRESETS[key].description}</p>
+              </button>
+            ))}
+          </div>
+        </div>
 
+        {/* Bot Controls */}
+        <SectionCard icon={<Zap className="w-4 h-4" />} title="Bot controls">
           <Field>
             <div className="flex items-center justify-between">
               <div>
                 <Label>Bot enabled</Label>
-                <Hint>When off, the cron runs but skips all actions.</Hint>
+                <Hint>When off, the worker runs but skips all trade actions.</Hint>
               </div>
-              <button
-                onClick={() => set("enabled")(!form.enabled)}
-                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${form.enabled ? "bg-primary" : "bg-muted"}`}
-              >
-                <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${form.enabled ? "translate-x-6" : "translate-x-1"}`} />
-              </button>
+              <Toggle checked={form.enabled} onChange={(v) => set("enabled")(v)} />
             </div>
           </Field>
 
@@ -176,28 +313,29 @@ export default function Settings() {
                 <Label>Live trading</Label>
                 <Hint>Off = paper mode (no real orders). Only enable after testing.</Hint>
               </div>
-              <button
-                onClick={() => {
-                  if (!form.live_trading && !confirm("Enable LIVE trading? Real money will be used.")) return;
-                  set("live_trading")(!form.live_trading);
+              <Toggle
+                checked={form.live_trading}
+                danger
+                onChange={(v) => {
+                  if (v && !confirm("Enable LIVE trading? Real money will be used.")) return;
+                  set("live_trading")(v);
                 }}
-                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${form.live_trading ? "bg-green-600" : "bg-muted"}`}
-              >
-                <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${form.live_trading ? "translate-x-6" : "translate-x-1"}`} />
-              </button>
+              />
             </div>
             {form.live_trading && (
-              <div className="flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400 mt-1">
-                <Zap className="w-3 h-3" /> Live mode active — real orders will be placed
+              <div className="flex items-center gap-1.5 text-xs text-amber-500 bg-amber-500/10 border border-amber-500/20 rounded-md px-2.5 py-1.5">
+                <Zap className="w-3 h-3 shrink-0" /> Live mode — real orders will be placed on Coinbase
               </div>
             )}
           </Field>
-        </section>
+        </SectionCard>
 
         {/* Strategy */}
-        <section className="space-y-5">
-          <h2 className="text-base font-semibold">Strategy</h2>
-
+        <SectionCard
+          icon={<TrendingUp className="w-4 h-4" />}
+          title="Strategy"
+          description="What to trade and how much to commit per position."
+        >
           <Field>
             <Label>Asset</Label>
             <select
@@ -208,11 +346,10 @@ export default function Settings() {
               <option value="BTC-USD">BTC-USD — Bitcoin</option>
               <option value="ETH-USD">ETH-USD — Ethereum</option>
             </select>
-            <Hint>The asset the bot will trade.</Hint>
           </Field>
 
           <Field>
-            <Label>Buy amount per trade (USD)</Label>
+            <Label>Buy amount per trade</Label>
             <div className="flex items-center gap-2">
               <span className="text-sm text-muted-foreground">$</span>
               <input
@@ -222,122 +359,147 @@ export default function Settings() {
                 className="h-9 w-32 rounded-md border border-input bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring"
               />
             </div>
-            <Hint>How much USD to spend per buy. Start small — $10–$50 is plenty to test.</Hint>
+            <Hint>How much USD to spend per buy. $10–$50 is plenty while testing.</Hint>
           </Field>
+        </SectionCard>
 
-          <Field>
-            <div className="flex items-center justify-between">
-              <Label>Minimum setup quality</Label>
-              <span className="text-sm font-medium tabular-nums">{form.entry_score_threshold}</span>
-            </div>
-            <input
-              type="range" min="0" max="100" step="5"
-              value={form.entry_score_threshold}
-              onChange={(e) => set("entry_score_threshold")(Number(e.target.value))}
-              className="w-full"
-            />
-            <Hint>Higher = fewer, stricter entries. Lower = more frequent, earlier entries.</Hint>
-          </Field>
+        {/* Entry Conditions */}
+        <SectionCard
+          icon={<Sliders className="w-4 h-4" />}
+          title="Entry conditions"
+          description="Controls when the bot considers opening a position."
+        >
+          <SliderField
+            label="RSI buy threshold"
+            hint="Bot only considers buying when RSI drops below this level. 38 = normal dips, 25 = near-crash only."
+            value={form.rsi_buy_threshold}
+            min={20} max={50} step={1}
+            format={(v) => `RSI < ${v}`}
+            onChange={(v) => set("rsi_buy_threshold")(v)}
+          />
 
-          <details className="rounded-lg border border-border/60 bg-muted/20 p-3">
-            <summary className="cursor-pointer text-sm font-medium text-muted-foreground">
-              Advanced/internal tuning
-            </summary>
-            <div className="mt-4 space-y-5">
-              <Field>
-                <div className="flex items-center justify-between">
-                  <Label>RSI buy threshold</Label>
-                  <span className="text-sm font-medium tabular-nums">{form.rsi_buy_threshold}</span>
-                </div>
-                <input
-                  type="range" min="20" max="50" step="1"
-                  value={form.rsi_buy_threshold}
-                  onChange={(e) => set("rsi_buy_threshold")(Number(e.target.value))}
-                  className="w-full"
-                />
-                <Hint>Internal RSI tuning used by the legacy signal path. Lower = rarer, deeper dips only.</Hint>
-              </Field>
+          <SliderField
+            label="Minimum setup quality"
+            hint="Multi-factor score gate (RSI depth, trend, volume, support). Higher = fewer, better-conviction entries."
+            value={form.entry_score_threshold}
+            min={0} max={100} step={5}
+            format={(v) => `${v}%`}
+            onChange={(v) => set("entry_score_threshold")(v)}
+          />
 
-              <Field>
-                <div className="flex items-center justify-between">
-                  <Label>RSI sell threshold</Label>
-                  <span className="text-sm font-medium tabular-nums">{form.rsi_sell_threshold}</span>
-                </div>
-                <input
-                  type="range" min="50" max="85" step="1"
-                  value={form.rsi_sell_threshold}
-                  onChange={(e) => set("rsi_sell_threshold")(Number(e.target.value))}
-                  className="w-full"
-                />
-                <Hint>Internal RSI tuning used by the legacy signal path. Higher = holds longer for bigger moves.</Hint>
-              </Field>
+          <details className="rounded-lg border border-border/50 bg-muted/20 p-3">
+            <summary className="cursor-pointer text-xs font-medium text-muted-foreground">RSI sell threshold (advanced)</summary>
+            <div className="mt-4">
+              <SliderField
+                label="RSI sell threshold"
+                hint="Sell signal fires when RSI rises above this after a buy. Higher = holds longer for bigger moves."
+                value={form.rsi_sell_threshold}
+                min={50} max={85} step={1}
+                format={(v) => `RSI > ${v}`}
+                onChange={(v) => set("rsi_sell_threshold")(v)}
+              />
             </div>
           </details>
+        </SectionCard>
 
+        {/* Exit Strategy */}
+        <SectionCard
+          icon={<LogOut className="w-4 h-4" />}
+          title="Exit strategy"
+          description="How the bot closes positions. At least one should be non-zero."
+        >
+          <SliderField
+            label="Stop-loss"
+            hint="Hard exit if price falls this % below entry. Cuts losers fast. 0 = disabled."
+            value={form.stop_loss_pct}
+            min={0} max={10} step={0.5}
+            format={pct}
+            onChange={(v) => set("stop_loss_pct")(v)}
+          />
+
+          <SliderField
+            label="Trailing stop"
+            hint="Sell if price drops this % from its peak since entry. Locks in gains as price rises. 0 = disabled."
+            value={form.trailing_stop_pct}
+            min={0} max={10} step={0.5}
+            format={pct}
+            onChange={(v) => set("trailing_stop_pct")(v)}
+          />
+
+          <SliderField
+            label="Take-profit"
+            hint="Hard exit once up this % from entry. 0 = rely on RSI signal or trailing stop only."
+            value={form.take_profit_pct}
+            min={0} max={20} step={0.5}
+            format={pct}
+            onChange={(v) => set("take_profit_pct")(v)}
+          />
+        </SectionCard>
+
+        {/* Risk Gates */}
+        <SectionCard
+          icon={<Shield className="w-4 h-4" />}
+          title="Risk gates"
+          description="Hard limits that block new entries when market or account conditions are unsafe."
+        >
           <Field>
-            <div className="flex items-center justify-between">
-              <Label>Stop-loss %</Label>
-              <span className="text-sm font-medium tabular-nums">{form.stop_loss_pct === 0 ? "Off" : `${form.stop_loss_pct}%`}</span>
+            <Label>Daily loss limit</Label>
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-muted-foreground">$</span>
+              <input
+                type="number" min="0" max="1000" step="5"
+                value={form.daily_loss_limit_usd}
+                onChange={(e) => set("daily_loss_limit_usd")(Number(e.target.value))}
+                className="h-9 w-32 rounded-md border border-input bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring"
+              />
             </div>
-            <input
-              type="range" min="0" max="10" step="0.5"
-              value={form.stop_loss_pct}
-              onChange={(e) => set("stop_loss_pct")(Number(e.target.value))}
-              className="w-full"
-            />
-            <Hint>Hard exit if price falls this % below entry. 2% is tight for day trading — cuts losers fast. 0 = disabled.</Hint>
+            <Hint>No new buys if closed-trade losses today exceed this amount. Resets at midnight UTC.</Hint>
           </Field>
 
-          <Field>
-            <div className="flex items-center justify-between">
-              <Label>Trailing stop %</Label>
-              <span className="text-sm font-medium tabular-nums">{form.trailing_stop_pct === 0 ? "Off" : `${form.trailing_stop_pct}%`}</span>
-            </div>
-            <input
-              type="range" min="0" max="10" step="0.5"
-              value={form.trailing_stop_pct}
-              onChange={(e) => set("trailing_stop_pct")(Number(e.target.value))}
-              className="w-full"
-            />
-            <Hint>Sell if price drops this % from its peak since entry. 1.5% locks in gains on short moves. 0 = disabled.</Hint>
-          </Field>
+          <SliderField
+            label="Max portfolio drawdown"
+            hint="Blocks new entries if total closed-trade losses exceed this % of peak value. Protects against runaway losses."
+            value={form.max_drawdown_pct}
+            min={1} max={30} step={0.5}
+            format={pct}
+            onChange={(v) => set("max_drawdown_pct")(v)}
+          />
 
-          <Field>
-            <div className="flex items-center justify-between">
-              <Label>Take-profit %</Label>
-              <span className="text-sm font-medium tabular-nums">{form.take_profit_pct === 0 ? "Off" : `${form.take_profit_pct}%`}</span>
-            </div>
-            <input
-              type="range" min="0" max="20" step="0.5"
-              value={form.take_profit_pct}
-              onChange={(e) => set("take_profit_pct")(Number(e.target.value))}
-              className="w-full"
-            />
-            <Hint>Hard exit once up this % from entry. 5% is a solid day-trade target. 0 = disabled (rely on RSI/trailing stop).</Hint>
-          </Field>
+          <SliderField
+            label="Max bid/ask spread"
+            hint="Skips entry if the live Coinbase spread exceeds this %. High spreads mean poor fill quality."
+            value={form.max_spread_pct}
+            min={0.05} max={1} step={0.05}
+            format={pct}
+            onChange={(v) => set("max_spread_pct")(v)}
+          />
 
-          <div className="pt-1">
-            <button
-              onClick={() => saveSettings.mutate()}
-              disabled={saveSettings.isPending}
-              className="flex items-center gap-1.5 h-9 px-4 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:opacity-90 disabled:opacity-50"
-            >
-              <Save className="w-4 h-4" />
-              {saveSettings.isPending ? "Saving…" : "Save settings"}
-            </button>
-          </div>
-        </section>
+          <SliderField
+            label="Max candle volatility"
+            hint="Blocks entry if the latest candle range exceeds this % of price. Avoids buying into erratic price spikes."
+            value={form.max_volatility_pct}
+            min={0.5} max={10} step={0.25}
+            format={pct}
+            onChange={(v) => set("max_volatility_pct")(v)}
+          />
+        </SectionCard>
+
+        {/* Save */}
+        <button
+          onClick={() => saveSettings.mutate()}
+          disabled={saveSettings.isPending}
+          className="w-full flex items-center justify-center gap-2 h-10 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:opacity-90 disabled:opacity-50 transition-opacity"
+        >
+          <Save className="w-4 h-4" />
+          {saveSettings.isPending ? "Saving…" : "Save settings"}
+        </button>
 
         {/* Coinbase credentials */}
-        <section className="space-y-5">
-          <div>
-            <h2 className="text-base font-semibold">Coinbase API credentials</h2>
-            <p className="text-sm text-muted-foreground mt-1">
-              Create a CDP API key at <a href="https://portal.cdp.coinbase.com" target="_blank" rel="noreferrer" className="underline">portal.cdp.coinbase.com</a>. 
-              Give it <strong>Trade</strong> permission only. The private key is stored encrypted in Supabase Vault.
-            </p>
-          </div>
-
+        <SectionCard
+          icon={<Shield className="w-4 h-4" />}
+          title="Coinbase API credentials"
+          description={`Create a CDP API key at portal.cdp.coinbase.com — Trade permission only. Stored encrypted in Supabase Vault.`}
+        >
           <Field>
             <Label>API key name</Label>
             <input
@@ -353,7 +515,7 @@ export default function Settings() {
           <Field>
             <div className="flex items-center justify-between">
               <Label>Private key (PEM)</Label>
-              <button onClick={() => setShowPem(!showPem)} className="text-xs text-muted-foreground flex items-center gap-1">
+              <button type="button" onClick={() => setShowPem(!showPem)} className="text-xs text-muted-foreground flex items-center gap-1 hover:text-foreground transition-colors">
                 {showPem ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
                 {showPem ? "Hide" : "Show"}
               </button>
@@ -365,11 +527,12 @@ export default function Settings() {
               placeholder="-----BEGIN PRIVATE KEY-----&#10;..."
               className="w-full rounded-md border border-input bg-background px-3 py-2 text-xs font-mono outline-none focus:ring-2 focus:ring-ring resize-none"
             />
-            <Hint>Paste the full PEM including the BEGIN/END lines. Stored encrypted, never exposed to the browser again after saving.</Hint>
+            <Hint>Paste the full PEM including BEGIN/END lines. Never exposed to the browser again after saving.</Hint>
           </Field>
 
           <div className="flex items-center gap-2">
             <button
+              type="button"
               onClick={testConnection}
               disabled={testingConn}
               className="h-9 px-4 rounded-md border border-border text-sm hover:bg-muted disabled:opacity-50 transition-colors"
@@ -377,6 +540,7 @@ export default function Settings() {
               {testingConn ? "Testing…" : "Test connection"}
             </button>
             <button
+              type="button"
               onClick={() => saveCredentials.mutate()}
               disabled={saveCredentials.isPending || !apiKeyName || !privatePem}
               className="flex items-center gap-1.5 h-9 px-4 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:opacity-90 disabled:opacity-50"
@@ -385,10 +549,10 @@ export default function Settings() {
               {saveCredentials.isPending ? "Saving…" : "Save credentials"}
             </button>
           </div>
-        </section>
+        </SectionCard>
 
-        <div className="border-t border-border pt-6 text-xs text-muted-foreground space-y-1">
-          <p>• Bot checks RSI on 5-minute candles every 5 minutes — each tick sees fresh data.</p>
+        <div className="border-t border-border pt-4 pb-8 text-xs text-muted-foreground space-y-1">
+          <p>• Worker evaluates 5-minute candles in real time via WebSocket — no polling delay.</p>
           <p>• Only one position open at a time per account.</p>
           <p>• Paper mode simulates trades without touching real funds.</p>
           <p>• Run "Test connection" before enabling live trading.</p>
