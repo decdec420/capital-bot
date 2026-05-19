@@ -805,28 +805,66 @@ type Severity = "success" | "warn" | "error" | "info";
 interface ParsedFactor { points: number; label: string; blurb: string; }
 interface ParsedReason { headline: string; detail: string; severity: Severity; factors: ParsedFactor[]; blockerList: string[]; scoreStr: string | null; }
 
-// Short human descriptions for each scoring factor (fuzzy matched by prefix)
-const FACTOR_BLURBS: [string, string][] = [
-  ["RSI below 25",         "Extremely oversold — strongest buy signal possible"],
-  ["RSI below 30",         "Oversold — solid buy zone, historically good entries"],
-  ["RSI below 35",         "Approaching oversold — getting interesting"],
-  ["RSI rising from",      "RSI bouncing back up — momentum turning positive"],
-  ["RSI falling fast",     "Dropping hard — better to wait for it to stabilize first"],
-  ["price above EMA 200",  "Price above the 200-day average — long-term trend is up (bullish)"],
-  ["price below EMA 200",  "Price below the 200-day average — long-term trend is down (bearish backdrop)"],
-  ["EMA 50 above EMA 200", "Golden cross — medium-term trend above long-term (bullish structure)"],
-  ["EMA 50 rising",        "Medium-term trend is improving"],
-  ["volume above average", "Volume confirms the move — buyers/sellers are active"],
-  ["support held",         "Price bounced off a key level — buyers stepped in and defended it"],
-  ["price near support",   "Approaching a price floor where buyers have shown up before"],
-  ["high volatility spike","Candle was too wild — erratic moves increase stop-loss risk"],
+// Human-readable labels and blurbs for each scoring factor (fuzzy matched by prefix)
+// label = short plain-English name shown prominently
+// blurb = one-sentence explanation shown below
+const FACTOR_BLURBS: [string, { label: string; blurb: string }][] = [
+  ["RSI below 25",         { label: "RSI deeply oversold",           blurb: "The strongest buy signal — price has sold off hard and a bounce is historically likely." }],
+  ["RSI below 30",         { label: "RSI oversold",                  blurb: "Solid buy zone — price has pulled back enough to look attractive." }],
+  ["RSI below 35",         { label: "RSI getting oversold",          blurb: "Starting to look interesting — not quite oversold yet but getting there." }],
+  ["RSI rising from",      { label: "RSI turning back up",           blurb: "Momentum is shifting — the selloff may be over and buyers are stepping in." }],
+  ["RSI falling fast",     { label: "RSI falling sharply",           blurb: "Still dropping — better to wait for it to stabilize before entering." }],
+  ["price above EMA 200",  { label: "Above 200-period average",      blurb: "The bigger trend is up. Buying dips in an uptrend tends to work better." }],
+  ["price below EMA 200",  { label: "Below 200-period average",      blurb: "The bigger trend is down. Buying here is going against the trend — higher risk." }],
+  ["EMA 50 above EMA 200", { label: "Short trend above long trend",  blurb: "Golden cross — medium-term momentum is stronger than the long-term average (bullish)." }],
+  ["EMA 50 rising",        { label: "Medium-term trend rising",      blurb: "The 50-period average is pointing up, meaning recent price action is improving." }],
+  ["volume above average", { label: "Volume above average",          blurb: "More people are trading right now — moves with high volume tend to be more reliable." }],
+  ["support held",         { label: "Bounced off support level",     blurb: "Price tested a floor and held. Buyers defended that level, which is a positive sign." }],
+  ["price near support",   { label: "Near a support level",          blurb: "Approaching a price floor where buyers have shown up before." }],
+  ["high volatility spike",{ label: "Candle too wild",               blurb: "The last candle had a huge range — erratic moves make stop-losses more likely to trigger." }],
 ];
 
-function factorBlurb(label: string): string {
-  for (const [prefix, blurb] of FACTOR_BLURBS) {
-    if (label.toLowerCase().startsWith(prefix.toLowerCase())) return blurb;
+const BLOCKER_LABELS: [string, string][] = [
+  ["volume is less than 50%",            "Volume is unusually low right now"],
+  ["open trade",                         "Already holding a position"],
+  ["current price is unavailable",       "Can't get a live price right now"],
+  ["RSI is unavailable",                 "RSI hasn't loaded yet"],
+  ["bid_ask_unavailable",                "Couldn't check the spread"],
+  ["unacceptable_spread",                "Spread between buy/sell price is too wide"],
+  ["high_volatility_spike",              "Market is too choppy right now"],
+  ["daily_loss_limit",                   "Daily loss limit reached — buys paused"],
+  ["max_drawdown",                       "Max drawdown reached — buys paused"],
+  ["stale_market_data",                  "Price data went stale"],
+  ["missing_candles",                    "Not enough history yet to compute signals"],
+];
+
+function humanizeBlocker(b: string): string {
+  const lower = b.toLowerCase();
+  for (const [key, label] of BLOCKER_LABELS) {
+    if (lower.includes(key.toLowerCase())) return label;
   }
-  return label;
+  return b;
+}
+
+function humanizeAction(action: string, reason: string): string {
+  if (action === "buy")          return "Bought";
+  if (action === "sell")         return "Sold";
+  if (action === "RISK_BLOCKED") return "Blocked";
+  const r = reason ?? "";
+  if (r.includes("holding"))     return "Holding";
+  if (r.includes(";;")) {
+    const header = r.split(";;")[0];
+    if (header.startsWith("tick-check")) return "Checking";
+    return "Evaluating";
+  }
+  return "Watching";
+}
+
+function factorInfo(label: string): { label: string; blurb: string } {
+  for (const [prefix, info] of FACTOR_BLURBS) {
+    if (label.toLowerCase().startsWith(prefix.toLowerCase())) return info;
+  }
+  return { label, blurb: "" };
 }
 
 function parseFactors(parts: string[]): { factors: ParsedFactor[]; blockerList: string[] } {
@@ -837,7 +875,7 @@ function parseFactors(parts: string[]): { factors: ParsedFactor[]; blockerList: 
       blockerList.push(part.slice(8).trim());
     } else {
       const m = part.match(/^([+-]?\d+)\s+(.+)$/);
-      if (m) factors.push({ points: Number(m[1]), label: m[2], blurb: factorBlurb(m[2]) });
+      if (m) { const info = factorInfo(m[2]); factors.push({ points: Number(m[1]), label: info.label, blurb: info.blurb }); }
     }
   }
   return { factors, blockerList };
@@ -850,41 +888,41 @@ function parseReason(action: string, reason: string): ParsedReason {
   if (action === "buy") {
     const rsiMatch = r.match(/RSI ([\d.]+)/);
     const isPaper = r.includes("PAPER");
-    return { headline: isPaper ? "Paper buy executed" : "Live buy executed",
-      detail: `Bot entered a ${isPaper ? "paper " : "live "}position when RSI dropped to ${rsiMatch?.[1] ?? "oversold"} — below your buy threshold. ${isPaper ? "No real money moved." : "A real market buy order was placed on Coinbase."}`,
-      severity: "success", ...empty };
+    return {
+      headline: isPaper ? "Paper trade placed" : "Live trade placed",
+      detail: `Bot bought when RSI hit ${rsiMatch?.[1] ?? "oversold"} — right in the buy zone you set. ${isPaper ? "This is a paper trade, so no real money moved." : "A real market buy order was sent to Coinbase and confirmed."}`,
+      severity: "success", ...empty,
+    };
   }
 
   if (action === "sell") {
     const pnlMatch = r.match(/P&L \$?([-\d.]+)/);
     const pnl = pnlMatch ? Number(pnlMatch[1]) : null;
-    const exitType = r.includes("trailing") ? "trailing stop" : r.includes("stop_loss") ? "stop-loss" : r.includes("take_profit") ? "take-profit" : "RSI signal";
-    return { headline: pnl != null && pnl >= 0 ? "Position closed — profit" : "Position closed — loss",
-      detail: `Exit triggered by ${exitType}. ${pnl != null ? `P&L: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}.` : ""} ${r.includes("PAPER") ? "Paper trade — no real money." : "Live fill confirmed on Coinbase."}`,
-      severity: pnl == null ? "info" : pnl >= 0 ? "success" : "warn", ...empty };
+    const exitType = r.includes("trailing") ? "trailing stop"
+      : r.includes("stop_loss") ? "stop-loss limit"
+      : r.includes("take_profit") ? "take-profit target"
+      : "RSI sell signal";
+    const won = pnl != null && pnl >= 0;
+    return {
+      headline: pnl == null ? "Position closed" : won ? "Closed for a profit 🟢" : "Closed at a loss 🔴",
+      detail: `Exit triggered by ${exitType}.${pnl != null ? ` Result: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}.` : ""} ${r.includes("PAPER") ? "Paper trade — no real money was involved." : "Fill confirmed on Coinbase."}`,
+      severity: pnl == null ? "info" : won ? "success" : "warn", ...empty,
+    };
   }
 
   if (action === "RISK_BLOCKED" || r.startsWith("RISK_BLOCKED")) {
     const blocker = r.replace(/^RISK_BLOCKED:\s*/i, "").split(":")[0].trim();
     const msgs: Record<string, { headline: string; detail: string }> = {
-      bid_ask_unavailable: { headline: "Spread check failed — API error",
-        detail: "Bot tried to fetch the live bid/ask spread before buying but Coinbase returned an error (bug now fixed in worker). Set Max Bid/Ask Spread to 0% in Settings to skip the spread gate if this keeps appearing." },
-      unacceptable_spread: { headline: "Spread too wide — entry skipped",
-        detail: "The gap between Coinbase's buy price and sell price exceeded your Max Spread setting. A wide spread means you'd be immediately underwater the moment you buy." },
-      high_volatility_spike: { headline: "Candle too volatile — entry skipped",
-        detail: "The most recent 5-minute candle's range exceeded your Max Candle Volatility setting. Buying into an erratic candle increases the chance of an immediate stop-loss hit." },
-      daily_loss_limit: { headline: "Daily loss limit hit — buys paused",
-        detail: "Closed trades today have lost more than your Daily Loss Limit. No new buys until midnight UTC resets the counter." },
-      max_drawdown: { headline: "Max drawdown reached — buys paused",
-        detail: "Total drawdown across all trades hit your Max Portfolio Drawdown setting. Raise or disable it in Settings → Risk Gates." },
-      existing_open_position: { headline: "Already in a position",
-        detail: "Bot holds one position at a time. A trade is open — no new buy until it closes." },
-      stale_market_data: { headline: "Market data went stale",
-        detail: "No fresh price ticks for 2+ minutes. Bot pauses new entries rather than buying on an outdated price. Usually resolves when WebSocket reconnects." },
-      missing_candles: { headline: "Not enough candle history yet",
-        detail: "Need at least 15 candles to compute RSI reliably. Resolves automatically after a few 5-minute closes." },
+      bid_ask_unavailable:    { headline: "Couldn't check the spread", detail: "Bot checks the gap between the buy and sell price before every trade, but Coinbase didn't respond. The buy was skipped to be safe. Usually fixes itself on the next tick." },
+      unacceptable_spread:    { headline: "Spread too wide — skipped", detail: "The difference between what you'd pay to buy vs. what you'd get if you sold immediately was larger than your Max Spread setting. Entering now would mean you're already down before the trade even starts." },
+      high_volatility_spike:  { headline: "Too choppy right now — skipped", detail: "The last 5-minute candle had a huge price swing. Buying into chaos like that gives your stop-loss a much higher chance of getting triggered right away." },
+      daily_loss_limit:       { headline: "Daily loss limit hit", detail: "The bot's losses today have reached the limit you set. No more buys until midnight UTC, when the counter resets. You can adjust the limit in Settings → Risk Gates." },
+      max_drawdown:           { headline: "Max drawdown limit hit", detail: "Total portfolio drawdown across all your trades has hit the ceiling you set. The bot is protecting what's left. You can raise or turn this off in Settings → Risk Gates." },
+      existing_open_position: { headline: "Already in a trade", detail: "The bot only holds one position at a time. There's an open trade right now — a new buy will be considered once it closes." },
+      stale_market_data:      { headline: "Price data went stale", detail: "The bot hasn't received a live price tick in over 2 minutes. Rather than act on stale data, it paused entries. Usually self-resolves when the WebSocket reconnects." },
+      missing_candles:        { headline: "Still warming up", detail: "Not enough price history has been collected yet to reliably compute signals. This clears automatically after the first few 5-minute candles close." },
     };
-    const found = msgs[blocker] ?? { headline: "Entry blocked by risk gate", detail: `Gate: "${blocker}"` };
+    const found = msgs[blocker] ?? { headline: "Buy blocked by a safety rule", detail: `The bot hit a risk gate before placing the order. Gate ID: "${blocker}"` };
     return { ...found, severity: "error", ...empty };
   }
 
@@ -896,14 +934,23 @@ function parseReason(action: string, reason: string): ParsedReason {
     const { factors, blockerList } = parseFactors(parts.slice(1));
     const scoreMatch  = header.match(/score=(\d+)\/(\d+)/);
     const rsiMatch    = header.match(/RSI[= ]([\d.]+)/);
-    const nextMatch   = header.match(/next=(.+)$/);
     const scoreStr    = scoreMatch ? `${scoreMatch[1]} / ${scoreMatch[2]}` : null;
+    const scoreNum    = scoreMatch ? Number(scoreMatch[1]) : 0;
+    const maxScore    = scoreMatch ? Number(scoreMatch[2]) : 12;
     const isTick      = header.startsWith("tick-check");
-    const hasScore    = scoreMatch && Number(scoreMatch[1]) > 0;
+
+    let detail: string;
+    if (blockerList.length > 0) {
+      detail = `RSI is at ${rsiMatch?.[1] ?? "—"} — in the buy zone. But the bot hit a roadblock before it could enter. See "Why it can't buy yet" below.`;
+    } else if (scoreNum === 0) {
+      detail = `RSI is at ${rsiMatch?.[1] ?? "—"} — in the buy zone, but the market doesn't look ready. None of the extra quality checks are passing right now.`;
+    } else {
+      detail = `RSI is at ${rsiMatch?.[1] ?? "—"} — in the buy zone. The setup is scoring ${scoreNum} out of ${maxScore} points. ${isTick ? "Bot rechecks every minute while RSI stays in range." : "It needs enough points to clear your Entry Quality setting before placing a buy."}`;
+    }
 
     return {
-      headline: isTick ? "RSI in range — checking entry quality" : "Candle close — evaluating entry",
-      detail: `RSI (${rsiMatch?.[1] ?? "—"}) is ${isTick ? "below" : "near"} your buy threshold. ${hasScore ? `Score is ${scoreStr}` : "Score is low"} — needs to clear your Entry Quality Threshold to trigger a buy. ${isTick ? "Rechecks every 60 seconds while RSI stays low." : `Next: ${nextMatch?.[1] ?? "watching."}`}`,
+      headline: isTick ? "RSI in range — sizing up the opportunity" : "Candle closed — sizing up the opportunity",
+      detail,
       severity: blockerList.length ? "error" : "warn",
       factors, blockerList, scoreStr,
     };
@@ -911,19 +958,143 @@ function parseReason(action: string, reason: string): ParsedReason {
 
   if (r.includes("holding")) {
     const rsiMatch = r.match(/RSI ([\d.]+)/);
-    return { headline: "Holding open position",
-      detail: `RSI is at ${rsiMatch?.[1] ?? "—"}, below your sell threshold. Bot is keeping the position open.`,
-      severity: "info", ...empty };
+    return {
+      headline: "Holding the position",
+      detail: `RSI is at ${rsiMatch?.[1] ?? "—"}, which hasn't reached your sell threshold yet. The bot is sitting tight and waiting for a cleaner exit signal.`,
+      severity: "info", ...empty,
+    };
   }
 
   if (r.includes("waiting") || r.includes("watching") || action === "hold") {
     const rsiMatch = r.match(/RSI[ =]([\d.]+)/);
-    return { headline: "Watching — RSI not in buy range yet",
-      detail: `RSI is at ${rsiMatch?.[1] ?? "—"}, above your buy threshold. Bot is monitoring and will evaluate a buy when RSI drops into range.`,
-      severity: "info", ...empty };
+    return {
+      headline: "Watching and waiting",
+      detail: `RSI is at ${rsiMatch?.[1] ?? "—"} — above your buy threshold. Nothing to do yet. The bot will start evaluating a buy once RSI drops into the oversold range you've set.`,
+      severity: "info", ...empty,
+    };
   }
 
-  return { headline: action.toUpperCase(), detail: r || "No additional details.", severity: "info", ...empty };
+  return { headline: "Monitoring", detail: r || "No additional details.", severity: "info", ...empty };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Expanded detail panel — extracted as a component so it can use hooks (useState)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function TickDetailPanel({ tick, parsed, severityColor }: { tick: TickLog; parsed: ParsedReason; severityColor: string }) {
+  const [showRaw, setShowRaw] = useState(false);
+  const scoredFactors  = parsed.factors.filter(f => f.points !== 0);
+  const neutralFactors = parsed.factors.filter(f => f.points === 0);
+  const scoreNums = parsed.scoreStr ? parsed.scoreStr.split(" / ").map(Number) : null;
+
+  return (
+    <div style={{
+      padding: "10px 14px 14px",
+      background: "var(--bg-2)",
+      borderTop: "1px solid var(--t-border)",
+      fontFamily: "JetBrains Mono, monospace",
+    }}>
+      {/* Headline + score dots */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+        <div style={{ fontSize: 11.5, fontWeight: 600, color: severityColor }}>
+          {parsed.headline}
+        </div>
+        {scoreNums && (
+          <div style={{ display: "flex", alignItems: "center", gap: 3, flexShrink: 0, marginLeft: 8 }}>
+            {Array.from({ length: scoreNums[1] }).map((_, di) => (
+              <div key={di} style={{
+                width: 5, height: 5, borderRadius: "50%",
+                background: di < scoreNums[0] ? severityColor : "var(--text-4)",
+                opacity: di < scoreNums[0] ? 1 : 0.3,
+              }} />
+            ))}
+            <span style={{ fontSize: 9, color: "var(--text-4)", marginLeft: 4 }}>{scoreNums[0]}/{scoreNums[1]}</span>
+          </div>
+        )}
+      </div>
+
+      {/* Detail text */}
+      <div style={{ fontSize: 11, color: "var(--text-2)", lineHeight: 1.65, marginBottom: (scoredFactors.length || neutralFactors.length || parsed.blockerList.length) ? 10 : 6 }}>
+        {parsed.detail}
+      </div>
+
+      {/* Scored factors */}
+      {scoredFactors.length > 0 && (
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 5 }}>
+            Signal quality checks
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {scoredFactors.map((f, fi) => (
+              <div key={fi} style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+                <span style={{
+                  minWidth: 26, fontSize: 10, fontWeight: 700, textAlign: "right", paddingTop: 1,
+                  color: f.points > 0 ? "var(--green)" : "var(--red)",
+                }}>
+                  {f.points > 0 ? `+${f.points}` : f.points}
+                </span>
+                <div>
+                  <div style={{ fontSize: 10.5, color: "var(--text)", lineHeight: 1.3 }}>{f.label}</div>
+                  {f.blurb && <div style={{ fontSize: 10, color: "var(--text-3)", lineHeight: 1.4, marginTop: 1 }}>{f.blurb}</div>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Neutral/unavailable factors */}
+      {neutralFactors.length > 0 && (
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 5 }}>
+            Not yet available
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            {neutralFactors.map((f, fi) => (
+              <div key={fi} style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+                <span style={{ minWidth: 26, fontSize: 10, color: "var(--text-4)", textAlign: "right" }}>—</span>
+                <div style={{ fontSize: 10, color: "var(--text-4)", lineHeight: 1.4 }}>{f.label}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Blockers */}
+      {parsed.blockerList.length > 0 && (
+        <div style={{ marginBottom: 6 }}>
+          <div style={{ fontSize: 9, color: "var(--red)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 5 }}>
+            Why it can't buy yet
+          </div>
+          {parsed.blockerList.map((b, bi) => (
+            <div key={bi} style={{ display: "flex", alignItems: "flex-start", gap: 7, marginBottom: 4 }}>
+              <span style={{ color: "var(--red)", fontSize: 11, minWidth: 14 }}>✕</span>
+              <div style={{ fontSize: 10.5, color: "var(--red)" }}>{humanizeBlocker(b)}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Raw log — hidden by default */}
+      {tick.reason && (
+        <div style={{ marginTop: 4 }}>
+          <button
+            onClick={(e) => { e.stopPropagation(); setShowRaw(v => !v); }}
+            style={{ fontSize: 9, color: "var(--text-4)", background: "none", border: "none", cursor: "pointer", padding: 0, textDecoration: "underline" }}
+          >
+            {showRaw ? "hide raw log" : "show raw log"}
+          </button>
+          {showRaw && (
+            <div style={{ marginTop: 5, padding: "6px 8px", background: "var(--bg-3)", borderRadius: 4 }}>
+              <div style={{ fontSize: 10, color: "var(--text-3)", wordBreak: "break-all", lineHeight: 1.5 }}>
+                {tick.reason.replace(/;;/g, " · ")}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -971,18 +1142,16 @@ function TickFeed({ ticks }: { ticks: TickLog[] }) {
               >
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 2 }}>
                   <span style={{ fontSize: 10, fontWeight: 600, letterSpacing: "0.05em", textTransform: "uppercase", color: actionColor }}>
-                    {t.action}
+                    {humanizeAction(t.action, t.reason ?? "")}
                   </span>
                   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                     <span style={{ fontSize: 10, color: "var(--text-4)" }}>{fmtTime(t.created_at)}</span>
                     <span style={{ fontSize: 9, color: "var(--text-4)" }}>{isSelected ? "▲" : "▼"}</span>
                   </div>
                 </div>
-                {t.reason && (
-                  <div style={{ fontSize: 11, color: "var(--text-3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {t.reason}
-                  </div>
-                )}
+                <div style={{ fontSize: 11, color: "var(--text-3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {parsed.headline}
+                </div>
                 {(t.price != null || t.rsi != null) && (
                   <div style={{ fontSize: 10.5, color: "var(--text-4)", marginTop: 1 }}>
                     {t.price != null ? `$${Number(t.price).toLocaleString("en-US", { maximumFractionDigits: 0 })}` : ""}
@@ -993,74 +1162,7 @@ function TickFeed({ ticks }: { ticks: TickLog[] }) {
 
               {/* Expanded detail panel */}
               {isSelected && (
-                <div style={{
-                  padding: "10px 14px 14px",
-                  background: "var(--bg-2)",
-                  borderTop: "1px solid var(--t-border)",
-                  fontFamily: "JetBrains Mono, monospace",
-                }}>
-                  <div style={{ fontSize: 11.5, fontWeight: 600, color: severityColor, marginBottom: 4 }}>
-                    {parsed.headline}
-                    {parsed.scoreStr && (
-                      <span style={{ marginLeft: 8, fontSize: 10, fontWeight: 400, color: "var(--text-3)" }}>
-                        score {parsed.scoreStr}
-                      </span>
-                    )}
-                  </div>
-                  <div style={{ fontSize: 11, color: "var(--text-2)", lineHeight: 1.65, marginBottom: parsed.factors.length ? 10 : 8 }}>
-                    {parsed.detail}
-                  </div>
-
-                  {/* Per-factor checklist */}
-                  {parsed.factors.length > 0 && (
-                    <div style={{ marginBottom: 8 }}>
-                      <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 5 }}>
-                        What the bot checked
-                      </div>
-                      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-                        {parsed.factors.map((f, fi) => (
-                          <div key={fi} style={{ display: "flex", alignItems: "flex-start", gap: 7 }}>
-                            <span style={{
-                              minWidth: 30, fontSize: 10, fontWeight: 700, textAlign: "right",
-                              color: f.points > 0 ? "var(--green)" : f.points < 0 ? "var(--red)" : "var(--text-4)",
-                            }}>
-                              {f.points > 0 ? `+${f.points}` : f.points}
-                            </span>
-                            <div>
-                              <div style={{ fontSize: 10.5, color: "var(--text)", lineHeight: 1.3 }}>{f.label}</div>
-                              <div style={{ fontSize: 10, color: "var(--text-3)", lineHeight: 1.4 }}>{f.blurb}</div>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Blockers */}
-                  {parsed.blockerList.length > 0 && (
-                    <div style={{ marginBottom: 8 }}>
-                      <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 5 }}>
-                        Blockers (must clear to buy)
-                      </div>
-                      {parsed.blockerList.map((b, bi) => (
-                        <div key={bi} style={{ display: "flex", alignItems: "flex-start", gap: 7, marginBottom: 4 }}>
-                          <span style={{ color: "var(--red)", fontSize: 11, minWidth: 14 }}>✕</span>
-                          <div style={{ fontSize: 10.5, color: "var(--red)" }}>{b}</div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
-                  {/* Raw log */}
-                  {t.reason && (
-                    <div style={{ padding: "6px 8px", background: "var(--bg-3)", borderRadius: 4 }}>
-                      <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 3 }}>Raw log</div>
-                      <div style={{ fontSize: 10, color: "var(--text-3)", wordBreak: "break-all", lineHeight: 1.5 }}>
-                        {t.reason.replace(/;;/g, " · ")}
-                      </div>
-                    </div>
-                  )}
-                </div>
+                <TickDetailPanel tick={t} parsed={parsed} severityColor={severityColor} />
               )}
             </div>
           );
@@ -1074,12 +1176,203 @@ function TickFeed({ ticks }: { ticks: TickLog[] }) {
 // Trade history — compact table, expandable
 // Default: show 5 most recent. "Show all" expands.
 // ─────────────────────────────────────────────────────────────────────────────
+// Trade lesson — structured JSON written to trades.notes by the worker
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface TradeLesson {
+  version:       number;
+  narrative:     string;
+  lesson:        string;
+  outcome:       "win" | "loss";
+  entry_score:   number | null;
+  entry_factors: string[];
+  hold_minutes:  number;
+  close_reason:  string;
+  is_live:       boolean;
+}
+
+function parseLessonNotes(notes?: string | null): TradeLesson | null {
+  if (!notes) return null;
+  try {
+    const parsed = JSON.parse(notes) as TradeLesson;
+    if (parsed.version && parsed.narrative) return parsed;
+  } catch { /* old-format string notes */ }
+  return null;
+}
+
+function fallbackNarrative(t: Trade): string {
+  const pnl = Number(t.effective_pnl ?? t.pnl_usd ?? 0);
+  const win = pnl >= 0;
+  const rsi = t.rsi_at_entry?.toFixed(1) ?? "—";
+  const hold = fmtDuration(t.created_at, t.closed_at);
+  const exitLabels: Record<string, string> = {
+    trailing_stop: "trailing stop", stop_loss: "stop-loss",
+    take_profit: "take-profit target", rsi_signal: "RSI sell signal", manual: "manual close",
+  };
+  const exit = exitLabels[t.close_reason ?? ""] ?? (t.close_reason ?? "exit");
+  return `Bot entered ${t.symbol} when RSI hit ${rsi}. Held for ${hold}, then exited via ${exit}. Result: ${win ? "+" : ""}$${Math.abs(pnl).toFixed(2)} (${fmtPct(t.pnl_pct)}).`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trade card — single collapsible trade with full story on expand
+// ─────────────────────────────────────────────────────────────────────────────
+
+function TradeCard({ trade, num }: { trade: Trade; num: number }) {
+  const [open, setOpen] = useState(false);
+  const pnl    = Number(trade.effective_pnl ?? trade.pnl_usd ?? 0);
+  const pnlPct = Number(trade.pnl_pct ?? 0);
+  const win    = pnl >= 0;
+  const accent = win ? "var(--green)" : "var(--red)";
+  const lesson = parseLessonNotes(trade.notes);
+  const narrative = lesson?.narrative ?? fallbackNarrative(trade);
+
+  // Build "why it worked / why it lost" bullet list from entry factors
+  const goodFactors = (lesson?.entry_factors ?? []).filter(f => f.startsWith("+")).map(f => f.replace(/^\+\d+ /, ""));
+  const badFactors  = (lesson?.entry_factors ?? []).filter(f => f.startsWith("-")).map(f => f.replace(/^-\d+ /, ""));
+
+  const whyPoints: { text: string; good: boolean }[] = [
+    ...goodFactors.map(f => ({ text: factorInfo(f).label || f, good: true })),
+    ...badFactors.map(f => ({ text: factorInfo(f).label || f, good: false })),
+  ];
+  // Add outcome-specific insights if no factors recorded
+  if (!whyPoints.length) {
+    const cr = trade.close_reason ?? "";
+    if (win) {
+      if (cr === "trailing_stop") whyPoints.push({ text: "Trailing stop locked in the gain", good: true });
+      if (cr === "take_profit")   whyPoints.push({ text: "Hit the take-profit target", good: true });
+      if (cr === "rsi_signal")    whyPoints.push({ text: "RSI reached overbought — clean exit", good: true });
+    } else {
+      if (cr === "stop_loss")     whyPoints.push({ text: "Stop-loss triggered — price moved against the position", good: false });
+      if (cr === "trailing_stop") whyPoints.push({ text: "Trailing stop triggered on a reversal", good: false });
+    }
+  }
+
+  return (
+    <div style={{ borderBottom: "1px solid var(--t-border)" }}>
+      {/* Collapsed row */}
+      <div
+        onClick={() => setOpen(o => !o)}
+        style={{ padding: "10px 14px", cursor: "pointer", background: open ? "var(--bg-2)" : "transparent", userSelect: "none" }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {/* Win/loss indicator */}
+            <div style={{
+              width: 6, height: 6, borderRadius: "50%", flexShrink: 0,
+              background: accent, boxShadow: `0 0 6px ${accent}`,
+            }} />
+            <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text)", fontFamily: "JetBrains Mono, monospace" }}>
+              #{num} {trade.symbol}
+            </span>
+            <span className={`pill ${closeReasonClass(trade.close_reason)}`} style={{ fontSize: 9, padding: "1px 6px" }}>
+              {closeReasonLabel(trade.close_reason)}
+            </span>
+            {lesson?.is_live === false && (
+              <span style={{ fontSize: 9, color: "var(--text-4)", fontFamily: "JetBrains Mono, monospace" }}>PAPER</span>
+            )}
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: accent, fontFamily: "JetBrains Mono, monospace" }}>
+                {pnl >= 0 ? "+" : "−"}{fmtUSD(Math.abs(pnl))}
+              </div>
+              <div style={{ fontSize: 10, color: "var(--text-4)", fontFamily: "JetBrains Mono, monospace" }}>
+                {fmtPct(pnlPct)} · {fmtDuration(trade.created_at, trade.closed_at)}
+              </div>
+            </div>
+            <span style={{ fontSize: 9, color: "var(--text-4)" }}>{open ? "▲" : "▼"}</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Expanded detail */}
+      {open && (
+        <div style={{ background: "var(--bg-2)", borderTop: "1px solid var(--t-border)", fontFamily: "JetBrains Mono, monospace" }}>
+          {/* Price journey */}
+          <div style={{ padding: "14px 14px 0", display: "flex", alignItems: "center", gap: 0 }}>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3 }}>Entry</div>
+              <div style={{ fontSize: 16, fontWeight: 700, color: "var(--text)" }}>{fmtUSD(trade.entry_price)}</div>
+              <div style={{ fontSize: 10, color: "var(--text-3)", marginTop: 2 }}>RSI {trade.rsi_at_entry?.toFixed(1) ?? "—"} · {new Date(trade.created_at).toLocaleDateString("en-US", { month: "short", day: "numeric" })} {fmtTime(trade.created_at)}</div>
+            </div>
+            {/* Arrow with P&L */}
+            <div style={{ textAlign: "center", padding: "0 12px", flexShrink: 0 }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: accent, marginBottom: 2 }}>
+                {pnl >= 0 ? "+" : "−"}{fmtUSD(Math.abs(pnl))}
+              </div>
+              <div style={{ fontSize: 18, color: "var(--text-4)", lineHeight: 1 }}>→</div>
+              <div style={{ fontSize: 10, color: accent, marginTop: 2 }}>{fmtPct(pnlPct)}</div>
+            </div>
+            <div style={{ flex: 1, textAlign: "right" }}>
+              <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3 }}>Exit</div>
+              <div style={{ fontSize: 16, fontWeight: 700, color: "var(--text)" }}>{fmtUSD(trade.exit_price)}</div>
+              <div style={{ fontSize: 10, color: "var(--text-3)", marginTop: 2 }}>{closeReasonLabel(trade.close_reason)} · {fmtTime(trade.closed_at)}</div>
+            </div>
+          </div>
+
+          {/* Divider */}
+          <div style={{ margin: "12px 14px", height: 1, background: "var(--t-border)" }} />
+
+          {/* Narrative */}
+          <div style={{ padding: "0 14px 12px" }}>
+            <div style={{ fontSize: 11, color: "var(--text-2)", lineHeight: 1.7 }}>
+              {narrative}
+            </div>
+          </div>
+
+          {/* What worked / what hurt */}
+          {whyPoints.length > 0 && (
+            <div style={{ padding: "0 14px 12px" }}>
+              <div style={{ fontSize: 9, color: accent, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>
+                {win ? "Why it worked" : "What went against it"}
+              </div>
+              {whyPoints.map((p, i) => (
+                <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 7, marginBottom: 4 }}>
+                  <span style={{ color: p.good ? "var(--green)" : "var(--red)", fontSize: 11, minWidth: 12, marginTop: 1 }}>
+                    {p.good ? "✓" : "✗"}
+                  </span>
+                  <span style={{ fontSize: 10.5, color: "var(--text-2)", lineHeight: 1.4 }}>{p.text}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Bot's lesson */}
+          {lesson?.lesson && (
+            <div style={{ margin: "0 14px 12px", padding: "9px 11px", background: `${accent}11`, borderLeft: `2px solid ${accent}`, borderRadius: "0 4px 4px 0" }}>
+              <div style={{ fontSize: 9, color: accent, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 4 }}>
+                {win ? "What the bot learned" : "What the bot learned"}
+              </div>
+              <div style={{ fontSize: 10.5, color: "var(--text-2)", lineHeight: 1.55 }}>{lesson.lesson}</div>
+            </div>
+          )}
+
+          {/* Stats grid */}
+          <div style={{ margin: "0 14px 14px", display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "8px 12px" }}>
+            {[
+              { label: "Invested",   value: fmtUSD(trade.quote_size) },
+              { label: "Size",       value: trade.size != null ? `${Number(trade.size).toFixed(6)} BTC` : "—" },
+              { label: "Hold time",  value: fmtDuration(trade.created_at, trade.closed_at) },
+              { label: "Entry fee",  value: trade.entry_fees_usd != null ? fmtUSD(trade.entry_fees_usd) : "—" },
+              { label: "RSI in",     value: trade.rsi_at_entry?.toFixed(1) ?? "—" },
+              { label: "Score",      value: lesson?.entry_score != null ? `${lesson.entry_score}/12` : "—" },
+            ].map(({ label, value }) => (
+              <div key={label}>
+                <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 2 }}>{label}</div>
+                <div style={{ fontSize: 11, color: "var(--text-2)" }}>{value}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function TradeHistory({ trades }: { trades: Trade[] }) {
-  const [expanded, setExpanded] = useState(false);
+  const [showAll, setShowAll] = useState(false);
   const PAGE = 5;
-  const visible = expanded ? trades : trades.slice(0, PAGE);
-  const more = trades.length - PAGE;
+  const visible = showAll ? trades : trades.slice(0, PAGE);
 
   if (!trades.length) {
     return (
@@ -1089,67 +1382,31 @@ function TradeHistory({ trades }: { trades: Trade[] }) {
     );
   }
 
+  const wins   = trades.filter(t => Number(t.effective_pnl ?? t.pnl_usd ?? 0) >= 0).length;
+  const totalPnl = trades.reduce((s, t) => s + Number(t.effective_pnl ?? t.pnl_usd ?? 0), 0);
+
   return (
     <div className="t-panel" style={{ overflow: "hidden" }}>
       <div className="t-panel-hd">
         <span className="kicker">TRADE HISTORY</span>
-        <span className="mono dim" style={{ fontSize: 10 }}>
-          {trades.length} closed trade{trades.length !== 1 ? "s" : ""}
-        </span>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, fontFamily: "JetBrains Mono, monospace" }}>
+          <span style={{ fontSize: 10, color: "var(--text-4)" }}>
+            {wins}W / {trades.length - wins}L
+          </span>
+          <span style={{ fontSize: 10, fontWeight: 600, color: totalPnl >= 0 ? "var(--green)" : "var(--red)" }}>
+            {totalPnl >= 0 ? "+" : ""}{fmtUSD(totalPnl)}
+          </span>
+        </div>
       </div>
-      <div style={{ overflowX: "auto" }}>
-        <table className="t-table">
-          <thead>
-            <tr>
-              <th style={{ textAlign: "left"  }}>#</th>
-              <th style={{ textAlign: "left"  }}>Pair</th>
-              <th style={{ textAlign: "right" }}>Entry</th>
-              <th style={{ textAlign: "right" }}>Exit</th>
-              <th style={{ textAlign: "right" }}>P&L</th>
-              <th style={{ textAlign: "right" }}>Δ%</th>
-              <th style={{ textAlign: "right" }}>Held</th>
-              <th style={{ textAlign: "right" }}>RSI in</th>
-              <th style={{ textAlign: "left",  paddingLeft: 16 }}>Reason</th>
-            </tr>
-          </thead>
-          <tbody>
-            {visible.map((t, idx) => {
-              const pnl    = Number(t.effective_pnl ?? t.pnl_usd ?? 0);
-              const pnlPct = Number(t.pnl_pct ?? 0);
-              return (
-                <tr key={t.id}>
-                  <td style={{ color: "var(--text-4)" }}>{trades.length - idx}</td>
-                  <td style={{ textAlign: "left" }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                      {pnl >= 0
-                        ? <svg width="10" height="10" viewBox="0 0 10 10"><polygon points="5,1 9,9 1,9" fill="var(--green)" /></svg>
-                        : <svg width="10" height="10" viewBox="0 0 10 10"><polygon points="1,1 9,1 5,9" fill="var(--red)" /></svg>}
-                      <span style={{ fontWeight: 500 }}>{t.symbol}</span>
-                    </span>
-                  </td>
-                  <td>{fmtUSD(t.entry_price)}</td>
-                  <td>{fmtUSD(t.exit_price)}</td>
-                  <td style={{ color: pnl >= 0 ? "var(--green)" : "var(--red)", fontWeight: 600 }}>
-                    {pnl >= 0 ? "+" : "−"}{fmtUSD(Math.abs(pnl))}
-                  </td>
-                  <td style={{ color: pnlPct >= 0 ? "var(--green)" : "var(--red)" }}>{fmtPct(pnlPct)}</td>
-                  <td style={{ color: "var(--text-3)" }}>{fmtDuration(t.created_at, t.closed_at)}</td>
-                  <td style={{ color: "var(--text-3)" }}>{t.rsi_at_entry?.toFixed(1) ?? "—"}</td>
-                  <td style={{ textAlign: "left", paddingLeft: 16 }}>
-                    <span className={`pill ${closeReasonClass(t.close_reason)}`} style={{ fontSize: "10px", padding: "1px 7px" }}>
-                      {closeReasonLabel(t.close_reason)}
-                    </span>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+      <div>
+        {visible.map((t, idx) => (
+          <TradeCard key={t.id} trade={t} num={trades.length - idx} />
+        ))}
       </div>
       {trades.length > PAGE && (
         <div style={{ borderTop: "1px solid var(--t-border)", padding: "10px 14px", textAlign: "center" }}>
-          <button className="t-btn" onClick={() => setExpanded((e) => !e)} style={{ fontSize: 11 }}>
-            {expanded ? "Show less" : `Show ${more} older trade${more !== 1 ? "s" : ""}`}
+          <button className="t-btn" onClick={() => setShowAll(s => !s)} style={{ fontSize: 11 }}>
+            {showAll ? "Show less" : `Show ${trades.length - PAGE} more trade${trades.length - PAGE !== 1 ? "s" : ""}`}
           </button>
         </div>
       )}

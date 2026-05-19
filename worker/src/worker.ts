@@ -75,6 +75,8 @@ interface UserState {
   openTrade:        OpenTrade | null;
   credentials:      Credentials | null; // null = paper mode or not yet loaded
   lastEntryCheckMs: number;             // debounce: last time tick-entry was evaluated
+  lastDecision:     import("./trade-decision.ts").TradeDecision | null; // saved for lesson generation at close
+  entryDecisionSnapshot: { score: number; reasons: string[]; rsi: number; price: number } | null;
 }
 
 const TICK_ENTRY_DEBOUNCE_MS = 60_000; // max one tick-level entry check per minute per user
@@ -151,7 +153,7 @@ async function reloadSettings(): Promise<void> {
             console.warn(`[settings] no creds for ${s.user_id}:`, e instanceof Error ? e.message : String(e));
           }
         }
-        userStates.set(s.user_id, { settings: s, openTrade, credentials: creds, lastEntryCheckMs: 0 });
+        userStates.set(s.user_id, { settings: s, openTrade, credentials: creds, lastEntryCheckMs: 0, lastDecision: null, entryDecisionSnapshot: null });
         console.log(`[settings] loaded user ${s.user_id} — openTrade=${openTrade?.id ?? "none"}`);
       } else {
         // Update settings, preserve openTrade and credentials
@@ -276,6 +278,84 @@ async function entryRiskBlocked(
   return false; // all gates passed
 }
 
+// ── Trade lesson generator — writes structured JSON to trades.notes ──────────
+// Called at every close so the Dashboard can render a full trade story and the
+// worker can load past lessons on startup to log patterns over time.
+
+interface TradeLesson {
+  version:     number;
+  symbol:      string;
+  entry_rsi:   number;
+  entry_price: number;
+  exit_price:  number;
+  pnl_pct:     number;
+  effective_pnl: number;
+  hold_minutes:  number;
+  close_reason:  string;
+  outcome:       "win" | "loss";
+  entry_score:   number | null;
+  entry_factors: string[];
+  is_live:       boolean;
+  narrative:     string;
+  lesson:        string;
+  closed_at:     string;
+}
+
+function generateTradeLesson(params: {
+  symbol: string; entryRsi: number; entryPrice: number; exitPrice: number;
+  pnlPct: number; effectivePnl: number; closeReason: string; holdMinutes: number;
+  entrySnapshot: UserState["entryDecisionSnapshot"]; isLive: boolean;
+}): string {
+  const { symbol, entryRsi, entryPrice, exitPrice, pnlPct, effectivePnl, closeReason, holdMinutes, entrySnapshot, isLive } = params;
+  const win = effectivePnl >= 0;
+
+  const exitLabels: Record<string, string> = {
+    trailing_stop: "trailing stop", stop_loss: "stop-loss",
+    take_profit:   "take-profit target", rsi_signal: "RSI sell signal", manual: "manual close",
+  };
+  const exitLabel = exitLabels[closeReason] ?? closeReason;
+  const rsiZone = entryRsi < 25 ? "deeply oversold" : entryRsi < 30 ? "oversold" : entryRsi < 35 ? "getting oversold" : "near the buy threshold";
+  const holdStr = holdMinutes < 60 ? `${holdMinutes} min` : `${Math.floor(holdMinutes / 60)}h ${holdMinutes % 60}m`;
+  const move = Math.abs(pnlPct).toFixed(2);
+  const priceDir = exitPrice >= entryPrice ? "up" : "down";
+
+  const score = entrySnapshot?.score ?? null;
+  const positiveFactors = (entrySnapshot?.reasons ?? []).filter(r => r.startsWith("+"));
+  const negativeFactors = (entrySnapshot?.reasons ?? []).filter(r => r.startsWith("-"));
+
+  // Build narrative
+  let narrative = `Bot entered ${symbol} when RSI hit ${entryRsi.toFixed(1)} (${rsiZone}).`;
+  if (score !== null) {
+    const quality = score >= 8 ? "high-quality" : score >= 5 ? "decent" : score >= 3 ? "marginal" : "weak";
+    narrative += ` The setup was ${quality}, scoring ${score}/${MAX_INTERNAL_SCORE} points.`;
+  }
+  if (positiveFactors.length) narrative += ` Positives: ${positiveFactors.slice(0, 3).map(f => f.replace(/^\+\d+ /, "")).join(", ")}.`;
+  if (negativeFactors.length) narrative += ` Headwinds: ${negativeFactors.map(f => f.replace(/^-\d+ /, "")).join(", ")}.`;
+  narrative += ` Price moved ${priceDir} ${move}% over ${holdStr}, closing via ${exitLabel}.`;
+
+  // Build lesson
+  let lesson: string;
+  if (win) {
+    if (closeReason === "trailing_stop")  lesson = `Trailing stop did its job — locked in a ${move}% gain as price moved in our favor.`;
+    else if (closeReason === "take_profit") lesson = `Hit the take-profit target (+${move}%). Worth checking whether price kept moving — if so, consider raising the TP.`;
+    else if (score !== null && score >= 7) lesson = `Strong setup (${score}/${MAX_INTERNAL_SCORE}) delivered. High-score entries in clear conditions tend to work.`;
+    else lesson = `RSI oversold entry paid off despite a lower score. Market timing mattered.`;
+  } else {
+    if (closeReason === "stop_loss") lesson = `Stop-loss triggered (${move}% loss). ${negativeFactors.length ? `Entry had headwinds: ${negativeFactors.map(f => f.replace(/^-\d+ /, "")).join(", ")}.` : "Entry may have lacked trend support."}`;
+    else if (closeReason === "trailing_stop") lesson = `Trailing stop triggered on a reversal after a ${move}% drawdown from peak. Position may have entered too early in the dip.`;
+    else lesson = `Position closed at a ${move}% loss via ${exitLabel}. Review whether RSI was still falling fast at entry.`;
+  }
+
+  const result: TradeLesson = {
+    version: 1, symbol, entry_rsi: entryRsi, entry_price: entryPrice, exit_price: exitPrice,
+    pnl_pct: pnlPct, effective_pnl: effectivePnl, hold_minutes: holdMinutes,
+    close_reason: closeReason, outcome: win ? "win" : "loss",
+    entry_score: score, entry_factors: (entrySnapshot?.reasons ?? []),
+    is_live: isLive, narrative, lesson, closed_at: new Date().toISOString(),
+  };
+  return JSON.stringify(result);
+}
+
 // ── Risk exits: checked on EVERY price tick ────────────────
 
 async function checkRiskExits(userId: string, state: UserState, price: number, rsi: number): Promise<boolean> {
@@ -310,18 +390,24 @@ async function checkRiskExits(userId: string, state: UserState, price: number, r
 
   console.log(`[risk] ${userId} → ${exitLabel} @ $${price.toFixed(2)}`);
 
+  const holdMinutes = Math.round((Date.now() - new Date(openTrade.created_at ?? Date.now()).getTime()) / 60_000);
+
   try {
     if (!settings.live_trading) {
       const pnl = (price - entry) * openTrade.size;
+      const notes = generateTradeLesson({
+        symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? rsi, entryPrice: entry,
+        exitPrice: price, pnlPct: changePct, effectivePnl: pnl,
+        closeReason, holdMinutes, entrySnapshot: state.entryDecisionSnapshot, isLive: false,
+      });
       await closeTrade(openTrade.id, {
         exit_price: price, exit_fees_usd: 0, pnl_usd: pnl, pnl_pct: changePct,
-        effective_pnl: pnl, close_reason: closeReason,
-        notes: `[PAPER] ${exitLabel} — $${price.toFixed(2)} — P&L $${pnl.toFixed(2)}`,
+        effective_pnl: pnl, close_reason: closeReason, notes,
       });
       if (settings.compound_mode) {
         const newBalance = settings.paper_balance_usd + pnl;
         await updatePaperBalance(userId, newBalance);
-        settings.paper_balance_usd = Math.max(0, newBalance); // reflect locally
+        settings.paper_balance_usd = Math.max(0, newBalance);
         console.log(`[compound] balance updated: $${newBalance.toFixed(2)} (${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)})`);
       }
       await sendTelegram(fmtSell(settings.symbol, rsi, price, entry, pnl, changePct, false, exitLabel));
@@ -332,11 +418,15 @@ async function checkRiskExits(userId: string, state: UserState, price: number, r
       const realPnl    = (fill.fillPrice - entry) * fill.filledBaseSize;
       const realPnlPct = ((fill.fillPrice - entry) / entry) * 100;
       const netPnl     = realPnl - openTrade.entry_fees_usd - fill.feesUsd;
+      const notes = generateTradeLesson({
+        symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? rsi, entryPrice: entry,
+        exitPrice: fill.fillPrice, pnlPct: realPnlPct, effectivePnl: netPnl,
+        closeReason, holdMinutes, entrySnapshot: state.entryDecisionSnapshot, isLive: true,
+      });
       await closeTrade(openTrade.id, {
         exit_price: fill.fillPrice, exit_fees_usd: fill.feesUsd,
         pnl_usd: realPnl, pnl_pct: realPnlPct, effective_pnl: netPnl,
-        close_reason: closeReason, close_order_id: fill.orderId,
-        notes: `LIVE ${exitLabel} — filled $${fill.fillPrice.toFixed(2)} — net $${netPnl.toFixed(2)}`,
+        close_reason: closeReason, close_order_id: fill.orderId, notes,
       });
       await sendTelegram(fmtSell(settings.symbol, rsi, fill.fillPrice, entry, realPnl, realPnlPct, true, exitLabel));
       await logTick(userId, settings.symbol, rsi, fill.fillPrice, "sell", `LIVE ${exitLabel}`);
@@ -390,6 +480,7 @@ async function checkTickEntry(userId: string, state: UserState, symState: Symbol
   const decision = evaluateTradeDecision({
     settings, openTrade, lastRsi, rsiHistory, closePrices, recentCandles, currentPrice,
   });
+  state.lastDecision = decision;
 
   if (decision.state !== "TRADE_ALLOWED" || decision.riskBlocked) {
     // Score too low or blocked — log per-factor breakdown for dashboard display
@@ -421,6 +512,7 @@ async function checkTickEntry(userId: string, state: UserState, symState: Symbol
         notes: `[PAPER] TICK BUY — RSI ${lastRsi.toFixed(1)} < ${settings.rsi_buy_threshold}${settings.compound_mode ? ` [compound $${orderUsd.toFixed(2)}]` : ""}`,
       });
       state.openTrade = { id, entry_price: currentPrice, size, quote_size: orderUsd, entry_fees_usd: 0, trailing_high: null, rsi_at_entry: lastRsi };
+      state.entryDecisionSnapshot = { score: decision.score, reasons: decision.reasons, rsi: lastRsi, price: currentPrice };
       await sendTelegram(fmtBuy(settings.symbol, lastRsi, currentPrice, size, orderUsd, false));
       await logTick(userId, settings.symbol, lastRsi, currentPrice, "buy", `PAPER TICK BUY — RSI ${lastRsi.toFixed(1)}`);
     } else {
@@ -445,6 +537,7 @@ async function checkTickEntry(userId: string, state: UserState, symState: Symbol
         notes: `LIVE TICK BUY — RSI ${lastRsi.toFixed(1)} filled @ $${fill.fillPrice.toFixed(2)}`,
       });
       state.openTrade = { id: pendingId, entry_price: fill.fillPrice, size: fill.filledBaseSize, quote_size: fill.filledQuoteSize, entry_fees_usd: fill.feesUsd, trailing_high: null, rsi_at_entry: lastRsi };
+      state.entryDecisionSnapshot = { score: decision.score, reasons: decision.reasons, rsi: lastRsi, price: fill.fillPrice };
       await sendTelegram(fmtBuy(settings.symbol, lastRsi, fill.fillPrice, fill.filledBaseSize, fill.filledQuoteSize, true));
       await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "buy", `LIVE TICK BUY filled @ $${fill.fillPrice.toFixed(2)}`);
     }
@@ -534,12 +627,17 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
     try {
       const entry  = openTrade.entry_price;
       const pnlPct = ((currentPrice - entry) / entry) * 100;
+      const holdMinutes = Math.round((Date.now() - new Date(openTrade.created_at ?? Date.now()).getTime()) / 60_000);
       if (!settings.live_trading) {
         const pnl = (currentPrice - entry) * openTrade.size;
+        const notes = generateTradeLesson({
+          symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? lastRsi, entryPrice: entry,
+          exitPrice: currentPrice, pnlPct, effectivePnl: pnl,
+          closeReason: "rsi_signal", holdMinutes, entrySnapshot: state.entryDecisionSnapshot, isLive: false,
+        });
         await closeTrade(openTrade.id, {
           exit_price: currentPrice, exit_fees_usd: 0, pnl_usd: pnl, pnl_pct: pnlPct,
-          effective_pnl: pnl, close_reason: "rsi_signal",
-          notes: `[PAPER] RSI ${lastRsi.toFixed(1)} > ${settings.rsi_sell_threshold} @ $${currentPrice.toFixed(2)} — P&L $${pnl.toFixed(2)}`,
+          effective_pnl: pnl, close_reason: "rsi_signal", notes,
         });
         if (settings.compound_mode) {
           const newBalance = settings.paper_balance_usd + pnl;
@@ -559,7 +657,11 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
           exit_price: fill.fillPrice, exit_fees_usd: fill.feesUsd,
           pnl_usd: realPnl, pnl_pct: realPnlPct, effective_pnl: netPnl,
           close_reason: "rsi_signal", close_order_id: fill.orderId,
-          notes: `LIVE SELL — RSI ${lastRsi.toFixed(1)} — filled $${fill.fillPrice.toFixed(2)} — net $${netPnl.toFixed(2)}`,
+          notes: generateTradeLesson({
+            symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? lastRsi, entryPrice: entry,
+            exitPrice: fill.fillPrice, pnlPct: realPnlPct, effectivePnl: netPnl,
+            closeReason: "rsi_signal", holdMinutes, entrySnapshot: state.entryDecisionSnapshot, isLive: true,
+          }),
         });
         await sendTelegram(fmtSell(settings.symbol, lastRsi, fill.fillPrice, entry, realPnl, realPnlPct, true));
         await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "sell", `LIVE SELL filled @ $${fill.fillPrice.toFixed(2)}`);
