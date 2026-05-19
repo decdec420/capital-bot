@@ -585,15 +585,41 @@ function PositionPanel({
   if (!openTrade) {
     const latestTick = tickLogs.find((t) => !settings?.symbol || t.symbol === settings.symbol) ?? tickLogs[0];
     const persistedState = normalizeDecisionState(latestTick?.decision_state ?? latestTick?.decision);
-    const decisionState: DecisionState = persistedState ?? "WATCHING";
-    const rsiValue = latestTick?.rsi != null ? Number(latestTick.rsi) : currentRSI;
-    const rsiText = Number.isFinite(Number(rsiValue)) ? Number(rsiValue).toFixed(2) : "—";
+
+    // Parse decision state from reason string if not stored as structured field
+    // Worker writes e.g. "waiting — RSI 48.9 (buy < 25)" or "Volume filter — skipped"
+    const reason = latestTick?.reason ?? "";
+    const isVolumeSkip = reason.toLowerCase().includes("volume filter");
+    const isWaiting = reason.toLowerCase().includes("waiting");
+    const derivedState: DecisionState = persistedState
+      ?? (isVolumeSkip ? "RISK BLOCKED" : isWaiting ? "WATCHING" : "WATCHING");
+    const decisionState = derivedState;
+
+    // Prefer currentRSI (from live candles, fresher) over tick_log RSI (up to 5 min stale)
+    const rsiValue = currentRSI ?? (latestTick?.rsi != null ? Number(latestTick.rsi) : null);
+    const tickRsi  = latestTick?.rsi != null ? Number(latestTick.rsi) : null;
+    const rsiText  = rsiValue != null ? rsiValue.toFixed(2) : "—";
     const rsiInterpretation = latestTick?.rsi_interpretation ?? interpretRSI(rsiValue);
     const tradeScore = fmtScore(latestTick?.trade_score ?? latestTick?.score);
-    const topReasons = parseTickList(latestTick?.top_reasons ?? latestTick?.reasons);
-    const topBlockers = parseTickList(latestTick?.top_blockers ?? latestTick?.blockers);
-    const nextTrigger = latestTick?.next_likely_trigger ?? latestTick?.next_trigger ?? "Awaiting backend entry evaluation";
-    const hasBackendDecision = Boolean(persistedState || latestTick?.trade_score != null || latestTick?.score != null || latestTick?.next_likely_trigger || latestTick?.next_trigger || topReasons.length || topBlockers.length);
+
+    // Parse reasons/blockers from structured fields OR from the reason string
+    const structuredReasons  = parseTickList(latestTick?.top_reasons ?? latestTick?.reasons);
+    const structuredBlockers = parseTickList(latestTick?.top_blockers ?? latestTick?.blockers);
+    const derivedReasons: string[] = structuredReasons.length ? structuredReasons
+      : isWaiting ? [`RSI ${tickRsi?.toFixed(1) ?? "—"} — waiting for RSI < ${settings?.rsi_buy_threshold ?? "?"}`]
+      : [];
+    const derivedBlockers: string[] = structuredBlockers.length ? structuredBlockers
+      : isVolumeSkip ? ["Volume below 50% of recent average"]
+      : [];
+    const topReasons  = derivedReasons;
+    const topBlockers = derivedBlockers;
+
+    const nextTrigger = latestTick?.next_likely_trigger ?? latestTick?.next_trigger
+      ?? (settings?.rsi_buy_threshold != null
+        ? `RSI below ${settings.rsi_buy_threshold} (currently ${rsiValue?.toFixed(1) ?? "—"})`
+        : "Awaiting backend entry evaluation");
+
+    const hasBackendDecision = Boolean(latestTick);
 
     function EmptyList({ label }: { label: string }) {
       return <span className="dim">No {label} reported by backend</span>;
@@ -654,7 +680,7 @@ function PositionPanel({
 
             {!hasBackendDecision && (
               <div className="dim" style={{ marginTop: 8, fontSize: 10.5 }}>
-                Backend decision metadata is not available yet; RSI is display-only and not shown as the sole entry condition.
+                No tick data yet — worker will populate this on the next 5-minute candle close.
               </div>
             )}
           </div>
@@ -972,11 +998,13 @@ export default function Dashboard() {
 
   // ── Aggregates ────────────────────────────────────────────────────────────
   const totalPnl  = closedTrades.reduce((s, t) => s + Number(t.effective_pnl ?? t.pnl_usd ?? 0), 0);
-  const wins      = closedTrades.filter((t) => Number(t.pnl_usd ?? 0) > 0).length;
+  // Use effective_pnl consistently for win/loss classification
+  const wins      = closedTrades.filter((t) => Number(t.effective_pnl ?? t.pnl_usd ?? 0) > 0).length;
   const losses    = closedTrades.length - wins;
   const winRate   = closedTrades.length ? (wins / closedTrades.length) * 100 : null;
   const avgTrade  = closedTrades.length ? totalPnl / closedTrades.length : null;
-  const totalInvested = closedTrades.length * (settings?.buy_amount_usd ?? 0);
+  // Use actual quote_size from each trade (not settings.buy_amount_usd which can change)
+  const totalInvested = closedTrades.reduce((s, t) => s + Number(t.quote_size ?? 0), 0);
   const roi       = totalInvested ? (totalPnl / totalInvested) * 100 : null;
 
   // Bot state label
