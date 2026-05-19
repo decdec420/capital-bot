@@ -457,22 +457,26 @@ function PriceChart({
     );
   }
 
-  const closes = candles.map((c) => c.close);
-  const minP = Math.min(...closes), maxP = Math.max(...closes);
-  const padP = (maxP - minP) * 0.08 || 1;
+  // Use full OHLC range so wicks aren't clipped at top/bottom
+  const minP = Math.min(...candles.map((c) => c.low));
+  const maxP = Math.max(...candles.map((c) => c.high));
+  const padP = (maxP - minP) * 0.06 || 1;
   const lo = minP - padP, hi = maxP + padP;
   const n = candles.length;
   const xAt = (i: number) => (i / (n - 1)) * W;
   const yAt = (p: number) => priceH - ((p - lo) / (hi - lo)) * priceH;
   const yRSI = (r: number) => rsiH - (r / 100) * rsiH;
 
-  const linePts = candles.map((c, i) => `${xAt(i).toFixed(2)},${yAt(c.close).toFixed(2)}`).join(" ");
-  const areaPath = `M0,${priceH} L${linePts.split(" ").join(" L")} L${W},${priceH} Z`;
+  // Candle bar dimensions — each candle gets 70% of its allocated slot
+  const candleSlot = W / Math.max(n, 1);
+  const candleW    = Math.max(1, candleSlot * 0.7);
+  const candleHalfW = candleW / 2;
+
   const rsiPts = rsiSeries
     .map((v, i) => v == null ? null : `${xAt(i).toFixed(2)},${yRSI(v).toFixed(2)}`)
     .filter(Boolean).join(" ");
 
-  const lastClose = spot ?? closes[n - 1];
+  const lastClose = spot ?? candles[n - 1]?.close ?? 0;
   const lastY = yAt(lastClose);
 
   return (
@@ -483,14 +487,25 @@ function PriceChart({
         <line key={f} x1={0} x2={W} y1={priceH * f} y2={priceH * f}
           stroke="var(--grid-line)" strokeWidth="1" strokeDasharray="2 4" />
       ))}
-      <defs>
-        <linearGradient id="priceGrad" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="var(--text)" stopOpacity="0.14" />
-          <stop offset="100%" stopColor="var(--text)" stopOpacity="0" />
-        </linearGradient>
-      </defs>
-      <path d={areaPath} fill="url(#priceGrad)" />
-      <polyline points={linePts} fill="none" stroke="var(--text)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
+      {/* Candlestick bars — green = close ≥ open, red = close < open */}
+      {candles.map((c, i) => {
+        const x = xAt(i);
+        const isUp = c.close >= c.open;
+        const col = isUp ? "var(--green)" : "var(--red)";
+        const bodyTop    = yAt(Math.max(c.open, c.close));
+        const bodyBottom = yAt(Math.min(c.open, c.close));
+        const bodyH = Math.max(1, bodyBottom - bodyTop);
+        return (
+          <g key={i}>
+            {/* Wick */}
+            <line x1={x} y1={yAt(c.high)} x2={x} y2={yAt(c.low)}
+              stroke={col} strokeWidth="0.7" opacity="0.55" vectorEffect="non-scaling-stroke" />
+            {/* Body */}
+            <rect x={x - candleHalfW} y={bodyTop} width={candleW} height={bodyH}
+              fill={col} opacity="0.8" />
+          </g>
+        );
+      })}
 
       {/* Live price dashed line + pulsing dot */}
       <line x1={0} x2={W} y1={lastY} y2={lastY} stroke="var(--text-3)" strokeWidth="1"
@@ -773,49 +788,200 @@ function PositionPanel({
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Live tick feed — real DB records only
+// Tick event parser — turns raw reason strings into plain-English explanations
+// ─────────────────────────────────────────────────────────────────────────────
+
+type Severity = "success" | "warn" | "error" | "info";
+
+function parseReason(action: string, reason: string): { headline: string; detail: string; severity: Severity } {
+  const r = reason ?? "";
+
+  if (action === "buy") {
+    const rsiMatch = r.match(/RSI ([\d.]+)/);
+    const isPaper = r.includes("PAPER");
+    return {
+      headline: isPaper ? "Paper buy executed" : "Live buy executed",
+      detail: `Bot entered a ${isPaper ? "paper " : "live "}position when RSI dropped to ${rsiMatch?.[1] ?? "oversold"} — below your buy threshold. ${isPaper ? "No real money moved." : "A real market buy order was placed on Coinbase."}`,
+      severity: "success",
+    };
+  }
+
+  if (action === "sell") {
+    const pnlMatch = r.match(/P&L \$?([-\d.]+)/);
+    const pnl = pnlMatch ? Number(pnlMatch[1]) : null;
+    const exitType = r.includes("trailing") ? "trailing stop" : r.includes("stop_loss") ? "stop-loss" : r.includes("take_profit") ? "take-profit" : "RSI signal";
+    return {
+      headline: pnl != null && pnl >= 0 ? "Position closed — profit" : "Position closed — loss",
+      detail: `Exit triggered by ${exitType}. ${pnl != null ? `P&L: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}.` : ""} ${r.includes("PAPER") ? "Paper trade — no real money." : "Live fill confirmed on Coinbase."}`,
+      severity: pnl == null ? "info" : pnl >= 0 ? "success" : "warn",
+    };
+  }
+
+  if (action === "RISK_BLOCKED" || r.startsWith("RISK_BLOCKED")) {
+    const blocker = r.replace(/^RISK_BLOCKED:\s*/i, "").split(":")[0].trim();
+    const msgs: Record<string, { headline: string; detail: string }> = {
+      bid_ask_unavailable: {
+        headline: "Spread check failed — API error",
+        detail: "Bot tried to fetch the live bid/ask spread from Coinbase before buying, but the API returned an error (was a bug — now fixed in worker). To prevent this from blocking entries in the meantime, you can set Max Bid/Ask Spread to 0% in Settings to skip the spread gate entirely.",
+      },
+      unacceptable_spread: {
+        headline: "Spread too wide — entry skipped",
+        detail: "The gap between Coinbase's buy price (ask) and sell price (bid) exceeded your Max Spread setting. A wide spread means you'd immediately be down by the full spread amount the moment you buy. Bot waited for a tighter market.",
+      },
+      high_volatility_spike: {
+        headline: "Candle too volatile — entry skipped",
+        detail: "The most recent 5-minute candle's price range (high minus low, as % of price) exceeded your Max Candle Volatility setting. Buying into an erratic candle increases the chance of an immediate stop-loss hit. Bot waits for a calmer candle.",
+      },
+      daily_loss_limit: {
+        headline: "Daily loss limit hit — buys paused",
+        detail: "Your closed trades today have lost more than your Daily Loss Limit setting. Bot will not open new positions until midnight UTC resets the daily counter. This protects against a bad session spiraling out of control.",
+      },
+      max_drawdown: {
+        headline: "Max drawdown reached — buys paused",
+        detail: "The total drawdown across all your closed trades has reached your Max Portfolio Drawdown setting. This is a long-term capital protection gate. You can raise or disable it in Settings under Risk Gates.",
+      },
+      existing_open_position: {
+        headline: "Already in a position",
+        detail: "The bot only holds one position at a time. A trade is currently open, so no new buy will be placed until it's closed by a sell signal, stop-loss, or take-profit.",
+      },
+      stale_market_data: {
+        headline: "Market data went stale",
+        detail: "No fresh price ticks arrived from the Coinbase WebSocket for more than 2 minutes. Bot pauses new entries rather than buying on an outdated price. This usually resolves automatically when the WebSocket reconnects.",
+      },
+      missing_candles: {
+        headline: "Not enough candle history yet",
+        detail: "The worker needs at least 15 historical candles to compute a reliable RSI. This normally only happens right after the worker starts — it resolves on its own after a few 5-minute candle closes.",
+      },
+    };
+    const found = msgs[blocker] ?? {
+      headline: `Entry blocked by risk gate`,
+      detail: `The gate that fired: "${blocker}". Full reason string is shown below.`,
+    };
+    return { ...found, severity: "error" };
+  }
+
+  if (r.startsWith("tick-check:")) {
+    const scoreMatch = r.match(/score=(\d+)\/(\d+)/);
+    const rsiMatch   = r.match(/RSI=([\d.]+)/);
+    return {
+      headline: "RSI in range — entry score too low",
+      detail: `RSI (${rsiMatch?.[1] ?? "—"}) is below your buy threshold, so bot ran a full quality check. The trade score (${scoreMatch ? `${scoreMatch[1]} out of ${scoreMatch[2]}` : "low"}) didn't clear your Entry Quality Threshold. Score factors include: EMA trend, volume vs. average, RSI momentum slope, and distance from support. Bot rechecks every 60 seconds while RSI stays low.`,
+      severity: "warn",
+    };
+  }
+
+  if (r.includes("holding")) {
+    const rsiMatch = r.match(/RSI ([\d.]+)/);
+    return {
+      headline: "Holding open position",
+      detail: `RSI is at ${rsiMatch?.[1] ?? "—"}, below your sell threshold. Bot is keeping the position open and checking for an exit signal on each 5-minute candle.`,
+      severity: "info",
+    };
+  }
+
+  if (r.includes("waiting") || r.includes("watching") || action === "hold") {
+    const rsiMatch = r.match(/RSI ([\d.]+)/);
+    const scoreMatch = r.match(/score (\d+)/);
+    return {
+      headline: "Watching for entry",
+      detail: `RSI is at ${rsiMatch?.[1] ?? "—"}, above your buy threshold. No action taken. ${scoreMatch ? `Current score: ${scoreMatch[1]}.` : ""} Bot will evaluate a buy when RSI drops into oversold territory.`,
+      severity: "info",
+    };
+  }
+
+  return { headline: action.toUpperCase(), detail: r || "No additional details available.", severity: "info" };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live tick feed — real DB records, click any row for plain-English detail
 // ─────────────────────────────────────────────────────────────────────────────
 
 function TickFeed({ ticks }: { ticks: TickLog[] }) {
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
   return (
-    <div className="t-panel" style={{ display: "flex", flexDirection: "column", maxHeight: 300 }}>
+    <div className="t-panel" style={{ display: "flex", flexDirection: "column", maxHeight: 340 }}>
       <div className="t-panel-hd">
         <span className="kicker">LIVE FEED</span>
-        <span className="mono dim" style={{ fontSize: 10 }}>{ticks.length} events</span>
+        <span className="mono dim" style={{ fontSize: 10 }}>{ticks.length} events · tap for details</span>
       </div>
       <div style={{ overflowY: "auto", flex: 1 }}>
         {ticks.length === 0 ? (
           <div className="mono dim" style={{ padding: "16px 14px", fontSize: 11, textAlign: "center" }}>
             no events yet…
           </div>
-        ) : ticks.map((t, i) => (
-          <div key={t.id} style={{
-            padding: "7px 14px",
-            borderBottom: i < ticks.length - 1 ? "1px solid var(--t-border)" : "none",
-            fontFamily: "JetBrains Mono, monospace",
-          }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 2 }}>
-              <span style={{
-                fontSize: 10, fontWeight: 600, letterSpacing: "0.05em", textTransform: "uppercase",
-                color: t.action === "buy" ? "var(--green)" : t.action === "sell" ? "var(--red)" : t.action === "error" ? "var(--red)" : "var(--text-3)",
-              }}>
-                {t.action}
-              </span>
-              <span style={{ fontSize: 10, color: "var(--text-4)" }}>{fmtTime(t.created_at)}</span>
+        ) : ticks.map((t, i) => {
+          const isSelected = selectedId === t.id;
+          const parsed = parseReason(t.action, t.reason ?? "");
+          const isBlocked = t.action === "RISK_BLOCKED" || (t.reason ?? "").startsWith("RISK_BLOCKED");
+          const actionColor = t.action === "buy" ? "var(--green)"
+            : t.action === "sell" ? "var(--red)"
+            : isBlocked ? "var(--red)"
+            : "var(--text-3)";
+          const severityColor = parsed.severity === "error" ? "var(--red)"
+            : parsed.severity === "success" ? "var(--green)"
+            : parsed.severity === "warn" ? "var(--amber)"
+            : "var(--text-2)";
+
+          return (
+            <div key={t.id} style={{ borderBottom: i < ticks.length - 1 ? "1px solid var(--t-border)" : "none" }}>
+              {/* Clickable row */}
+              <div
+                onClick={() => setSelectedId(isSelected ? null : t.id)}
+                style={{
+                  padding: "7px 14px",
+                  cursor: "pointer",
+                  background: isSelected ? "var(--bg-2)" : "transparent",
+                  fontFamily: "JetBrains Mono, monospace",
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 2 }}>
+                  <span style={{ fontSize: 10, fontWeight: 600, letterSpacing: "0.05em", textTransform: "uppercase", color: actionColor }}>
+                    {t.action}
+                  </span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ fontSize: 10, color: "var(--text-4)" }}>{fmtTime(t.created_at)}</span>
+                    <span style={{ fontSize: 9, color: "var(--text-4)" }}>{isSelected ? "▲" : "▼"}</span>
+                  </div>
+                </div>
+                {t.reason && (
+                  <div style={{ fontSize: 11, color: "var(--text-3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {t.reason}
+                  </div>
+                )}
+                {(t.price != null || t.rsi != null) && (
+                  <div style={{ fontSize: 10.5, color: "var(--text-4)", marginTop: 1 }}>
+                    {t.price != null ? `$${Number(t.price).toLocaleString("en-US", { maximumFractionDigits: 0 })}` : ""}
+                    {t.rsi != null ? ` · RSI ${Number(t.rsi).toFixed(1)}` : ""}
+                  </div>
+                )}
+              </div>
+
+              {/* Expanded detail panel */}
+              {isSelected && (
+                <div style={{
+                  padding: "10px 14px 14px",
+                  background: "var(--bg-2)",
+                  borderTop: "1px solid var(--t-border)",
+                  fontFamily: "JetBrains Mono, monospace",
+                }}>
+                  <div style={{ fontSize: 11.5, fontWeight: 600, color: severityColor, marginBottom: 6 }}>
+                    {parsed.headline}
+                  </div>
+                  <div style={{ fontSize: 11, color: "var(--text-2)", lineHeight: 1.65, marginBottom: 8 }}>
+                    {parsed.detail}
+                  </div>
+                  {t.reason && (
+                    <div style={{ padding: "6px 8px", background: "var(--bg-3)", borderRadius: 4 }}>
+                      <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 3 }}>Raw log</div>
+                      <div style={{ fontSize: 10, color: "var(--text-3)", wordBreak: "break-all", lineHeight: 1.5 }}>{t.reason}</div>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
-            {t.reason && (
-              <div style={{ fontSize: 11, color: "var(--text-3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={t.reason}>
-                {t.reason}
-              </div>
-            )}
-            {(t.price != null || t.rsi != null) && (
-              <div style={{ fontSize: 10.5, color: "var(--text-4)", marginTop: 1 }}>
-                {t.price != null ? `$${Number(t.price).toLocaleString("en-US", { maximumFractionDigits: 0 })}` : ""}
-                {t.rsi != null ? ` · RSI ${Number(t.rsi).toFixed(1)}` : ""}
-              </div>
-            )}
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
