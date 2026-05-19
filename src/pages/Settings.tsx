@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
-import { ArrowLeft, Eye, EyeOff, Save, Zap, Shield, TrendingUp, LogOut, Sliders } from "lucide-react";
+import { ArrowLeft, Eye, EyeOff, Save, Zap, Shield, TrendingUp, LogOut, Sliders, RefreshCw } from "lucide-react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 
 interface BotSettings {
@@ -21,6 +21,9 @@ interface BotSettings {
   max_drawdown_pct: number;
   max_spread_pct: number;
   max_volatility_pct: number;
+  compound_mode: boolean;
+  paper_balance_usd: number;
+  paper_starting_balance_usd: number;
 }
 
 const DEFAULT_BOT_SETTINGS: BotSettings = {
@@ -38,6 +41,9 @@ const DEFAULT_BOT_SETTINGS: BotSettings = {
   max_drawdown_pct: 10,
   max_spread_pct: 0.25,
   max_volatility_pct: 3,
+  compound_mode: false,
+  paper_balance_usd: 20,
+  paper_starting_balance_usd: 20,
 };
 
 const PRESETS = {
@@ -434,6 +440,67 @@ export default function Settings() {
             format={pct}
             onChange={(v) => set("take_profit_pct")(v)}
           />
+        </SectionCard>
+
+        {/* Compound Mode */}
+        <SectionCard
+          icon={<RefreshCw className="w-4 h-4" />}
+          title="Compound mode"
+          description="Reinvest gains automatically — position size grows with your balance over time."
+        >
+          <Field>
+            <div className="flex items-center justify-between">
+              <div>
+                <Label>Compound mode</Label>
+                <Hint>When on, ignores the fixed buy amount and sizes each trade as a % of current balance.</Hint>
+              </div>
+              <Toggle checked={form.compound_mode} onChange={(v) => set("compound_mode")(v)} />
+            </div>
+          </Field>
+
+          {form.compound_mode && (
+            <>
+              <Field>
+                <Label>Starting balance (paper mode)</Label>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-muted-foreground">$</span>
+                  <input
+                    type="number" min="1" max="100000" step="1"
+                    value={form.paper_starting_balance_usd}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      set("paper_starting_balance_usd")(v);
+                    }}
+                    className="h-9 w-32 rounded-md border border-input bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring"
+                  />
+                </div>
+                <Hint>Your seed capital. The bot compounds from this amount.</Hint>
+              </Field>
+
+              <Field>
+                <div className="flex items-center justify-between">
+                  <Label>Current paper balance</Label>
+                  <span className="text-sm font-semibold tabular-nums">${form.paper_balance_usd.toFixed(2)}</span>
+                </div>
+                <Hint>Running balance updated after each simulated trade. Reset by setting it back to your starting balance.</Hint>
+                <button
+                  type="button"
+                  onClick={() => set("paper_balance_usd")(form.paper_starting_balance_usd)}
+                  className="mt-1 text-xs text-muted-foreground hover:text-foreground underline"
+                >
+                  Reset to starting balance
+                </button>
+              </Field>
+
+              <div className="rounded-lg border border-border/50 bg-muted/20 p-3 text-xs text-muted-foreground space-y-1">
+                <p className="font-medium text-foreground">Position sizing tiers</p>
+                <p>Under $100 → deploy <strong>90%</strong> per trade</p>
+                <p>$100 – $500 → deploy <strong>80%</strong> per trade</p>
+                <p>$500 – $1,000 → deploy <strong>70%</strong> per trade</p>
+                <p>Over $1,000 → deploy <strong>50%</strong> per trade</p>
+              </div>
+            </>
+          )}
         </SectionCard>
 
         {/* Risk Gates */}

@@ -30,6 +30,10 @@ export interface Settings {
   // Entry quality gate: 0-100 slider in UI; maps to internal multi-factor score
   entry_score_threshold: number;
   enabled: boolean;
+  // Compound mode — grows position size with balance
+  compound_mode: boolean;
+  paper_balance_usd: number;          // running paper balance (updated after each close)
+  paper_starting_balance_usd: number; // original seed (for growth % display)
 }
 
 export interface ClosedTradeRiskRow {
@@ -72,8 +76,16 @@ export async function loadAllSettings(): Promise<Settings[]> {
     "/settings?enabled=eq.true&select=user_id,symbol,buy_amount_usd," +
     "rsi_buy_threshold,rsi_sell_threshold,live_trading,stop_loss_pct," +
     "take_profit_pct,trailing_stop_pct,daily_loss_limit_usd,max_drawdown_pct," +
-    "max_spread_pct,max_volatility_pct,entry_score_threshold,enabled",
+    "max_spread_pct,max_volatility_pct,entry_score_threshold,enabled," +
+    "compound_mode,paper_balance_usd,paper_starting_balance_usd",
   );
+}
+
+/** Update the running paper balance after a compound-mode simulated close */
+export async function updatePaperBalance(userId: string, newBalance: number): Promise<void> {
+  await rest("PATCH", `/settings?user_id=eq.${userId}`, {
+    paper_balance_usd: Math.max(0, newBalance),
+  });
 }
 
 /** Load open trade for a user (null if none) */

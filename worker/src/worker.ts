@@ -15,11 +15,11 @@
 import { CoinbaseWs } from "./coinbase-ws.ts";
 import { CandleBuilder, computeRsi, computeRsiSeries, volumeFilterPass, type Candle } from "./indicators.ts";
 import { evaluateTradeDecision } from "./trade-decision.ts";
-import { fetchHistoricalCandles, fetchBestBidAsk, placeMarketBuy, placeMarketSell, probeAuth, type Credentials } from "./broker.ts";
+import { fetchHistoricalCandles, fetchBestBidAsk, fetchUSDBalance, placeMarketBuy, placeMarketSell, probeAuth, type Credentials } from "./broker.ts";
 import {
   loadAllSettings, loadOpenTrade, loadClosedTradeRiskRows, getCoinbaseCredentials,
   insertTrade, insertPendingTrade, confirmTrade, deleteTrade,
-  loadPendingTrades, closeTrade, updateTrailingHigh, logTick,
+  loadPendingTrades, closeTrade, updateTrailingHigh, logTick, updatePaperBalance,
   type Settings, type OpenTrade,
 } from "./supabase.ts";
 import { sendTelegram, fmtBuy, fmtSell } from "./telegram.ts";
@@ -29,6 +29,30 @@ const RSI_PERIOD        = 14;
 const WARMUP_CANDLES    = 100;
 const SETTINGS_REFRESH  = 15_000; // ms — reduced from 60s to limit disable-lag
 const RSI_HISTORY_LIMIT = 50;     // bounded recent RSI values for signal-shape detection
+
+// ── Compound mode: tiered position sizing ───────────────────
+// Small balance → more aggressive deployment (faster compounding)
+// Large balance → more conservative (more to protect)
+function tieredDeployPct(balance: number): number {
+  if (balance < 100)  return 0.90; // < $100  → deploy 90%
+  if (balance < 500)  return 0.80; // $100–$500 → deploy 80%
+  if (balance < 1000) return 0.70; // $500–$1000 → deploy 70%
+  return 0.50;                      // $1000+  → deploy 50%
+}
+
+async function resolveOrderSize(settings: Settings, creds: Credentials | null, currentPrice: number): Promise<number> {
+  if (!settings.compound_mode) return settings.buy_amount_usd;
+  let balance: number;
+  if (settings.live_trading && creds) {
+    balance = await fetchUSDBalance(creds);
+  } else {
+    balance = settings.paper_balance_usd;
+  }
+  const deployPct = tieredDeployPct(balance);
+  const size = balance * deployPct;
+  console.log(`[compound] balance=$${balance.toFixed(2)} tier=${(deployPct*100).toFixed(0)}% orderSize=$${size.toFixed(2)}`);
+  return size;
+}
 
 // ── Per-symbol shared state ─────────────────────────────────
 
@@ -265,6 +289,12 @@ async function checkRiskExits(userId: string, state: UserState, price: number, r
         effective_pnl: pnl, close_reason: closeReason,
         notes: `[PAPER] ${exitLabel} — $${price.toFixed(2)} — P&L $${pnl.toFixed(2)}`,
       });
+      if (settings.compound_mode) {
+        const newBalance = settings.paper_balance_usd + pnl;
+        await updatePaperBalance(userId, newBalance);
+        settings.paper_balance_usd = Math.max(0, newBalance); // reflect locally
+        console.log(`[compound] balance updated: $${newBalance.toFixed(2)} (${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)})`);
+      }
       await sendTelegram(fmtSell(settings.symbol, rsi, price, entry, pnl, changePct, false, exitLabel));
       await logTick(userId, settings.symbol, rsi, price, "sell", `PAPER ${exitLabel}`);
     } else {
@@ -317,30 +347,32 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
     console.log(`[signal] ${userId} BUY — decision=${decision.state} score=${decision.score} reasons=${decision.reasons.join("; ")} @ $${currentPrice.toFixed(2)}`);
     try {
       if (!settings.live_trading) {
-        const size = settings.buy_amount_usd / currentPrice;
+        const orderUsd = await resolveOrderSize(settings, state.credentials, currentPrice);
+        const size = orderUsd / currentPrice;
         const id = await insertTrade({
           user_id: userId, symbol: settings.symbol,
-          entry_price: currentPrice, size, quote_size: settings.buy_amount_usd,
+          entry_price: currentPrice, size, quote_size: orderUsd,
           entry_fees_usd: 0, rsi_at_entry: lastRsi,
-          notes: `[PAPER] RSI ${lastRsi.toFixed(1)} < ${settings.rsi_buy_threshold}`,
+          notes: `[PAPER] RSI ${lastRsi.toFixed(1)} < ${settings.rsi_buy_threshold}${settings.compound_mode ? ` [compound $${orderUsd.toFixed(2)}]` : ""}`,
         });
-        state.openTrade = { id, entry_price: currentPrice, size, quote_size: settings.buy_amount_usd, entry_fees_usd: 0, trailing_high: null, rsi_at_entry: lastRsi };
-        await sendTelegram(fmtBuy(settings.symbol, lastRsi, currentPrice, size, settings.buy_amount_usd, false));
+        state.openTrade = { id, entry_price: currentPrice, size, quote_size: orderUsd, entry_fees_usd: 0, trailing_high: null, rsi_at_entry: lastRsi };
+        await sendTelegram(fmtBuy(settings.symbol, lastRsi, currentPrice, size, orderUsd, false));
         await logTick(userId, settings.symbol, lastRsi, currentPrice, "buy", `PAPER BUY — RSI ${lastRsi.toFixed(1)}`);
       } else {
         if (!state.credentials) throw new Error("live mode but no credentials");
         // ── Idempotency: write pending row BEFORE placing order ──
         // If the worker crashes after fill but before DB write, this row
         // survives and is flagged on next startup for manual reconciliation.
+        const orderUsd = await resolveOrderSize(settings, state.credentials, currentPrice);
         const clientOrderId = crypto.randomUUID();
         const pendingId = await insertPendingTrade({
           user_id: userId, symbol: settings.symbol,
-          quote_size: settings.buy_amount_usd,
+          quote_size: orderUsd,
           rsi_at_entry: lastRsi, client_order_id: clientOrderId,
         });
         let fill;
         try {
-          fill = await placeMarketBuy(state.credentials, settings.symbol, settings.buy_amount_usd.toFixed(2), clientOrderId);
+          fill = await placeMarketBuy(state.credentials, settings.symbol, orderUsd.toFixed(2), clientOrderId);
         } catch (e) {
           // Order failed — clean up the pending row so it doesn't linger
           await deleteTrade(pendingId).catch(console.error);
@@ -375,6 +407,12 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
           effective_pnl: pnl, close_reason: "rsi_signal",
           notes: `[PAPER] RSI ${lastRsi.toFixed(1)} > ${settings.rsi_sell_threshold} @ $${currentPrice.toFixed(2)} — P&L $${pnl.toFixed(2)}`,
         });
+        if (settings.compound_mode) {
+          const newBalance = settings.paper_balance_usd + pnl;
+          await updatePaperBalance(userId, newBalance);
+          settings.paper_balance_usd = Math.max(0, newBalance);
+          console.log(`[compound] balance updated: $${newBalance.toFixed(2)} (${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)})`);
+        }
         await sendTelegram(fmtSell(settings.symbol, lastRsi, currentPrice, entry, (currentPrice - entry) * openTrade.size, pnlPct, false));
         await logTick(userId, settings.symbol, lastRsi, currentPrice, "sell", `PAPER SELL — P&L $${((currentPrice - entry) * openTrade.size).toFixed(2)}`);
       } else {

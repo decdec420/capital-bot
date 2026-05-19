@@ -77,6 +77,9 @@ interface BotSettings {
   stop_loss_pct: number;
   take_profit_pct: number;
   trailing_stop_pct?: number;
+  compound_mode?: boolean;
+  paper_balance_usd?: number;
+  paper_starting_balance_usd?: number;
 }
 
 interface Candle {
@@ -1104,6 +1107,56 @@ export default function Dashboard() {
       </header>
 
       <main style={{ padding: "20px 24px", maxWidth: 1480, margin: "0 auto", width: "100%" }}>
+
+        {/* ── Compound balance banner — shown only when compound mode is on ── */}
+        {settings?.compound_mode && (
+          (() => {
+            const balance  = settings.paper_balance_usd ?? 0;
+            const seed     = settings.paper_starting_balance_usd ?? balance;
+            const growth   = seed > 0 ? ((balance - seed) / seed) * 100 : 0;
+            const deployPct = balance < 100 ? 90 : balance < 500 ? 80 : balance < 1000 ? 70 : 50;
+            const nextOrder = balance * (deployPct / 100);
+            // Simple projection: use avg trade P&L / avg order size as rate
+            const avgRate   = (closedTrades.length && totalInvested > 0)
+              ? totalPnl / totalInvested  // avg return per $ deployed
+              : 0.02;                      // default 2% assumption
+            const tradesTo100 = balance < 100 && avgRate > 0
+              ? Math.ceil(Math.log(100 / balance) / Math.log(1 + avgRate * deployPct / 100))
+              : null;
+            return (
+              <div className="rounded-xl border border-border bg-card p-4 mb-3" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 16 }}>
+                <div>
+                  <div className="kicker" style={{ fontSize: 9.5 }}>COMPOUND BALANCE</div>
+                  <div className="mono" style={{ fontSize: 22, fontWeight: 600, color: balance >= seed ? "var(--green)" : "var(--red)" }}>
+                    ${balance.toFixed(2)}
+                  </div>
+                  <div className="mono dim" style={{ fontSize: 10 }}>started at ${seed.toFixed(2)}</div>
+                </div>
+                <div>
+                  <div className="kicker" style={{ fontSize: 9.5 }}>GROWTH</div>
+                  <div className="mono" style={{ fontSize: 22, fontWeight: 600, color: growth >= 0 ? "var(--green)" : "var(--red)" }}>
+                    {growth >= 0 ? "+" : ""}{growth.toFixed(1)}%
+                  </div>
+                  <div className="mono dim" style={{ fontSize: 10 }}>vs seed capital</div>
+                </div>
+                <div>
+                  <div className="kicker" style={{ fontSize: 9.5 }}>NEXT ORDER SIZE</div>
+                  <div className="mono" style={{ fontSize: 22, fontWeight: 600 }}>${nextOrder.toFixed(2)}</div>
+                  <div className="mono dim" style={{ fontSize: 10 }}>{deployPct}% of balance (tier)</div>
+                </div>
+                <div>
+                  <div className="kicker" style={{ fontSize: 9.5 }}>PROJECTION</div>
+                  <div className="mono" style={{ fontSize: 22, fontWeight: 600 }}>
+                    {tradesTo100 != null ? `~${tradesTo100} trades` : "—"}
+                  </div>
+                  <div className="mono dim" style={{ fontSize: 10 }}>
+                    {tradesTo100 != null ? "to reach $100" : "growing…"}
+                  </div>
+                </div>
+              </div>
+            );
+          })()
+        )}
 
         {/* ── Hero row: P&L + Live BTC + RSI gauge ── */}
         <div style={{ display: "grid", gridTemplateColumns: "1.5fr 1fr 220px", gap: 12, marginBottom: 12 }}>

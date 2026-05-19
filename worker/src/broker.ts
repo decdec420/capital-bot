@@ -130,3 +130,20 @@ export async function fetchBestBidAsk(productId: string): Promise<BestBidAsk> {
   const mid = (bid + ask) / 2;
   return { bid, ask, mid, spreadPct: ((ask - bid) / mid) * 100 };
 }
+
+/**
+ * Fetch available USD balance from Coinbase — used for live compound mode.
+ * Finds the USD (or USDC) account and returns its available_balance.
+ */
+export async function fetchUSDBalance(creds: Credentials): Promise<number> {
+  const jwt = await signJwt(creds.apiKeyName, creds.privateKey, "GET api.coinbase.com/api/v3/brokerage/accounts");
+  const r = await fetch(`${CB}/api/v3/brokerage/accounts?limit=50`, {
+    headers: { Authorization: `Bearer ${jwt}` },
+  });
+  if (!r.ok) throw new Error(`[broker] accounts ${r.status}: ${await r.text()}`);
+  const body = await r.json();
+  const accounts: Array<{ currency: string; available_balance: { value: string } }> = body.accounts ?? [];
+  const usd = accounts.find((a) => a.currency === "USD") ?? accounts.find((a) => a.currency === "USDC");
+  if (!usd) throw new Error("[broker] No USD or USDC account found");
+  return Number(usd.available_balance.value);
+}

@@ -44,6 +44,7 @@ export type Database = {
       settings: {
         Row: {
           buy_amount_usd: number
+          compound_mode: boolean
           created_at: string
           daily_loss_limit_usd: number
           enabled: boolean
@@ -53,6 +54,8 @@ export type Database = {
           max_drawdown_pct: number
           max_spread_pct: number
           max_volatility_pct: number
+          paper_balance_usd: number
+          paper_starting_balance_usd: number
           rsi_buy_threshold: number
           rsi_sell_threshold: number
           stop_loss_pct: number
@@ -64,6 +67,7 @@ export type Database = {
         }
         Insert: {
           buy_amount_usd?: number
+          compound_mode?: boolean
           created_at?: string
           daily_loss_limit_usd?: number
           enabled?: boolean
@@ -73,6 +77,8 @@ export type Database = {
           max_drawdown_pct?: number
           max_spread_pct?: number
           max_volatility_pct?: number
+          paper_balance_usd?: number
+          paper_starting_balance_usd?: number
           rsi_buy_threshold?: number
           rsi_sell_threshold?: number
           stop_loss_pct?: number
@@ -84,6 +90,7 @@ export type Database = {
         }
         Update: {
           buy_amount_usd?: number
+          compound_mode?: boolean
           created_at?: string
           daily_loss_limit_usd?: number
           enabled?: boolean
@@ -93,6 +100,8 @@ export type Database = {
           max_drawdown_pct?: number
           max_spread_pct?: number
           max_volatility_pct?: number
+          paper_balance_usd?: number
+          paper_starting_balance_usd?: number
           rsi_buy_threshold?: number
           rsi_sell_threshold?: number
           stop_loss_pct?: number
