@@ -7,7 +7,7 @@
 const WS_URL = "wss://advanced-trade-ws.coinbase.com/";
 
 export interface TradeHandler {
-  (symbol: string, price: number, size: number): void;
+  (symbol: string, price: number, size: number, tickMs: number): void;
 }
 
 export class CoinbaseWs {
@@ -63,10 +63,11 @@ export class CoinbaseWs {
         if (msg.channel !== "market_trades") return;
         for (const ev of msg.events ?? []) {
           for (const trade of ev.trades ?? []) {
-            const price = Number(trade.price);
-            const size  = Number(trade.size);
+            const price  = Number(trade.price);
+            const size   = Number(trade.size);
+            const tickMs = trade.time ? new Date(trade.time as string).getTime() : Date.now();
             if (price > 0 && size > 0) {
-              this.onTrade(trade.product_id, price, size);
+              this.onTrade(trade.product_id, price, size, Number.isFinite(tickMs) ? tickMs : Date.now());
             }
           }
         }

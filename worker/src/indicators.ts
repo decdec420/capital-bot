@@ -19,9 +19,11 @@ export interface Candle {
 export class CandleBuilder {
   private candle: Candle | null = null;
 
-  addTick(price: number, size: number): Candle | null {
-    const now = Math.floor(Date.now() / 1000);
-    const candleStart = Math.floor(now / CANDLE_SECONDS) * CANDLE_SECONDS;
+  addTick(price: number, size: number, tickMs?: number): Candle | null {
+    // Use the tick's own timestamp when provided — guards against out-of-order
+    // ticks from Coinbase bursting late messages into the wrong candle bucket.
+    const nowSec = Math.floor((tickMs ?? Date.now()) / 1000);
+    const candleStart = Math.floor(nowSec / CANDLE_SECONDS) * CANDLE_SECONDS;
 
     // First tick ever
     if (!this.candle) {

@@ -340,7 +340,12 @@ function closestCandleIndex(candles: Candle[], tsMs: number): number {
 // Sparkline component
 // ─────────────────────────────────────────────────────────────────────────────
 
+// gradientIdCounter ensures each Sparkline instance gets a unique SVG gradient ID.
+// Sharing a single "sparkG" ID causes all sparklines to inherit the first gradient's
+// color — the later green/red ones render wrong if they mount after a red/green one.
+let _sparklineIdCounter = 0;
 function Sparkline({ data, width = 110, height = 34 }: { data: number[]; width?: number; height?: number }) {
+  const gradId = useMemo(() => `sparkG-${++_sparklineIdCounter}`, []);
   if (!data || data.length < 2) return <div style={{ width, height }} />;
   const min = Math.min(...data), max = Math.max(...data);
   const pad = (max - min) * 0.15 || 1;
@@ -354,12 +359,12 @@ function Sparkline({ data, width = 110, height = 34 }: { data: number[]; width?:
   return (
     <svg width={width} height={height} style={{ display: "block" }}>
       <defs>
-        <linearGradient id="sparkG" x1="0" y1="0" x2="0" y2="1">
+        <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor={col} stopOpacity="0.25" />
           <stop offset="100%" stopColor={col} stopOpacity="0" />
         </linearGradient>
       </defs>
-      <polygon points={`0,${height} ${pts} ${width},${height}`} fill="url(#sparkG)" />
+      <polygon points={`0,${height} ${pts} ${width},${height}`} fill={`url(#${gradId})`} />
       <polyline points={pts} fill="none" stroke={col} strokeWidth="1.25" />
       <circle cx={xAt(n - 1)} cy={yAt(data[n - 1])} r="2" fill={col} />
     </svg>

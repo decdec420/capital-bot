@@ -200,14 +200,17 @@ function calcVolatilityPct(candle: Candle): number {
 }
 
 function maxClosedTradeDrawdownPct(rows: Awaited<ReturnType<typeof loadClosedTradeRiskRows>>): number {
-  let cumReturnPct = 0, peakReturnPct = 0, maxDrawdownPct = 0;
+  // Use multiplicative equity curve (1 + r1) * (1 + r2) * … so compounding losses
+  // are measured correctly. Additive % overstates recovery and understates drawdown.
+  let equity = 1.0, peakEquity = 1.0, maxDrawdownPct = 0;
   for (const row of rows) {
-    const tradeReturnPct = row.quote_size > 0
-      ? (row.effective_pnl / row.quote_size) * 100
-      : row.pnl_pct;
-    cumReturnPct += Number.isFinite(tradeReturnPct) ? tradeReturnPct : 0;
-    peakReturnPct = Math.max(peakReturnPct, cumReturnPct);
-    maxDrawdownPct = Math.max(maxDrawdownPct, peakReturnPct - cumReturnPct);
+    const tradePct = row.quote_size > 0
+      ? row.effective_pnl / row.quote_size   // fractional return, e.g. 0.02 = +2%
+      : (row.pnl_pct ?? 0) / 100;
+    if (!Number.isFinite(tradePct)) continue;
+    equity *= (1 + tradePct);
+    peakEquity = Math.max(peakEquity, equity);
+    maxDrawdownPct = Math.max(maxDrawdownPct, ((peakEquity - equity) / peakEquity) * 100);
   }
   return maxDrawdownPct;
 }
@@ -587,26 +590,26 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
 
 // ── WebSocket trade handler ────────────────────────────────
 
-async function onTrade(symbol: string, price: number, size: number): Promise<void> {
+async function onTrade(symbol: string, price: number, size: number, tickMs: number): Promise<void> {
   // Drop this tick if a previous tick for the same symbol is still being processed.
   // Without this, rapid ticks can race through userInFlight checks simultaneously
   // and both place a buy order before either resolves (double-buy on live money).
   if (symbolProcessing.has(symbol)) return;
   symbolProcessing.add(symbol);
   try {
-    await _onTradeInner(symbol, price, size);
+    await _onTradeInner(symbol, price, size, tickMs);
   } finally {
     symbolProcessing.delete(symbol);
   }
 }
 
-async function _onTradeInner(symbol: string, price: number, size: number): Promise<void> {
+async function _onTradeInner(symbol: string, price: number, size: number, tickMs: number): Promise<void> {
   const symState = symbolStates.get(symbol);
   if (!symState) return;
 
   symState.currentPrice = price;
   symState.lastTickMs = Date.now();
-  const closedCandle = symState.builder.addTick(price, size);
+  const closedCandle = symState.builder.addTick(price, size, tickMs);
 
   // Every tick: check risk exits for all users on this symbol
   for (const [userId, userState] of userStates) {
@@ -763,7 +766,7 @@ async function main() {
   // Start WebSocket — alert on reconnection so we know if it was unstable
   const ws = new CoinbaseWs(
     [...symbols],
-    (symbol, price, size) => { onTrade(symbol, price, size).catch(console.error); },
+    (symbol, price, size, tickMs) => { onTrade(symbol, price, size, tickMs).catch(console.error); },
     () => {
       console.warn("[ws] reconnected after disconnect");
       sendTelegram("⚠️ capital-bot: WebSocket reconnected after a disconnect. Bot is back online.").catch(console.error);
@@ -772,7 +775,9 @@ async function main() {
   ws.start();
 
   const STALE_TICK_MS = 10 * 60 * 1000; // alert if no tick for 10 minutes
-  let lastStalertMs = 0; // rate-limit stale alerts to once per 30 min
+  // Per-symbol rate-limit: track last stale alert time independently so a silent
+  // BTC doesn't suppress the ETH alert for 30 minutes (and vice-versa).
+  const lastStalertMs = new Map<string, number>();
 
   // Reload settings + dead-man's switch check
   setInterval(async () => {
@@ -782,14 +787,15 @@ async function main() {
     const now = Date.now();
     for (const [symbol, s] of symbolStates) {
       const silentMs = now - s.lastTickMs;
-      if (silentMs > STALE_TICK_MS && now - lastStalertMs > 30 * 60 * 1000) {
+      const lastAlert = lastStalertMs.get(symbol) ?? 0;
+      if (silentMs > STALE_TICK_MS && now - lastAlert > 30 * 60 * 1000) {
         const mins = Math.floor(silentMs / 60_000);
         console.warn(`[watchdog] ${symbol} — no ticks for ${mins} min`);
         await sendTelegram(
           `⚠️ capital-bot watchdog: no ticks for ${symbol} in ${mins} minutes.\n` +
           `WebSocket may be disconnected. Check: fly logs --app capital-bot-worker-black-moonrise-2383`
         ).catch(console.error);
-        lastStalertMs = now;
+        lastStalertMs.set(symbol, now);
       }
     }
 

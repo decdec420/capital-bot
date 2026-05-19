@@ -8,7 +8,12 @@ function stripPem(pem: string): string {
     .replace(/[^A-Za-z0-9+/=]/g, "");
 }
 function b64ToBytes(b64: string): Uint8Array {
-  const clean = b64.length % 4 === 1 ? b64.slice(1) : b64;
+  // Strip any existing padding first so length checks are against raw chars.
+  const unpadded = b64.replace(/=/g, "");
+  // length % 4 === 1 is invalid base64 (can't represent whole bytes).
+  // The stray char is at the END (a corrupt trailing byte), not the start —
+  // slice(1) was wrong; drop the last character instead.
+  const clean = unpadded.length % 4 === 1 ? unpadded.slice(0, -1) : unpadded;
   const padded = clean + "=".repeat((4 - (clean.length % 4)) % 4);
   return Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
 }
