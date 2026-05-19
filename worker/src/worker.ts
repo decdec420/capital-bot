@@ -86,6 +86,11 @@ const userStates   = new Map<string, UserState>();
 // insertTrade() resolves and state.openTrade is updated.
 const userInFlight = new Set<string>();
 
+// Per-symbol outer lock: prevents two onTrade() calls from running concurrently
+// for the same symbol. Without this, rapid ticks can both pass userInFlight checks
+// before either resolves, creating a double-buy race on live money.
+const symbolProcessing = new Set<string>();
+
 // ── Boot: warmup RSI from historical candles ───────────────
 
 async function warmupSymbol(symbol: string, creds: Credentials): Promise<void> {
@@ -152,6 +157,22 @@ async function reloadSettings(): Promise<void> {
         // Update settings, preserve openTrade and credentials
         const wasLive = existing.settings.live_trading;
         existing.settings = s;
+
+        // Fix #13: sync openTrade from DB so external closes (dashboard "Close now")
+        // are reflected in the worker without a restart. Without this the worker
+        // thinks a position is open indefinitely and skips all buy evaluation.
+        if (existing.openTrade) {
+          try {
+            const dbTrade = await loadOpenTrade(s.user_id);
+            if (!dbTrade) {
+              console.log(`[settings] ${s.user_id} — open trade closed externally, clearing worker state`);
+              existing.openTrade = null;
+            }
+          } catch (e) {
+            console.warn(`[settings] trade sync failed for ${s.user_id}:`, e instanceof Error ? e.message : String(e));
+          }
+        }
+
         if (s.live_trading && !wasLive) {
           // Just switched to live — load credentials
           try {
@@ -320,6 +341,20 @@ async function checkRiskExits(userId: string, state: UserState, price: number, r
     state.openTrade = null;
   } catch (e) {
     console.error(`[risk] exit failed for ${userId}:`, e instanceof Error ? e.message : String(e));
+    // Fix #14: if a live sell timed out, Coinbase may have already filled the order.
+    // Clear the in-memory openTrade to stop the worker retrying on every tick
+    // (which would fail as a duplicate clientOrderId). Log an error so it's visible.
+    // Manual reconciliation: check Coinbase orders and update the DB trade if needed.
+    if (settings.live_trading) {
+      console.warn(`[risk] clearing openTrade for ${userId} after failed live exit — verify position on Coinbase`);
+      state.openTrade = null;
+      await logTick(userId, settings.symbol, rsi, price, "error",
+        `LIVE SELL FAILED — position cleared from worker memory. Check Coinbase manually. Error: ${e instanceof Error ? e.message : String(e)}`
+      ).catch(console.error);
+      await sendTelegram(
+        `⚠️ capital-bot: live sell FAILED for ${settings.symbol}.\nError: ${e instanceof Error ? e.message : String(e)}\nPosition cleared from worker — CHECK COINBASE IMMEDIATELY.`
+      ).catch(console.error);
+    }
   }
   return true;
 }
@@ -553,6 +588,19 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
 // ── WebSocket trade handler ────────────────────────────────
 
 async function onTrade(symbol: string, price: number, size: number): Promise<void> {
+  // Drop this tick if a previous tick for the same symbol is still being processed.
+  // Without this, rapid ticks can race through userInFlight checks simultaneously
+  // and both place a buy order before either resolves (double-buy on live money).
+  if (symbolProcessing.has(symbol)) return;
+  symbolProcessing.add(symbol);
+  try {
+    await _onTradeInner(symbol, price, size);
+  } finally {
+    symbolProcessing.delete(symbol);
+  }
+}
+
+async function _onTradeInner(symbol: string, price: number, size: number): Promise<void> {
   const symState = symbolStates.get(symbol);
   if (!symState) return;
 

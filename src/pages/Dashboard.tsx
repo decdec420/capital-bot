@@ -43,7 +43,7 @@ interface Trade {
   notes?: string;
 }
 
-type DecisionState = "WATCHING" | "SETUP FORMING" | "ENTRY CANDIDATE" | "RISK BLOCKED";
+type DecisionState = "WATCHING" | "SETUP FORMING" | "ENTRY CANDIDATE" | "TRADE ALLOWED" | "IN POSITION" | "RISK BLOCKED";
 
 interface TickLog {
   id: string;
@@ -140,13 +140,17 @@ function normalizeDecisionState(value?: string | null): DecisionState | null {
   if (normalized === "WATCHING") return "WATCHING";
   if (normalized === "SETUP FORMING") return "SETUP FORMING";
   if (normalized === "ENTRY CANDIDATE") return "ENTRY CANDIDATE";
+  if (normalized === "TRADE ALLOWED") return "TRADE ALLOWED";
+  if (normalized === "IN POSITION") return "IN POSITION";
   if (normalized === "RISK BLOCKED") return "RISK BLOCKED";
   return null;
 }
 
 function decisionPillClass(state: DecisionState): string {
   switch (state) {
+    case "TRADE ALLOWED":   return "pill-green";
     case "ENTRY CANDIDATE": return "pill-green";
+    case "IN POSITION":     return "pill-green";
     case "SETUP FORMING":   return "pill-amber";
     case "RISK BLOCKED":    return "pill-red";
     case "WATCHING":

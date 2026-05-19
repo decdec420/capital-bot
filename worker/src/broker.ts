@@ -45,9 +45,15 @@ async function waitForFill(creds: Credentials, orderId: string, timeoutMs = 8_00
     const order = body.order ?? body;
     if (order.status === "CANCELLED") throw new Error(`[broker] order ${orderId} cancelled`);
     if (order.status === "FILLED") {
+      const fillPrice = Number(order.average_filled_price ?? 0);
+      if (!fillPrice || fillPrice <= 0) {
+        // Coinbase omitted fill price — throw rather than record 0 which would
+        // cause (price - 0) / 0 = Infinity and trigger an immediate fake take-profit.
+        throw new Error(`[broker] order ${orderId} FILLED but average_filled_price missing or zero`);
+      }
       return {
         orderId: order.order_id,
-        fillPrice: Number(order.average_filled_price ?? 0),
+        fillPrice,
         filledBaseSize: Number(order.filled_size ?? 0),
         filledQuoteSize: Number(order.total_value_after_fees ?? order.filled_value ?? 0),
         feesUsd: Number(order.total_fees ?? 0),
@@ -137,14 +143,18 @@ export async function fetchBestBidAsk(productId: string): Promise<BestBidAsk> {
  * Finds the USD (or USDC) account and returns its available_balance.
  */
 export async function fetchUSDBalance(creds: Credentials): Promise<number> {
-  const jwt = await signJwt(creds.apiKeyName, creds.privateKey, "GET api.coinbase.com/api/v3/brokerage/accounts");
-  const r = await fetch(`${CB}/api/v3/brokerage/accounts?limit=50`, {
-    headers: { Authorization: `Bearer ${jwt}` },
-  });
-  if (!r.ok) throw new Error(`[broker] accounts ${r.status}: ${await r.text()}`);
-  const body = await r.json();
-  const accounts: Array<{ currency: string; available_balance: { value: string } }> = body.accounts ?? [];
-  const usd = accounts.find((a) => a.currency === "USD") ?? accounts.find((a) => a.currency === "USDC");
-  if (!usd) throw new Error("[broker] No USD or USDC account found");
-  return Number(usd.available_balance.value);
+  // Paginate through all accounts — users with many assets may have USD beyond page 1
+  let cursor: string | undefined;
+  do {
+    const url = `${CB}/api/v3/brokerage/accounts?limit=50${cursor ? `&cursor=${cursor}` : ""}`;
+    const jwt = await signJwt(creds.apiKeyName, creds.privateKey, "GET api.coinbase.com/api/v3/brokerage/accounts");
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${jwt}` } });
+    if (!r.ok) throw new Error(`[broker] accounts ${r.status}: ${await r.text()}`);
+    const body = await r.json();
+    const accounts: Array<{ currency: string; available_balance: { value: string } }> = body.accounts ?? [];
+    const usd = accounts.find((a) => a.currency === "USD") ?? accounts.find((a) => a.currency === "USDC");
+    if (usd) return Number(usd.available_balance.value);
+    cursor = body.has_next ? body.cursor : undefined;
+  } while (cursor);
+  throw new Error("[broker] No USD or USDC account found across all Coinbase accounts");
 }
