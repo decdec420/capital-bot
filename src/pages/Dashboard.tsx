@@ -469,7 +469,6 @@ function PriceChart({
     );
   }
 
-  // Use full OHLC range so wicks aren't clipped at top/bottom
   const minP = Math.min(...candles.map((c) => c.low));
   const maxP = Math.max(...candles.map((c) => c.high));
   const padP = (maxP - minP) * 0.06 || 1;
@@ -479,7 +478,6 @@ function PriceChart({
   const yAt = (p: number) => priceH - ((p - lo) / (hi - lo)) * priceH;
   const yRSI = (r: number) => rsiH - (r / 100) * rsiH;
 
-  // Candle bar dimensions — each candle gets 70% of its allocated slot
   const candleSlot = W / Math.max(n, 1);
   const candleW    = Math.max(1, candleSlot * 0.7);
   const candleHalfW = candleW / 2;
@@ -491,173 +489,263 @@ function PriceChart({
   const lastClose = spot ?? candles[n - 1]?.close ?? 0;
   const lastY = yAt(lastClose);
 
-  // Mouse → SVG coordinate conversion (handles preserveAspectRatio="none" scaling)
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
     const svg = svgRef.current;
     if (!svg) return;
     const rect = svg.getBoundingClientRect();
     const relX = (e.clientX - rect.left) / rect.width;
-    const idx = Math.round(relX * (n - 1));
-    setHoverIdx(Math.max(0, Math.min(n - 1, idx)));
+    setHoverIdx(Math.max(0, Math.min(n - 1, Math.round(relX * (n - 1)))));
   };
 
-  // Tooltip data for hovered candle
-  const hc = hoverIdx != null ? candles[hoverIdx] : null;
-  const hRsi = hoverIdx != null ? rsiSeries[hoverIdx] : null;
-  const hX = hoverIdx != null ? xAt(hoverIdx) : null;
-  const hY = hc ? yAt(hc.close) : null;
-  // Tooltip box: flip to left side when near right edge
-  const tipW = 148, tipH = 82;
-  const tipX = hX != null ? (hX > W * 0.65 ? hX - tipW - 12 : hX + 12) : 0;
-  const tipY = 8;
+  // Hover state
+  const hc        = hoverIdx != null ? candles[hoverIdx] : null;
+  const hRsi      = hoverIdx != null ? rsiSeries[hoverIdx] : null;
+  const hX        = hoverIdx != null ? xAt(hoverIdx) : null;
+  const hY        = hc ? yAt(hc.close) : null;
+  const isUp      = hc ? hc.close >= hc.open : false;
+  const prevClose = hoverIdx != null && hoverIdx > 0 ? candles[hoverIdx - 1].close : null;
+  const chgPct    = prevClose != null && hc ? ((hc.close - prevClose) / prevClose) * 100 : null;
+  const hoverFrac = hoverIdx != null && n > 1 ? hoverIdx / (n - 1) : null;
 
-  const fmtTime = (ms: number) => {
-    const d = new Date(ms);
-    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  };
-  const fmtDate = (ms: number) => {
-    const d = new Date(ms);
-    return d.toLocaleDateString([], { month: "short", day: "numeric" });
-  };
+  // HTML tooltip sizing and position
+  const tipW      = 166;
+  const tipH      = hRsi != null ? 148 : 122;
+  const flipTip   = hoverFrac != null && hoverFrac > 0.58;
+  const tipPixelY = hY != null ? Math.max(8, Math.min(priceH - tipH - 8, hY - tipH / 2)) : 8;
+
+  const accentCol = isUp ? "var(--green)" : "var(--red)";
+  const accentBg  = isUp ? "rgba(74,222,128,0.12)" : "rgba(248,113,113,0.12)";
+
+  const fmtTime = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const fmtDate = (ms: number) => new Date(ms).toLocaleDateString([], { month: "short", day: "numeric" });
 
   return (
-    <svg ref={svgRef} viewBox={`0 0 ${W} ${height}`} preserveAspectRatio="none"
-      style={{ width: "100%", height, display: "block", overflow: "visible", cursor: hoverIdx != null ? "crosshair" : "default" }}
-      onMouseMove={handleMouseMove}
-      onMouseLeave={() => setHoverIdx(null)}>
-      {/* Price grid */}
-      {[0.25, 0.5, 0.75].map((f) => (
-        <line key={f} x1={0} x2={W} y1={priceH * f} y2={priceH * f}
-          stroke="var(--grid-line)" strokeWidth="1" strokeDasharray="2 4" />
-      ))}
-      {/* Candlestick bars — green = close ≥ open, red = close < open */}
-      {candles.map((c, i) => {
-        const x = xAt(i);
-        const isUp = c.close >= c.open;
-        const col = isUp ? "var(--green)" : "var(--red)";
-        const bodyTop    = yAt(Math.max(c.open, c.close));
-        const bodyBottom = yAt(Math.min(c.open, c.close));
-        const bodyH = Math.max(1, bodyBottom - bodyTop);
-        return (
-          <g key={i}>
-            {/* Wick */}
-            <line x1={x} y1={yAt(c.high)} x2={x} y2={yAt(c.low)}
-              stroke={col} strokeWidth="0.7" opacity="0.55" vectorEffect="non-scaling-stroke" />
-            {/* Body */}
-            <rect x={x - candleHalfW} y={bodyTop} width={candleW} height={bodyH}
-              fill={col} opacity="0.8" />
+    <div style={{ position: "relative" }}>
+      <svg ref={svgRef} viewBox={`0 0 ${W} ${height}`} preserveAspectRatio="none"
+        style={{ width: "100%", height, display: "block", overflow: "visible", cursor: hoverIdx != null ? "crosshair" : "default" }}
+        onMouseMove={handleMouseMove}
+        onMouseLeave={() => setHoverIdx(null)}>
+
+        <defs>
+          <filter id="hoverGlow" x="-150%" y="-150%" width="400%" height="400%">
+            <feGaussianBlur in="SourceGraphic" stdDeviation="6" result="blur" />
+            <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+          </filter>
+        </defs>
+
+        {/* Price grid */}
+        {[0.25, 0.5, 0.75].map((f) => (
+          <line key={f} x1={0} x2={W} y1={priceH * f} y2={priceH * f}
+            stroke="var(--grid-line)" strokeWidth="1" strokeDasharray="2 4" />
+        ))}
+
+        {/* Hover column highlight — subtle band behind the active candle */}
+        {hoverIdx != null && hX != null && (
+          <rect x={hX - candleHalfW - 4} y={0} width={candleW + 8} height={priceH}
+            fill="white" opacity="0.03" style={{ pointerEvents: "none" }} />
+        )}
+
+        {/* Candlestick bars */}
+        {candles.map((c, i) => {
+          const x = xAt(i);
+          const up  = c.close >= c.open;
+          const col = up ? "var(--green)" : "var(--red)";
+          const bodyTop    = yAt(Math.max(c.open, c.close));
+          const bodyBottom = yAt(Math.min(c.open, c.close));
+          const bodyH = Math.max(1, bodyBottom - bodyTop);
+          const dimmed = hoverIdx != null && i !== hoverIdx;
+          return (
+            <g key={i} opacity={dimmed ? 0.45 : 1}>
+              <line x1={x} y1={yAt(c.high)} x2={x} y2={yAt(c.low)}
+                stroke={col} strokeWidth="0.7" opacity="0.55" vectorEffect="non-scaling-stroke" />
+              <rect x={x - candleHalfW} y={bodyTop} width={candleW} height={bodyH}
+                fill={col} opacity="0.85" />
+            </g>
+          );
+        })}
+
+        {/* Live price line + pulsing dot */}
+        <line x1={0} x2={W} y1={lastY} y2={lastY} stroke="var(--text-3)" strokeWidth="1"
+          strokeDasharray="3 5" vectorEffect="non-scaling-stroke" opacity="0.5" />
+        <circle cx={W} cy={lastY} r="3" fill="var(--text)" />
+        <circle cx={W} cy={lastY} r="6" fill="var(--text)" opacity="0.2">
+          <animate attributeName="r" from="3" to="10" dur="1.6s" repeatCount="indefinite" />
+          <animate attributeName="opacity" from="0.4" to="0" dur="1.6s" repeatCount="indefinite" />
+        </circle>
+
+        {/* Closed trade markers */}
+        {trades.map((t) => {
+          const ex = xAt(t.entry_i), ey = yAt(t.entry);
+          const xx = xAt(t.exit_i),  xy = yAt(t.exit);
+          const c = t.pnl >= 0 ? "var(--green)" : "var(--red)";
+          return (
+            <g key={t.id}>
+              <line x1={ex} y1={ey} x2={xx} y2={xy} stroke={c} strokeWidth="1"
+                strokeDasharray="2 3" opacity="0.45" vectorEffect="non-scaling-stroke" />
+              <circle cx={ex} cy={ey} r="5" fill="var(--bg)" stroke="var(--green)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
+              <path d={`M ${ex-2.5} ${ey+1} L ${ex} ${ey-2} L ${ex+2.5} ${ey+1} Z`} fill="var(--green)" />
+              <circle cx={xx} cy={xy} r="5" fill="var(--bg)" stroke="var(--red)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
+              <path d={`M ${xx-2.5} ${xy-1} L ${xx} ${xy+2} L ${xx+2.5} ${xy-1} Z`} fill="var(--red)" />
+            </g>
+          );
+        })}
+
+        {/* Open trade — pulsing amber dot */}
+        {openTrade && (
+          <g>
+            <circle cx={xAt(openTrade.entry_i)} cy={yAt(openTrade.entry)} r="6"
+              fill="var(--bg)" stroke="var(--amber)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
+            <circle cx={xAt(openTrade.entry_i)} cy={yAt(openTrade.entry)} r="6"
+              fill="var(--amber)" opacity="0.3">
+              <animate attributeName="r" from="6" to="14" dur="1.4s" repeatCount="indefinite" />
+              <animate attributeName="opacity" from="0.5" to="0" dur="1.4s" repeatCount="indefinite" />
+            </circle>
           </g>
-        );
-      })}
+        )}
 
-      {/* Live price dashed line + pulsing dot */}
-      <line x1={0} x2={W} y1={lastY} y2={lastY} stroke="var(--text-3)" strokeWidth="1"
-        strokeDasharray="3 5" vectorEffect="non-scaling-stroke" opacity="0.5" />
-      <circle cx={W} cy={lastY} r="3" fill="var(--text)" />
-      <circle cx={W} cy={lastY} r="6" fill="var(--text)" opacity="0.2">
-        <animate attributeName="r" from="3" to="10" dur="1.6s" repeatCount="indefinite" />
-        <animate attributeName="opacity" from="0.4" to="0" dur="1.6s" repeatCount="indefinite" />
-      </circle>
+        {/* Y-axis labels */}
+        <text x={W-4} y={12}       fontSize="9"   fill="var(--text-3)" textAnchor="end" className="mono">{maxP.toFixed(0)}</text>
+        <text x={W-4} y={priceH-4} fontSize="9"   fill="var(--text-3)" textAnchor="end" className="mono">{minP.toFixed(0)}</text>
+        <text x={W-4} y={lastY-4}  fontSize="9.5" fill="var(--text)"   textAnchor="end" className="mono" fontWeight="600">{Math.round(lastClose).toLocaleString()}</text>
 
-      {/* Closed trade markers */}
-      {trades.map((t) => {
-        const ex = xAt(t.entry_i), ey = yAt(t.entry);
-        const xx = xAt(t.exit_i),  xy = yAt(t.exit);
-        const c = t.pnl >= 0 ? "var(--green)" : "var(--red)";
-        return (
-          <g key={t.id}>
-            <line x1={ex} y1={ey} x2={xx} y2={xy} stroke={c} strokeWidth="1"
-              strokeDasharray="2 3" opacity="0.45" vectorEffect="non-scaling-stroke" />
-            <circle cx={ex} cy={ey} r="5" fill="var(--bg)" stroke="var(--green)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
-            <path d={`M ${ex-2.5} ${ey+1} L ${ex} ${ey-2} L ${ex+2.5} ${ey+1} Z`} fill="var(--green)" />
-            <circle cx={xx} cy={xy} r="5" fill="var(--bg)" stroke="var(--red)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
-            <path d={`M ${xx-2.5} ${xy-1} L ${xx} ${xy+2} L ${xx+2.5} ${xy-1} Z`} fill="var(--red)" />
-          </g>
-        );
-      })}
+        {/* ── Crosshair + axis pills ── */}
+        {hoverIdx != null && hX != null && hc != null && hY != null && (
+          <g style={{ pointerEvents: "none" }}>
+            {/* Vertical crosshair */}
+            <line x1={hX} y1={0} x2={hX} y2={height}
+              stroke="white" strokeWidth="0.6" opacity="0.18" vectorEffect="non-scaling-stroke" />
+            {/* Horizontal crosshair — price area only */}
+            <line x1={0} y1={hY} x2={W} y2={hY}
+              stroke="white" strokeWidth="0.6" opacity="0.18" vectorEffect="non-scaling-stroke" />
 
-      {/* Open trade — pulsing amber dot */}
-      {openTrade && (
-        <g>
-          <circle cx={xAt(openTrade.entry_i)} cy={yAt(openTrade.entry)} r="6"
-            fill="var(--bg)" stroke="var(--amber)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
-          <circle cx={xAt(openTrade.entry_i)} cy={yAt(openTrade.entry)} r="6"
-            fill="var(--amber)" opacity="0.3">
-            <animate attributeName="r" from="6" to="14" dur="1.4s" repeatCount="indefinite" />
-            <animate attributeName="opacity" from="0.5" to="0" dur="1.4s" repeatCount="indefinite" />
-          </circle>
-        </g>
-      )}
+            {/* Glow halo */}
+            <circle cx={hX} cy={hY} r="16" fill={accentCol} opacity="0.1"
+              filter="url(#hoverGlow)" vectorEffect="non-scaling-stroke" />
+            {/* Ring */}
+            <circle cx={hX} cy={hY} r="6" fill="var(--bg)" stroke={accentCol}
+              strokeWidth="1.8" vectorEffect="non-scaling-stroke" />
+            {/* Inner fill */}
+            <circle cx={hX} cy={hY} r="2.5" fill={accentCol} />
 
-      {/* Y-axis labels */}
-      <text x={W-4} y={12}         fontSize="9"   fill="var(--text-3)" textAnchor="end" className="mono">{maxP.toFixed(0)}</text>
-      <text x={W-4} y={priceH-4}   fontSize="9"   fill="var(--text-3)" textAnchor="end" className="mono">{minP.toFixed(0)}</text>
-      <text x={W-4} y={lastY-4}    fontSize="9.5" fill="var(--text)"   textAnchor="end" className="mono" fontWeight="600">{Math.round(lastClose).toLocaleString()}</text>
-
-      {/* ── Hover crosshair + tooltip ── */}
-      {hoverIdx != null && hX != null && hc != null && hY != null && (
-        <g style={{ pointerEvents: "none" }}>
-          {/* Vertical crosshair — full chart height */}
-          <line x1={hX} y1={0} x2={hX} y2={height}
-            stroke="var(--text-3)" strokeWidth="1" strokeDasharray="3 4"
-            vectorEffect="non-scaling-stroke" opacity="0.6" />
-          {/* Horizontal crosshair — price area only */}
-          <line x1={0} y1={hY} x2={W} y2={hY}
-            stroke="var(--text-3)" strokeWidth="1" strokeDasharray="3 4"
-            vectorEffect="non-scaling-stroke" opacity="0.35" />
-          {/* Dot on close */}
-          <circle cx={hX} cy={hY} r="4" fill="var(--text)" vectorEffect="non-scaling-stroke" />
-
-          {/* Tooltip card */}
-          <rect x={tipX} y={tipY} width={tipW} height={tipH} rx="4" ry="4"
-            fill="var(--bg-2)" stroke="var(--border)" strokeWidth="1"
-            vectorEffect="non-scaling-stroke" opacity="0.97" />
-          {/* Date + time */}
-          <text x={tipX + 8} y={tipY + 16} fontSize="9" fill="var(--text-3)" className="mono">
-            {fmtDate(hc.t)} · {fmtTime(hc.t)}
-          </text>
-          {/* Close price — large */}
-          <text x={tipX + 8} y={tipY + 34} fontSize="13" fill="var(--text)" className="mono" fontWeight="600">
-            ${hc.close.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-          </text>
-          {/* OHLC row */}
-          <text x={tipX + 8}  y={tipY + 50} fontSize="8.5" fill="var(--text-3)" className="mono">O {hc.open.toFixed(0)}</text>
-          <text x={tipX + 44} y={tipY + 50} fontSize="8.5" fill="var(--green)"  className="mono">H {hc.high.toFixed(0)}</text>
-          <text x={tipX + 84} y={tipY + 50} fontSize="8.5" fill="var(--red)"    className="mono">L {hc.low.toFixed(0)}</text>
-          {/* RSI */}
-          {hRsi != null && (
-            <text x={tipX + 8} y={tipY + 67} fontSize="8.5" fill="var(--blue)" className="mono">
-              RSI {hRsi.toFixed(1)}
+            {/* Right-edge price pill */}
+            <rect x={W + 4} y={hY - 12} width={78} height={24} rx="5"
+              fill={accentCol} vectorEffect="non-scaling-stroke" />
+            <text x={W + 10} y={hY + 5.5} fontSize="11.5" fill="#09090b" fontWeight="700" className="mono">
+              {Math.round(hc.close).toLocaleString()}
             </text>
-          )}
-          {/* Change vs prev candle */}
-          {hoverIdx > 0 && (() => {
-            const prev = candles[hoverIdx - 1];
-            const chg = ((hc.close - prev.close) / prev.close) * 100;
-            return (
-              <text x={tipX + tipW - 8} y={tipY + 67} fontSize="8.5"
-                fill={chg >= 0 ? "var(--green)" : "var(--red)"}
-                textAnchor="end" className="mono">
-                {chg >= 0 ? "+" : ""}{chg.toFixed(2)}%
-              </text>
-            );
-          })()}
-        </g>
-      )}
 
-      {/* RSI subplot */}
-      <g transform={`translate(0, ${priceH + 12})`}>
-        <rect x={0} y={yRSI(70)} width={W} height={yRSI(0) - yRSI(70)} fill="var(--red)"   opacity="0.04" />
-        <rect x={0} y={yRSI(30)} width={W} height={yRSI(0) - yRSI(30)} fill="var(--green)" opacity="0.04" />
-        <line x1={0} x2={W} y1={yRSI(70)} y2={yRSI(70)} stroke="var(--red)"   strokeWidth="1" strokeDasharray="2 4" opacity="0.4" />
-        <line x1={0} x2={W} y1={yRSI(30)} y2={yRSI(30)} stroke="var(--green)" strokeWidth="1" strokeDasharray="2 4" opacity="0.4" />
-        <line x1={0} x2={W} y1={yRSI(50)} y2={yRSI(50)} stroke="var(--grid-line)" strokeWidth="1" />
-        {rsiPts && <polyline points={rsiPts} fill="none" stroke="var(--blue)" strokeWidth="1.25" vectorEffect="non-scaling-stroke" />}
-        <text x={4}   y={yRSI(70)-2} fontSize="8.5" fill="var(--red)"   className="mono">70</text>
-        <text x={4}   y={yRSI(30)+8} fontSize="8.5" fill="var(--green)" className="mono">30</text>
-        <text x={W-4} y={12}         fontSize="8.5" fill="var(--text-3)" textAnchor="end" className="mono">RSI(14)</text>
-      </g>
-    </svg>
+            {/* Bottom time pill */}
+            <rect x={hX - 34} y={priceH + 3} width={68} height={19} rx="5"
+              fill="var(--bg-3)" stroke="var(--t-border)" strokeWidth="0.75"
+              opacity="0.96" vectorEffect="non-scaling-stroke" />
+            <text x={hX} y={priceH + 14.5} fontSize="9" fill="var(--text-2)"
+              textAnchor="middle" className="mono">
+              {fmtTime(hc.t)}
+            </text>
+          </g>
+        )}
+
+        {/* RSI subplot */}
+        <g transform={`translate(0, ${priceH + 12})`}>
+          <rect x={0} y={yRSI(70)} width={W} height={yRSI(0) - yRSI(70)} fill="var(--red)"   opacity="0.04" />
+          <rect x={0} y={yRSI(30)} width={W} height={yRSI(0) - yRSI(30)} fill="var(--green)" opacity="0.04" />
+          <line x1={0} x2={W} y1={yRSI(70)} y2={yRSI(70)} stroke="var(--red)"   strokeWidth="1" strokeDasharray="2 4" opacity="0.4" />
+          <line x1={0} x2={W} y1={yRSI(30)} y2={yRSI(30)} stroke="var(--green)" strokeWidth="1" strokeDasharray="2 4" opacity="0.4" />
+          <line x1={0} x2={W} y1={yRSI(50)} y2={yRSI(50)} stroke="var(--grid-line)" strokeWidth="1" />
+          {rsiPts && <polyline points={rsiPts} fill="none" stroke="var(--blue)" strokeWidth="1.25" vectorEffect="non-scaling-stroke" />}
+          <text x={4}   y={yRSI(70)-2} fontSize="8.5" fill="var(--red)"   className="mono">70</text>
+          <text x={4}   y={yRSI(30)+8} fontSize="8.5" fill="var(--green)" className="mono">30</text>
+          <text x={W-4} y={12}         fontSize="8.5" fill="var(--text-3)" textAnchor="end" className="mono">RSI(14)</text>
+        </g>
+      </svg>
+
+      {/* ── Glassmorphism tooltip card (HTML overlay — no SVG distortion) ── */}
+      {hoverIdx != null && hc != null && hoverFrac != null && (
+        <div style={{
+          position:             "absolute",
+          top:                  tipPixelY,
+          left:                 flipTip
+            ? `calc(${hoverFrac * 100}% - ${tipW + 18}px)`
+            : `calc(${hoverFrac * 100}% + 18px)`,
+          width:                tipW,
+          background:           "rgba(9,10,13,0.88)",
+          backdropFilter:       "blur(24px)",
+          WebkitBackdropFilter: "blur(24px)",
+          border:               "1px solid rgba(255,255,255,0.07)",
+          borderTop:            `2px solid ${accentCol}`,
+          borderRadius:         10,
+          padding:              "10px 13px 12px",
+          boxShadow:            "0 24px 64px rgba(0,0,0,0.75), 0 1px 0 rgba(255,255,255,0.04) inset",
+          pointerEvents:        "none",
+          zIndex:               20,
+        }}>
+          {/* Header row: date/time + candle direction badge */}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 7 }}>
+            <span style={{ fontSize: 9, color: "var(--text-3)", fontFamily: "monospace", letterSpacing: "0.04em" }}>
+              {fmtDate(hc.t)} · {fmtTime(hc.t)}
+            </span>
+            <span style={{ fontSize: 9, fontWeight: 700, fontFamily: "monospace",
+              color: accentCol, background: accentBg, padding: "1px 6px", borderRadius: 4 }}>
+              {isUp ? "▲ UP" : "▼ DN"}
+            </span>
+          </div>
+
+          {/* Close price — hero number */}
+          <div style={{ fontSize: 22, fontWeight: 700, color: "var(--text)",
+            letterSpacing: "-0.03em", lineHeight: 1, fontFamily: "monospace" }}>
+            ${hc.close.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+          </div>
+
+          {/* % change vs previous candle */}
+          {chgPct != null && (
+            <div style={{ fontSize: 10, fontFamily: "monospace", marginTop: 3, marginBottom: 8,
+              color: chgPct >= 0 ? "var(--green)" : "var(--red)" }}>
+              {chgPct >= 0 ? "+" : ""}{chgPct.toFixed(3)}%
+            </div>
+          )}
+
+          {/* Divider */}
+          <div style={{ height: 1, background: "rgba(255,255,255,0.06)", margin: "6px 0 8px" }} />
+
+          {/* OHLC 2×2 grid */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "5px 4px" }}>
+            {([
+              ["O", hc.open,  "var(--text-3)"],
+              ["H", hc.high,  "var(--green)"],
+              ["L", hc.low,   "var(--red)"],
+              ["C", hc.close, "var(--text)"],
+            ] as [string, number, string][]).map(([label, val, color]) => (
+              <div key={label} style={{ display: "flex", alignItems: "baseline", gap: 5 }}>
+                <span style={{ fontSize: 8, fontWeight: 700, fontFamily: "monospace", color: "var(--text-4)" }}>{label}</span>
+                <span style={{ fontSize: 10, fontWeight: 600, fontFamily: "monospace", color }}>
+                  {val.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          {/* RSI mini bar */}
+          {hRsi != null && (
+            <div style={{ marginTop: 10 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                <span style={{ fontSize: 8, color: "var(--text-3)", fontFamily: "monospace" }}>RSI(14)</span>
+                <span style={{ fontSize: 9, fontWeight: 700, fontFamily: "monospace",
+                  color: hRsi < 30 ? "var(--green)" : hRsi > 70 ? "var(--red)" : "var(--blue)" }}>
+                  {hRsi.toFixed(1)}{hRsi < 30 ? " · oversold" : hRsi > 70 ? " · overbought" : ""}
+                </span>
+              </div>
+              {/* Track */}
+              <div style={{ height: 3, background: "rgba(255,255,255,0.07)", borderRadius: 99, overflow: "hidden" }}>
+                {/* Fill */}
+                <div style={{ width: `${hRsi}%`, height: "100%", borderRadius: 99,
+                  background: hRsi < 30 ? "var(--green)" : hRsi > 70 ? "var(--red)" : "var(--blue)",
+                  transition: "width 0.1s ease" }} />
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
