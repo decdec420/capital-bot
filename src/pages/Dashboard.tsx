@@ -675,33 +675,34 @@ function PriceChart({
           </g>
         )}
 
-        {/* RSI subplot */}
+        {/* RSI subplot — TradingView-style: clean amber line, zone fills, no glow */}
         <g transform={`translate(0, ${priceH + 12})`}>
           <defs>
             <linearGradient id="rsiAreaGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%"   stopColor="rgba(56,189,248,0.28)" />
-              <stop offset="60%"  stopColor="rgba(56,189,248,0.08)" />
-              <stop offset="100%" stopColor="rgba(56,189,248,0)"    />
+              <stop offset="0%"   stopColor="rgba(251,191,36,0.12)" />
+              <stop offset="100%" stopColor="rgba(251,191,36,0)"    />
             </linearGradient>
           </defs>
-          {/* Zone bands */}
-          <rect x={0} y={yRSI(70)} width={W} height={yRSI(0) - yRSI(70)} fill="var(--red)"   opacity="0.06" />
-          <rect x={0} y={yRSI(30)} width={W} height={yRSI(0) - yRSI(30)} fill="var(--green)" opacity="0.06" />
-          {/* Zone threshold lines */}
-          <line x1={0} x2={W} y1={yRSI(70)} y2={yRSI(70)} stroke="var(--red)"   strokeWidth="0.75" strokeDasharray="2 4" opacity="0.55" />
-          <line x1={0} x2={W} y1={yRSI(30)} y2={yRSI(30)} stroke="var(--green)" strokeWidth="0.75" strokeDasharray="2 4" opacity="0.55" />
-          <line x1={0} x2={W} y1={yRSI(50)} y2={yRSI(50)} stroke="var(--grid-line)" strokeWidth="1" />
-          {/* RSI gradient area fill */}
+          {/* Pane background */}
+          <rect x={0} y={0} width={W} height={rsiH} fill="rgba(0,0,0,0.15)" rx="2" />
+          {/* Overbought zone (>70) — subtle red tint */}
+          <rect x={0} y={0}         width={W} height={yRSI(70)}            fill="rgba(255,95,109,0.07)" />
+          {/* Oversold zone (<30) — subtle green tint */}
+          <rect x={0} y={yRSI(30)}  width={W} height={rsiH - yRSI(30)}     fill="rgba(57,255,143,0.07)" />
+          {/* Midline at 50 */}
+          <line x1={0} x2={W} y1={yRSI(50)} y2={yRSI(50)} stroke="rgba(255,255,255,0.07)" strokeWidth="1" />
+          {/* Threshold lines */}
+          <line x1={0} x2={W} y1={yRSI(70)} y2={yRSI(70)} stroke="rgba(255,95,109,0.4)"  strokeWidth="0.75" strokeDasharray="3 5" />
+          <line x1={0} x2={W} y1={yRSI(30)} y2={yRSI(30)} stroke="rgba(57,255,143,0.4)"  strokeWidth="0.75" strokeDasharray="3 5" />
+          {/* Subtle area fill below RSI line */}
           {rsiAreaPath && <path d={rsiAreaPath} fill="url(#rsiAreaGrad)" />}
-          {/* RSI glow halo — wide, very transparent */}
-          {rsiPts && <polyline points={rsiPts} fill="none" stroke="var(--cyan)" strokeWidth="6" opacity="0.1" vectorEffect="non-scaling-stroke" />}
-          {/* RSI mid glow */}
-          {rsiPts && <polyline points={rsiPts} fill="none" stroke="var(--blue)" strokeWidth="2.5" opacity="0.25" vectorEffect="non-scaling-stroke" />}
-          {/* RSI sharp line on top */}
-          {rsiPts && <polyline points={rsiPts} fill="none" stroke="var(--cyan)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" opacity="0.95" />}
-          <text x={4}   y={yRSI(70)-2} fontSize="8.5" fill="var(--red)"   className="mono" opacity="0.7">70</text>
-          <text x={4}   y={yRSI(30)+8} fontSize="8.5" fill="var(--green)" className="mono" opacity="0.7">30</text>
-          <text x={W-4} y={12}         fontSize="8.5" fill="var(--text-3)" textAnchor="end" className="mono">RSI(14)</text>
+          {/* Single clean RSI line — amber, no glow */}
+          {rsiPts && <polyline points={rsiPts} fill="none" stroke="#f59e0b" strokeWidth="1.5" vectorEffect="non-scaling-stroke" opacity="0.9" strokeLinejoin="round" />}
+          {/* Zone labels */}
+          <text x={4}   y={yRSI(70)-3} fontSize="8" fill="rgba(255,95,109,0.6)"  className="mono">70</text>
+          <text x={4}   y={yRSI(50)+3} fontSize="8" fill="rgba(255,255,255,0.2)" className="mono">50</text>
+          <text x={4}   y={yRSI(30)+9} fontSize="8" fill="rgba(57,255,143,0.6)"  className="mono">30</text>
+          <text x={W-4} y={11}         fontSize="8" fill="var(--text-4)" textAnchor="end" className="mono">RSI(14)</text>
         </g>
       </svg>
 
@@ -1842,13 +1843,7 @@ export default function Dashboard() {
             const growth   = seed > 0 ? ((balance - seed) / seed) * 100 : 0;
             const deployPct = balance < 100 ? 90 : balance < 500 ? 80 : balance < 1000 ? 70 : 50;
             const nextOrder = balance * (deployPct / 100);
-            // Simple projection: use avg trade P&L / avg order size as rate
-            const avgRate   = (closedTrades.length && totalInvested > 0)
-              ? totalPnl / totalInvested  // avg return per $ deployed
-              : 0.02;                      // default 2% assumption
-            const tradesTo100 = balance < 100 && avgRate > 0
-              ? Math.ceil(Math.log(100 / balance) / Math.log(1 + avgRate * deployPct / 100))
-              : null;
+            // (projection calc reserved for future use)
             // When in a trade, show cash-on-hand (balance minus capital currently deployed)
             const inTradeAmt  = openTrade ? Number(openTrade.quote_size ?? 0) : 0;
             const cashOnHand  = balance - inTradeAmt;
@@ -1886,32 +1881,35 @@ export default function Dashboard() {
                     <div className="mono" style={{ fontSize: 10, color: "var(--text-3)", marginTop: 4 }}>{sub}</div>
                   </div>
                 ))}
-                {/* ── RACES TO $100 — always shows progress bar ── */}
+                {/* ── RACES TO $100 PROFIT — tracks earned profit, not balance ── */}
                 {(() => {
-                  const pct     = Math.min(1, balance / 100);
-                  const pctDisp = (pct * 100).toFixed(1);
-                  const barColor = pct >= 1 ? "var(--green)" : pct >= 0.7 ? "var(--cyan)" : "var(--amber)";
+                  const profit   = totalPnl; // realized P&L across all closed trades
+                  const inHole   = profit < 0;
+                  const pct      = inHole ? 0 : Math.min(1, profit / 100);
+                  const pctDisp  = inHole ? "0%" : `${(pct * 100).toFixed(1)}%`;
+                  const barColor = pct >= 1 ? "var(--green)" : pct >= 0.5 ? "var(--cyan)" : "var(--amber)";
                   return (
                     <div style={{ padding: "14px 18px" }}>
                       <div className="kicker" style={{ fontSize: 9, color: "var(--cyan)", opacity: 0.7, marginBottom: 6, letterSpacing: "0.1em" }}>
-                        RACES TO $100
+                        PROFIT RACE · $100
                       </div>
-                      <div className="mono" style={{ fontSize: 24, fontWeight: 700, color: barColor, lineHeight: 1 }}>
-                        {pctDisp}%
+                      <div className="mono" style={{ fontSize: 24, fontWeight: 700, color: inHole ? "var(--red)" : barColor, lineHeight: 1 }}>
+                        {inHole ? `−$${Math.abs(profit).toFixed(2)}` : pctDisp}
                       </div>
                       {/* Progress bar */}
                       <div style={{ height: 4, background: "var(--bg-3)", borderRadius: 2, margin: "8px 0 5px", overflow: "hidden" }}>
                         <div style={{
                           height: "100%", borderRadius: 2,
-                          width: `${pct * 100}%`,
-                          background: barColor,
-                          boxShadow: `0 0 6px ${barColor}`,
+                          width: inHole ? "2px" : `${pct * 100}%`,
+                          background: inHole ? "var(--red)" : barColor,
+                          boxShadow: `0 0 6px ${inHole ? "var(--red)" : barColor}`,
                           transition: "width 0.6s ease",
                         }} />
                       </div>
                       <div className="mono" style={{ fontSize: 10, color: "var(--text-3)" }}>
-                        ${balance.toFixed(2)} of $100
-                        {tradesTo100 != null ? ` · ~${tradesTo100} trades left` : ""}
+                        {inHole
+                          ? `dig out ${fmtUSD(profit)} → then race starts`
+                          : `${fmtUSD(profit)} profit · $${(100 - profit).toFixed(2)} to go`}
                       </div>
                     </div>
                   );
