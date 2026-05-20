@@ -34,6 +34,10 @@ export interface Settings {
   compound_mode: boolean;
   paper_balance_usd: number;          // running paper balance (updated after each close)
   paper_starting_balance_usd: number; // original seed (for growth % display)
+  // Scale-in (averaging down)
+  scale_in_enabled: boolean;
+  scale_in_rsi_threshold: number;     // RSI below this triggers the second buy
+  scale_in_amount_usd: number;        // fixed dollar amount for the scale-in buy
 }
 
 export interface ClosedTradeRiskRow {
@@ -53,6 +57,9 @@ export interface OpenTrade {
   entry_fees_usd: number;
   trailing_high: number | null;
   rsi_at_entry: number;
+  scale_in_count: number;        // 0 = not yet scaled in, 1 = scaled in once
+  scale_in_price: number | null; // price at which scale-in fired
+  scale_in_quote_size: number | null; // dollar amount of the scale-in
 }
 
 async function rest(method: string, path: string, body?: unknown): Promise<any> {
@@ -77,7 +84,8 @@ export async function loadAllSettings(): Promise<Settings[]> {
     "rsi_buy_threshold,rsi_sell_threshold,live_trading,stop_loss_pct," +
     "take_profit_pct,trailing_stop_pct,daily_loss_limit_usd,max_drawdown_pct," +
     "max_spread_pct,max_volatility_pct,entry_score_threshold,enabled," +
-    "compound_mode,paper_balance_usd,paper_starting_balance_usd",
+    "compound_mode,paper_balance_usd,paper_starting_balance_usd," +
+    "scale_in_enabled,scale_in_rsi_threshold,scale_in_amount_usd",
   );
 }
 
@@ -88,9 +96,28 @@ export async function updatePaperBalance(userId: string, newBalance: number): Pr
   });
 }
 
+/** Record a scale-in on an open trade — updates avg entry, total size, total quote_size */
+export async function updateScaleIn(
+  tradeId: string,
+  scaleInPrice: number,
+  scaleInQuoteSize: number,
+  newAvgEntryPrice: number,
+  newSize: number,
+  newQuoteSize: number,
+): Promise<void> {
+  await rest("PATCH", `/trades?id=eq.${tradeId}`, {
+    scale_in_count:      1,
+    scale_in_price:      scaleInPrice,
+    scale_in_quote_size: scaleInQuoteSize,
+    entry_price:         newAvgEntryPrice,  // weighted average — used for P&L calc
+    size:                newSize,
+    quote_size:          newQuoteSize,
+  });
+}
+
 /** Load open trade for a user (null if none) */
 export async function loadOpenTrade(userId: string): Promise<OpenTrade | null> {
-  const rows = await rest("GET", `/trades?user_id=eq.${userId}&status=eq.open&select=id,entry_price,size,quote_size,entry_fees_usd,trailing_high,rsi_at_entry&limit=1`);
+  const rows = await rest("GET", `/trades?user_id=eq.${userId}&status=eq.open&select=id,entry_price,size,quote_size,entry_fees_usd,trailing_high,rsi_at_entry,scale_in_count,scale_in_price,scale_in_quote_size&limit=1`);
   if (!rows?.length) return null;
   const r = rows[0];
   return {

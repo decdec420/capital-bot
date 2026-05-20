@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
-import { ArrowLeft, Eye, EyeOff, Save, Zap, Shield, TrendingUp, LogOut, Sliders, RefreshCw } from "lucide-react";
+import { ArrowLeft, Eye, EyeOff, Save, Zap, Shield, TrendingUp, TrendingDown, LogOut, Sliders, RefreshCw } from "lucide-react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 
 interface BotSettings {
@@ -24,6 +24,9 @@ interface BotSettings {
   compound_mode: boolean;
   paper_balance_usd: number;
   paper_starting_balance_usd: number;
+  scale_in_enabled: boolean;
+  scale_in_rsi_threshold: number;
+  scale_in_amount_usd: number;
 }
 
 const DEFAULT_BOT_SETTINGS: BotSettings = {
@@ -44,6 +47,9 @@ const DEFAULT_BOT_SETTINGS: BotSettings = {
   compound_mode: false,
   paper_balance_usd: 20,
   paper_starting_balance_usd: 20,
+  scale_in_enabled: false,
+  scale_in_rsi_threshold: 30,
+  scale_in_amount_usd: 10,
 };
 
 const PRESETS = {
@@ -492,6 +498,57 @@ export default function Settings() {
                 <p>$100 – $500 → deploy <strong>80%</strong> per trade</p>
                 <p>$500 – $1,000 → deploy <strong>70%</strong> per trade</p>
                 <p>Over $1,000 → deploy <strong>50%</strong> per trade</p>
+              </div>
+            </>
+          )}
+        </SectionCard>
+
+        {/* Scale-in (average down) */}
+        <SectionCard
+          icon={<TrendingDown className="w-4 h-4" />}
+          title="Scale-in (average down)"
+          description="Buy more if RSI drops further while you're in a trade — lowers your average entry and doubles up for the recovery."
+        >
+          <Field>
+            <div className="flex items-center justify-between">
+              <div>
+                <Label>Scale-in mode</Label>
+                <Hint>When on, the bot adds to your open position once if RSI drops below the threshold you set.</Hint>
+              </div>
+              <Toggle checked={form.scale_in_enabled} onChange={(v) => set("scale_in_enabled")(v)} />
+            </div>
+          </Field>
+
+          {form.scale_in_enabled && (
+            <>
+              <SliderField
+                label="Scale-in RSI threshold"
+                hint="Second buy fires when RSI drops below this while you're in a trade. Keep it lower than your entry RSI — otherwise it triggers immediately."
+                min={10} max={45} step={1}
+                value={form.scale_in_rsi_threshold}
+                onChange={set("scale_in_rsi_threshold")}
+                format={(v) => `RSI < ${v}`}
+              />
+
+              <Field>
+                <Label>Scale-in amount</Label>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-muted-foreground">$</span>
+                  <input
+                    type="number" min="1" max="100000" step="1"
+                    value={form.scale_in_amount_usd}
+                    onChange={(e) => set("scale_in_amount_usd")(Number(e.target.value))}
+                    className="h-9 w-32 rounded-md border border-input bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring"
+                  />
+                </div>
+                <Hint>Fixed amount to add to the position. Your call — $5 to test, $100 to go heavier.</Hint>
+              </Field>
+
+              <div className="rounded-lg border border-border/50 bg-muted/20 p-3 text-xs text-muted-foreground space-y-1">
+                <p className="font-medium text-foreground">How it works</p>
+                <p>While you're in a trade, if RSI drops below <strong>RSI {form.scale_in_rsi_threshold}</strong>, the bot buys an additional <strong>${form.scale_in_amount_usd}</strong> at the lower price.</p>
+                <p>Your average entry price lowers. The stop-loss stays anchored to the original entry price — it doesn't move. Both chunks exit together at the sell signal.</p>
+                <p className="text-foreground/60">Max one scale-in per trade.</p>
               </div>
             </>
           )}

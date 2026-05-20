@@ -21,7 +21,7 @@ import { fetchHistoricalCandles, fetchBestBidAsk, fetchUSDBalance, placeMarketBu
 import {
   loadAllSettings, loadOpenTrade, loadClosedTradeRiskRows, getCoinbaseCredentials,
   insertTrade, insertPendingTrade, confirmTrade, deleteTrade,
-  loadPendingTrades, closeTrade, updateTrailingHigh, logTick, updatePaperBalance,
+  loadPendingTrades, closeTrade, updateTrailingHigh, logTick, updatePaperBalance, updateScaleIn,
   type Settings, type OpenTrade,
 } from "./supabase.ts";
 import { sendTelegram, fmtBuy, fmtSell } from "./telegram.ts";
@@ -622,6 +622,88 @@ async function checkTickSell(userId: string, state: UserState, symState: SymbolS
   }
 }
 
+// ── Scale-in: fires once per trade when RSI drops below scale_in_rsi_threshold ──
+
+async function checkTickScaleIn(userId: string, state: UserState, symState: SymbolState): Promise<void> {
+  const { settings, openTrade } = state;
+  if (!openTrade) return;
+  if ((openTrade.scale_in_count ?? 0) > 0) return; // already scaled in — one per trade
+
+  const { lastRsi, currentPrice } = symState;
+  if (lastRsi == null || lastRsi >= settings.scale_in_rsi_threshold) return;
+
+  const scaleAmount = settings.scale_in_amount_usd;
+  console.log(`[scale-in] ${userId} — RSI ${lastRsi.toFixed(1)} < ${settings.scale_in_rsi_threshold}, adding $${scaleAmount.toFixed(2)}`);
+
+  try {
+    if (!settings.live_trading) {
+      const available = settings.paper_balance_usd;
+      if (available < scaleAmount) {
+        console.log(`[scale-in] ${userId} — skipped: balance $${available.toFixed(2)} < scale amount $${scaleAmount.toFixed(2)}`);
+        return;
+      }
+
+      const scaleSize    = scaleAmount / currentPrice;
+      const totalSize    = openTrade.size + scaleSize;
+      const newAvgEntry  = ((openTrade.entry_price * openTrade.size) + (currentPrice * scaleSize)) / totalSize;
+      const newQuoteSize = openTrade.quote_size + scaleAmount;
+
+      await updateScaleIn(openTrade.id, currentPrice, scaleAmount, newAvgEntry, totalSize, newQuoteSize);
+
+      const newBalance = Math.max(0, settings.paper_balance_usd - scaleAmount);
+      await updatePaperBalance(userId, newBalance);
+      settings.paper_balance_usd = newBalance;
+
+      // Sync in-memory state so subsequent ticks see updated position
+      openTrade.scale_in_count     = 1;
+      openTrade.scale_in_price     = currentPrice;
+      openTrade.scale_in_quote_size = scaleAmount;
+      openTrade.entry_price        = newAvgEntry;
+      openTrade.size               = totalSize;
+      openTrade.quote_size         = newQuoteSize;
+
+      await logTick(userId, settings.symbol, lastRsi, currentPrice, "scale_in",
+        `PAPER SCALE-IN — added $${scaleAmount.toFixed(2)} @ $${currentPrice.toFixed(2)} RSI ${lastRsi.toFixed(1)} · new avg entry $${newAvgEntry.toFixed(2)}`);
+      await sendTelegram(
+        `📉 Scale-in: ${settings.symbol}\nRSI ${lastRsi.toFixed(1)} hit scale-in threshold (< ${settings.scale_in_rsi_threshold})\n` +
+        `Added $${scaleAmount.toFixed(2)} @ $${currentPrice.toFixed(2)}\nNew avg entry: $${newAvgEntry.toFixed(2)}`,
+      );
+    } else {
+      // Live: check real balance then place a market buy
+      if (!state.credentials) { console.error("[scale-in] live mode but no credentials"); return; }
+      const available = await fetchUSDBalance(state.credentials).catch(() => 0);
+      if (available < scaleAmount) {
+        console.log(`[scale-in] ${userId} — live: insufficient balance $${available.toFixed(2)}`);
+        return;
+      }
+
+      const fill = await placeMarketBuy(state.credentials, settings.symbol, scaleAmount.toFixed(2), `${openTrade.id}-scalein`);
+
+      const totalSize    = openTrade.size + fill.filledBaseSize;
+      const newAvgEntry  = ((openTrade.entry_price * openTrade.size) + (fill.fillPrice * fill.filledBaseSize)) / totalSize;
+      const newQuoteSize = openTrade.quote_size + fill.filledQuoteSize;
+
+      await updateScaleIn(openTrade.id, fill.fillPrice, fill.filledQuoteSize, newAvgEntry, totalSize, newQuoteSize);
+
+      openTrade.scale_in_count      = 1;
+      openTrade.scale_in_price      = fill.fillPrice;
+      openTrade.scale_in_quote_size = fill.filledQuoteSize;
+      openTrade.entry_price         = newAvgEntry;
+      openTrade.size                = totalSize;
+      openTrade.quote_size          = newQuoteSize;
+
+      await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "scale_in",
+        `LIVE SCALE-IN — filled $${fill.filledQuoteSize.toFixed(2)} @ $${fill.fillPrice.toFixed(2)} RSI ${lastRsi.toFixed(1)} · new avg $${newAvgEntry.toFixed(2)}`);
+      await sendTelegram(
+        `📉 Scale-in: ${settings.symbol}\nRSI ${lastRsi.toFixed(1)} < ${settings.scale_in_rsi_threshold}\n` +
+        `Filled $${fill.filledQuoteSize.toFixed(2)} @ $${fill.fillPrice.toFixed(2)}\nNew avg entry: $${newAvgEntry.toFixed(2)}`,
+      );
+    }
+  } catch (e) {
+    console.error(`[scale-in] failed for ${userId}:`, e instanceof Error ? e.message : String(e));
+  }
+}
+
 // ── RSI signals: checked on candle close ──────────────────
 
 async function checkSignals(userId: string, state: UserState, symState: SymbolState, closedCandle: Candle): Promise<void> {
@@ -801,6 +883,12 @@ async function _onTradeInner(symbol: string, price: number, size: number, tickMs
       // Tick-level RSI sell — only if risk exits didn't already close the position
       if (!exited && symState.lastRsi > userState.settings.rsi_sell_threshold) {
         await checkTickSell(userId, userState, symState);
+      }
+      // Scale-in: add to position once if RSI drops below scale-in threshold
+      if (!exited && userState.settings.scale_in_enabled &&
+          symState.lastRsi < userState.settings.scale_in_rsi_threshold &&
+          (userState.openTrade?.scale_in_count ?? 0) === 0) {
+        await checkTickScaleIn(userId, userState, symState);
       }
     } finally {
       userInFlight.delete(userId);

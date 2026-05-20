@@ -41,6 +41,9 @@ interface Trade {
   closed_at?: string;
   entry_fees_usd?: number;
   notes?: string;
+  scale_in_count?: number;
+  scale_in_price?: number;
+  scale_in_quote_size?: number;
 }
 
 type DecisionState = "WATCHING" | "SETUP FORMING" | "ENTRY CANDIDATE" | "TRADE ALLOWED" | "IN POSITION" | "RISK BLOCKED";
@@ -80,6 +83,9 @@ interface BotSettings {
   compound_mode?: boolean;
   paper_balance_usd?: number;
   paper_starting_balance_usd?: number;
+  scale_in_enabled?: boolean;
+  scale_in_rsi_threshold?: number;
+  scale_in_amount_usd?: number;
 }
 
 interface Candle {
@@ -959,7 +965,12 @@ function PositionPanel({
   return (
     <div className="t-panel" style={{ padding: 16 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
-        <span className="kicker">ACTIVE TRADE</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span className="kicker">ACTIVE TRADE</span>
+          {(openTrade.scale_in_count ?? 0) > 0 && (
+            <span className="pill pill-cyan" style={{ fontSize: 9, padding: "1px 6px" }}>SCALED IN</span>
+          )}
+        </div>
         <button className="t-btn t-btn-danger" onClick={() => { if (confirm("Force-close this position now?")) onClose(); }} disabled={closing} style={{ height: 26, padding: "0 10px", fontSize: 11 }}>
           {closing ? "Closing…" : "Force close"}
         </button>
@@ -1002,12 +1013,18 @@ function PositionPanel({
 
       {/* Grid of details */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px 16px" }}>
-        <DataRow label="Entry price"    value={fmtUSD(entry)} />
+        <DataRow label={(openTrade.scale_in_count ?? 0) > 0 ? "Avg entry" : "Entry price"} value={fmtUSD(entry)} />
         <DataRow label="Now"            value={fmtUSD(cur)} />
         <DataRow label="Size"           value={Number(openTrade.size).toFixed(8) + " BTC"} />
         <DataRow label="Deployed"       value={fmtUSD(openTrade.quote_size)} />
         <DataRow label="RSI at entry"   value={openTrade.rsi_at_entry?.toFixed(1) ?? "—"} />
         <DataRow label="High water"     value={fmtUSD(tHigh)} />
+        {(openTrade.scale_in_count ?? 0) > 0 && openTrade.scale_in_price != null && (
+          <DataRow label="Scale-in @" value={fmtUSD(openTrade.scale_in_price)} color="var(--cyan)" />
+        )}
+        {(openTrade.scale_in_count ?? 0) > 0 && openTrade.scale_in_quote_size != null && (
+          <DataRow label="Scale-in $" value={fmtUSD(openTrade.scale_in_quote_size)} color="var(--cyan)" />
+        )}
         {slPrice && <DataRow label="Stop loss"     value={fmtUSD(slPrice)} color="var(--red)" />}
         {tpPrice && <DataRow label="Take profit"   value={fmtUSD(tpPrice)} color="var(--green)" />}
         {tsPrice && <DataRow label="Trailing stop" value={fmtUSD(tsPrice)} color="var(--amber)" />}
