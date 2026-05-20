@@ -13,7 +13,7 @@ import { Link } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
-import { Settings, LogOut, RefreshCw } from "lucide-react";
+import { Settings, LogOut, RefreshCw, BarChart2 } from "lucide-react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1841,6 +1841,9 @@ export default function Dashboard() {
           <button className="t-btn" onClick={handleRefresh} title="Sync DB data">
             <RefreshCw size={11} /> Sync
           </button>
+          <Link to="/performance" className="t-btn" style={{ textDecoration: "none", display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <BarChart2 size={11} /> Performance
+          </Link>
           <Link to="/settings" className="t-btn" style={{ textDecoration: "none", display: "inline-flex", alignItems: "center", gap: 6 }}>
             <Settings size={12} /> Settings
           </Link>
