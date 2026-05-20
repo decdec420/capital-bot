@@ -1849,6 +1849,10 @@ export default function Dashboard() {
             const tradesTo100 = balance < 100 && avgRate > 0
               ? Math.ceil(Math.log(100 / balance) / Math.log(1 + avgRate * deployPct / 100))
               : null;
+            // When in a trade, show cash-on-hand (balance minus capital currently deployed)
+            const inTradeAmt  = openTrade ? Number(openTrade.quote_size ?? 0) : 0;
+            const cashOnHand  = balance - inTradeAmt;
+            const inTrade     = inTradeAmt > 0;
             return (
               <div className="hud-panel" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 0, marginBottom: 12 }}>
                 {/* Corner brackets (top-right, bottom-left) via inline spans */}
@@ -1859,7 +1863,13 @@ export default function Dashboard() {
                   borderBottom: "2px solid var(--cyan)", borderLeft: "2px solid var(--cyan)",
                   borderRadius: "0 0 0 10px", opacity: 0.7, pointerEvents: "none" }} />
                 {[
-                  { label: "RUNNING BALANCE", value: `$${balance.toFixed(2)}`, sub: `seed $${seed.toFixed(2)}`, color: balance >= seed ? "var(--green)" : "var(--red)", glow: balance >= seed },
+                  {
+                    label: inTrade ? "CASH ON HAND" : "RUNNING BALANCE",
+                    value: inTrade ? `$${cashOnHand.toFixed(2)}` : `$${balance.toFixed(2)}`,
+                    sub: inTrade ? `$${inTradeAmt.toFixed(2)} in trade · total $${balance.toFixed(2)}` : `seed $${seed.toFixed(2)}`,
+                    color: inTrade ? "var(--amber)" : (balance >= seed ? "var(--green)" : "var(--red)"),
+                    glow: !inTrade && balance >= seed,
+                  },
                   { label: "RETURN", value: `${growth >= 0 ? "+" : ""}${growth.toFixed(1)}%`, sub: "since seed capital", color: growth >= 0 ? "var(--green)" : "var(--red)", glow: growth >= 0 },
                   { label: "NEXT STAKE", value: `$${nextOrder.toFixed(2)}`, sub: `${deployPct}% of balance · tiered`, color: "var(--cyan)", glow: true },
                   { label: "RACES TO $100", value: tradesTo100 != null ? `~${tradesTo100}` : "—", sub: tradesTo100 != null ? "est. trades remaining" : "compounding…", color: "var(--text-2)", glow: false },
