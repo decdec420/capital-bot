@@ -8,7 +8,7 @@
 //   • ZERO simulation, ZERO mock data — paper trades are real DB records
 //   • The Fly.io worker is the single source of truth for trade execution
 
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { Link } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
@@ -458,6 +458,9 @@ function PriceChart({
   const priceH = height - rsiH - 12;
   const W = 1000;
 
+  const svgRef = useRef<SVGSVGElement>(null);
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+
   if (!candles.length) {
     return (
       <div style={{ height, display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -488,9 +491,40 @@ function PriceChart({
   const lastClose = spot ?? candles[n - 1]?.close ?? 0;
   const lastY = yAt(lastClose);
 
+  // Mouse → SVG coordinate conversion (handles preserveAspectRatio="none" scaling)
+  const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const rect = svg.getBoundingClientRect();
+    const relX = (e.clientX - rect.left) / rect.width;
+    const idx = Math.round(relX * (n - 1));
+    setHoverIdx(Math.max(0, Math.min(n - 1, idx)));
+  };
+
+  // Tooltip data for hovered candle
+  const hc = hoverIdx != null ? candles[hoverIdx] : null;
+  const hRsi = hoverIdx != null ? rsiSeries[hoverIdx] : null;
+  const hX = hoverIdx != null ? xAt(hoverIdx) : null;
+  const hY = hc ? yAt(hc.close) : null;
+  // Tooltip box: flip to left side when near right edge
+  const tipW = 148, tipH = 82;
+  const tipX = hX != null ? (hX > W * 0.65 ? hX - tipW - 12 : hX + 12) : 0;
+  const tipY = 8;
+
+  const fmtTime = (ms: number) => {
+    const d = new Date(ms);
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  };
+  const fmtDate = (ms: number) => {
+    const d = new Date(ms);
+    return d.toLocaleDateString([], { month: "short", day: "numeric" });
+  };
+
   return (
-    <svg viewBox={`0 0 ${W} ${height}`} preserveAspectRatio="none"
-      style={{ width: "100%", height, display: "block", overflow: "visible" }}>
+    <svg ref={svgRef} viewBox={`0 0 ${W} ${height}`} preserveAspectRatio="none"
+      style={{ width: "100%", height, display: "block", overflow: "visible", cursor: hoverIdx != null ? "crosshair" : "default" }}
+      onMouseMove={handleMouseMove}
+      onMouseLeave={() => setHoverIdx(null)}>
       {/* Price grid */}
       {[0.25, 0.5, 0.75].map((f) => (
         <line key={f} x1={0} x2={W} y1={priceH * f} y2={priceH * f}
@@ -559,6 +593,57 @@ function PriceChart({
       <text x={W-4} y={12}         fontSize="9"   fill="var(--text-3)" textAnchor="end" className="mono">{maxP.toFixed(0)}</text>
       <text x={W-4} y={priceH-4}   fontSize="9"   fill="var(--text-3)" textAnchor="end" className="mono">{minP.toFixed(0)}</text>
       <text x={W-4} y={lastY-4}    fontSize="9.5" fill="var(--text)"   textAnchor="end" className="mono" fontWeight="600">{Math.round(lastClose).toLocaleString()}</text>
+
+      {/* ── Hover crosshair + tooltip ── */}
+      {hoverIdx != null && hX != null && hc != null && hY != null && (
+        <g style={{ pointerEvents: "none" }}>
+          {/* Vertical crosshair — full chart height */}
+          <line x1={hX} y1={0} x2={hX} y2={height}
+            stroke="var(--text-3)" strokeWidth="1" strokeDasharray="3 4"
+            vectorEffect="non-scaling-stroke" opacity="0.6" />
+          {/* Horizontal crosshair — price area only */}
+          <line x1={0} y1={hY} x2={W} y2={hY}
+            stroke="var(--text-3)" strokeWidth="1" strokeDasharray="3 4"
+            vectorEffect="non-scaling-stroke" opacity="0.35" />
+          {/* Dot on close */}
+          <circle cx={hX} cy={hY} r="4" fill="var(--text)" vectorEffect="non-scaling-stroke" />
+
+          {/* Tooltip card */}
+          <rect x={tipX} y={tipY} width={tipW} height={tipH} rx="4" ry="4"
+            fill="var(--bg-2)" stroke="var(--border)" strokeWidth="1"
+            vectorEffect="non-scaling-stroke" opacity="0.97" />
+          {/* Date + time */}
+          <text x={tipX + 8} y={tipY + 16} fontSize="9" fill="var(--text-3)" className="mono">
+            {fmtDate(hc.t)} · {fmtTime(hc.t)}
+          </text>
+          {/* Close price — large */}
+          <text x={tipX + 8} y={tipY + 34} fontSize="13" fill="var(--text)" className="mono" fontWeight="600">
+            ${hc.close.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+          </text>
+          {/* OHLC row */}
+          <text x={tipX + 8}  y={tipY + 50} fontSize="8.5" fill="var(--text-3)" className="mono">O {hc.open.toFixed(0)}</text>
+          <text x={tipX + 44} y={tipY + 50} fontSize="8.5" fill="var(--green)"  className="mono">H {hc.high.toFixed(0)}</text>
+          <text x={tipX + 84} y={tipY + 50} fontSize="8.5" fill="var(--red)"    className="mono">L {hc.low.toFixed(0)}</text>
+          {/* RSI */}
+          {hRsi != null && (
+            <text x={tipX + 8} y={tipY + 67} fontSize="8.5" fill="var(--blue)" className="mono">
+              RSI {hRsi.toFixed(1)}
+            </text>
+          )}
+          {/* Change vs prev candle */}
+          {hoverIdx > 0 && (() => {
+            const prev = candles[hoverIdx - 1];
+            const chg = ((hc.close - prev.close) / prev.close) * 100;
+            return (
+              <text x={tipX + tipW - 8} y={tipY + 67} fontSize="8.5"
+                fill={chg >= 0 ? "var(--green)" : "var(--red)"}
+                textAnchor="end" className="mono">
+                {chg >= 0 ? "+" : ""}{chg.toFixed(2)}%
+              </text>
+            );
+          })()}
+        </g>
+      )}
 
       {/* RSI subplot */}
       <g transform={`translate(0, ${priceH + 12})`}>
