@@ -1862,6 +1862,7 @@ export default function Dashboard() {
                 <span style={{ position: "absolute", bottom: -1, left: -1, width: 14, height: 14,
                   borderBottom: "2px solid var(--cyan)", borderLeft: "2px solid var(--cyan)",
                   borderRadius: "0 0 0 10px", opacity: 0.7, pointerEvents: "none" }} />
+                {/* ── First 3 cells via map ── */}
                 {[
                   {
                     label: inTrade ? "CASH ON HAND" : "RUNNING BALANCE",
@@ -1872,11 +1873,10 @@ export default function Dashboard() {
                   },
                   { label: "RETURN", value: `${growth >= 0 ? "+" : ""}${growth.toFixed(1)}%`, sub: "since seed capital", color: growth >= 0 ? "var(--green)" : "var(--red)", glow: growth >= 0 },
                   { label: "NEXT STAKE", value: `$${nextOrder.toFixed(2)}`, sub: `${deployPct}% of balance · tiered`, color: "var(--cyan)", glow: true },
-                  { label: "RACES TO $100", value: tradesTo100 != null ? `~${tradesTo100}` : "—", sub: tradesTo100 != null ? "est. trades remaining" : "compounding…", color: "var(--text-2)", glow: false },
-                ].map(({ label, value, sub, color, glow }, idx) => (
+                ].map(({ label, value, sub, color, glow }) => (
                   <div key={label} style={{
                     padding: "14px 18px",
-                    borderRight: idx < 3 ? "1px solid var(--t-border)" : "none",
+                    borderRight: "1px solid var(--t-border)",
                   }}>
                     <div className="kicker" style={{ fontSize: 9, color: "var(--cyan)", opacity: 0.7, marginBottom: 6, letterSpacing: "0.1em" }}>{label}</div>
                     <div className="mono" style={{
@@ -1886,6 +1886,36 @@ export default function Dashboard() {
                     <div className="mono" style={{ fontSize: 10, color: "var(--text-3)", marginTop: 4 }}>{sub}</div>
                   </div>
                 ))}
+                {/* ── RACES TO $100 — always shows progress bar ── */}
+                {(() => {
+                  const pct     = Math.min(1, balance / 100);
+                  const pctDisp = (pct * 100).toFixed(1);
+                  const barColor = pct >= 1 ? "var(--green)" : pct >= 0.7 ? "var(--cyan)" : "var(--amber)";
+                  return (
+                    <div style={{ padding: "14px 18px" }}>
+                      <div className="kicker" style={{ fontSize: 9, color: "var(--cyan)", opacity: 0.7, marginBottom: 6, letterSpacing: "0.1em" }}>
+                        RACES TO $100
+                      </div>
+                      <div className="mono" style={{ fontSize: 24, fontWeight: 700, color: barColor, lineHeight: 1 }}>
+                        {pctDisp}%
+                      </div>
+                      {/* Progress bar */}
+                      <div style={{ height: 4, background: "var(--bg-3)", borderRadius: 2, margin: "8px 0 5px", overflow: "hidden" }}>
+                        <div style={{
+                          height: "100%", borderRadius: 2,
+                          width: `${pct * 100}%`,
+                          background: barColor,
+                          boxShadow: `0 0 6px ${barColor}`,
+                          transition: "width 0.6s ease",
+                        }} />
+                      </div>
+                      <div className="mono" style={{ fontSize: 10, color: "var(--text-3)" }}>
+                        ${balance.toFixed(2)} of $100
+                        {tradesTo100 != null ? ` · ~${tradesTo100} trades left` : ""}
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
             );
           })()
@@ -1898,7 +1928,7 @@ export default function Dashboard() {
           <div className="t-panel" style={{ padding: "18px 22px" }}>
             <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 8 }}>
               <span className="kicker">ALL-TIME P&L</span>
-              <span className="mono dim" style={{ fontSize: 10.5 }}>{closedTrades.length} trades closed · {fmtUSD(totalInvested, 0)} deployed</span>
+              <span className="mono dim" style={{ fontSize: 10.5 }}>{closedTrades.length} trades · {fmtUSD(totalInvested, 0)} total volume</span>
             </div>
             <div style={{ display: "flex", alignItems: "baseline", gap: 14, flexWrap: "wrap", marginBottom: 14 }}>
               <span className="hero-num mono" style={{
