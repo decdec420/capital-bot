@@ -406,13 +406,27 @@ function RSIGauge({ value, buyT = 30, sellT = 70, size = 180 }: {
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
       <svg width={size} height={svgH} viewBox={`0 0 ${size} ${svgH}`} style={{ overflow: "visible" }}>
+        <defs>
+          <filter id="gaugeGlow" x="-40%" y="-40%" width="180%" height="180%">
+            <feGaussianBlur in="SourceGraphic" stdDeviation="3" result="blur" />
+            <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+          </filter>
+          <filter id="needleGlow" x="-80%" y="-80%" width="260%" height="260%">
+            <feGaussianBlur in="SourceGraphic" stdDeviation="2.5" result="blur" />
+            <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+          </filter>
+        </defs>
         {/* Track */}
         <path d={arcPath(0, 100)} fill="none" stroke="var(--bg-3)" strokeWidth="10" strokeLinecap="butt" />
+        {/* Buy zone glow layer */}
+        <path d={arcPath(0, buyT)} fill="none" stroke="var(--green)" strokeWidth="14" strokeLinecap="butt" opacity="0.15" filter="url(#gaugeGlow)" />
         {/* Buy zone */}
-        <path d={arcPath(0, buyT)} fill="none" stroke="var(--green)" strokeWidth="10" strokeLinecap="butt" opacity="0.85" />
+        <path d={arcPath(0, buyT)} fill="none" stroke="var(--green)" strokeWidth="10" strokeLinecap="butt" opacity="0.9" />
+        {/* Sell zone glow layer */}
+        <path d={arcPath(sellT, 100)} fill="none" stroke="var(--red)" strokeWidth="14" strokeLinecap="butt" opacity="0.15" filter="url(#gaugeGlow)" />
         {/* Sell zone */}
-        <path d={arcPath(sellT, 100)} fill="none" stroke="var(--red)" strokeWidth="10" strokeLinecap="butt" opacity="0.85" />
-        {/* Tick marks at 0, 25, 50, 75, 100 */}
+        <path d={arcPath(sellT, 100)} fill="none" stroke="var(--red)" strokeWidth="10" strokeLinecap="butt" opacity="0.9" />
+        {/* Tick marks */}
         {[0, 25, 50, 75, 100].map((t) => {
           const a = rsiToAngle(t);
           const [x1, y1] = polar(a, r - 14);
@@ -425,12 +439,18 @@ function RSIGauge({ value, buyT = 30, sellT = 70, size = 180 }: {
             </g>
           );
         })}
+        {/* Needle glow */}
+        <line x1={cx} y1={cy} x2={nx} y2={ny} stroke={needleColor} strokeWidth="5" strokeLinecap="round"
+          opacity="0.3" filter="url(#needleGlow)" />
         {/* Needle */}
-        <line x1={cx} y1={cy} x2={nx} y2={ny} stroke={needleColor} strokeWidth="2.5" strokeLinecap="round" />
+        <line x1={cx} y1={cy} x2={nx} y2={ny} stroke={needleColor} strokeWidth="2" strokeLinecap="round" />
+        {/* Pivot glow */}
+        <circle cx={cx} cy={cy} r="8" fill={needleColor} opacity="0.15" filter="url(#gaugeGlow)" />
         <circle cx={cx} cy={cy} r="5" fill={needleColor} />
         <circle cx={cx} cy={cy} r="2.5" fill="var(--bg)" />
         {/* Value */}
-        <text x={cx} y={cy - 22} fontSize={size * 0.17} fill="var(--text)" textAnchor="middle" className="mono hero-num" fontWeight="500">
+        <text x={cx} y={cy - 22} fontSize={size * 0.17} textAnchor="middle" className="mono hero-num" fontWeight="600"
+          fill={needleColor} style={{ filter: `drop-shadow(0 0 6px ${needleColor})` }}>
           {value != null ? value.toFixed(1) : "—"}
         </text>
         <text x={cx} y={cy - 7} fontSize="9" fill="var(--text-3)" textAnchor="middle" className="mono">RSI(14)</text>
@@ -485,6 +505,16 @@ function PriceChart({
   const rsiPts = rsiSeries
     .map((v, i) => v == null ? null : `${xAt(i).toFixed(2)},${yRSI(v).toFixed(2)}`)
     .filter(Boolean).join(" ");
+
+  // RSI gradient area path — traces the RSI line and closes at the bottom of the pane
+  const rsiAreaPath = (() => {
+    const pts: { x: number; y: number }[] = [];
+    rsiSeries.forEach((v, i) => { if (v != null) pts.push({ x: xAt(i), y: yRSI(v) }); });
+    if (pts.length < 2) return null;
+    return `M ${pts[0].x.toFixed(1)},${rsiH} ` +
+      pts.map(p => `L ${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ") +
+      ` L ${pts[pts.length-1].x.toFixed(1)},${rsiH} Z`;
+  })();
 
   const lastClose = spot ?? candles[n - 1]?.close ?? 0;
   const lastY = yAt(lastClose);
@@ -647,14 +677,30 @@ function PriceChart({
 
         {/* RSI subplot */}
         <g transform={`translate(0, ${priceH + 12})`}>
-          <rect x={0} y={yRSI(70)} width={W} height={yRSI(0) - yRSI(70)} fill="var(--red)"   opacity="0.04" />
-          <rect x={0} y={yRSI(30)} width={W} height={yRSI(0) - yRSI(30)} fill="var(--green)" opacity="0.04" />
-          <line x1={0} x2={W} y1={yRSI(70)} y2={yRSI(70)} stroke="var(--red)"   strokeWidth="1" strokeDasharray="2 4" opacity="0.4" />
-          <line x1={0} x2={W} y1={yRSI(30)} y2={yRSI(30)} stroke="var(--green)" strokeWidth="1" strokeDasharray="2 4" opacity="0.4" />
+          <defs>
+            <linearGradient id="rsiAreaGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%"   stopColor="rgba(56,189,248,0.28)" />
+              <stop offset="60%"  stopColor="rgba(56,189,248,0.08)" />
+              <stop offset="100%" stopColor="rgba(56,189,248,0)"    />
+            </linearGradient>
+          </defs>
+          {/* Zone bands */}
+          <rect x={0} y={yRSI(70)} width={W} height={yRSI(0) - yRSI(70)} fill="var(--red)"   opacity="0.06" />
+          <rect x={0} y={yRSI(30)} width={W} height={yRSI(0) - yRSI(30)} fill="var(--green)" opacity="0.06" />
+          {/* Zone threshold lines */}
+          <line x1={0} x2={W} y1={yRSI(70)} y2={yRSI(70)} stroke="var(--red)"   strokeWidth="0.75" strokeDasharray="2 4" opacity="0.55" />
+          <line x1={0} x2={W} y1={yRSI(30)} y2={yRSI(30)} stroke="var(--green)" strokeWidth="0.75" strokeDasharray="2 4" opacity="0.55" />
           <line x1={0} x2={W} y1={yRSI(50)} y2={yRSI(50)} stroke="var(--grid-line)" strokeWidth="1" />
-          {rsiPts && <polyline points={rsiPts} fill="none" stroke="var(--blue)" strokeWidth="1.25" vectorEffect="non-scaling-stroke" />}
-          <text x={4}   y={yRSI(70)-2} fontSize="8.5" fill="var(--red)"   className="mono">70</text>
-          <text x={4}   y={yRSI(30)+8} fontSize="8.5" fill="var(--green)" className="mono">30</text>
+          {/* RSI gradient area fill */}
+          {rsiAreaPath && <path d={rsiAreaPath} fill="url(#rsiAreaGrad)" />}
+          {/* RSI glow halo — wide, very transparent */}
+          {rsiPts && <polyline points={rsiPts} fill="none" stroke="var(--cyan)" strokeWidth="6" opacity="0.1" vectorEffect="non-scaling-stroke" />}
+          {/* RSI mid glow */}
+          {rsiPts && <polyline points={rsiPts} fill="none" stroke="var(--blue)" strokeWidth="2.5" opacity="0.25" vectorEffect="non-scaling-stroke" />}
+          {/* RSI sharp line on top */}
+          {rsiPts && <polyline points={rsiPts} fill="none" stroke="var(--cyan)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" opacity="0.95" />}
+          <text x={4}   y={yRSI(70)-2} fontSize="8.5" fill="var(--red)"   className="mono" opacity="0.7">70</text>
+          <text x={4}   y={yRSI(30)+8} fontSize="8.5" fill="var(--green)" className="mono" opacity="0.7">30</text>
           <text x={W-4} y={12}         fontSize="8.5" fill="var(--text-3)" textAnchor="end" className="mono">RSI(14)</text>
         </g>
       </svg>
@@ -1741,17 +1787,18 @@ export default function Dashboard() {
 
       {/* ── Top bar ── */}
       <header style={{
-        borderBottom: "1px solid var(--t-border)",
+        borderBottom: "1px solid rgba(0,229,255,0.12)",
+        boxShadow: "0 1px 0 rgba(0,229,255,0.04)",
         padding: "10px 24px",
         display: "flex", alignItems: "center", justifyContent: "space-between",
-        background: "var(--bg)",
+        background: "rgba(8,9,9,0.92)",
         position: "sticky", top: 0, zIndex: 30,
-        backdropFilter: "blur(8px)",
+        backdropFilter: "blur(16px)",
       }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <BotMark size={18} />
-            <span className="mono" style={{ fontSize: 12, fontWeight: 600, letterSpacing: "0.04em" }}>CAPITAL_BOT</span>
+            <span className="mono" style={{ fontSize: 12, fontWeight: 700, letterSpacing: "0.12em", color: "var(--cyan)", textShadow: "0 0 12px rgba(0,229,255,0.6), 0 0 32px rgba(0,229,255,0.2)" }}>CAPITAL_BOT</span>
           </div>
           <span style={{ height: 14, width: 1, background: "var(--t-border)" }} />
           <span className={`pill ${settings?.live_trading ? "pill-red" : "pill-amber"}`}>
@@ -1803,35 +1850,32 @@ export default function Dashboard() {
               ? Math.ceil(Math.log(100 / balance) / Math.log(1 + avgRate * deployPct / 100))
               : null;
             return (
-              <div className="rounded-xl border border-border bg-card p-4 mb-3" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 16 }}>
-                <div>
-                  <div className="kicker" style={{ fontSize: 9.5 }}>COMPOUND BALANCE</div>
-                  <div className="mono" style={{ fontSize: 22, fontWeight: 600, color: balance >= seed ? "var(--green)" : "var(--red)" }}>
-                    ${balance.toFixed(2)}
+              <div className="hud-panel" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 0, marginBottom: 12 }}>
+                {/* Corner brackets (top-right, bottom-left) via inline spans */}
+                <span style={{ position: "absolute", top: -1, right: -1, width: 14, height: 14,
+                  borderTop: "2px solid var(--cyan)", borderRight: "2px solid var(--cyan)",
+                  borderRadius: "0 10px 0 0", opacity: 0.7, pointerEvents: "none" }} />
+                <span style={{ position: "absolute", bottom: -1, left: -1, width: 14, height: 14,
+                  borderBottom: "2px solid var(--cyan)", borderLeft: "2px solid var(--cyan)",
+                  borderRadius: "0 0 0 10px", opacity: 0.7, pointerEvents: "none" }} />
+                {[
+                  { label: "COMPOUND BALANCE", value: `$${balance.toFixed(2)}`, sub: `started at $${seed.toFixed(2)}`, color: balance >= seed ? "var(--green)" : "var(--red)", glow: balance >= seed },
+                  { label: "GROWTH", value: `${growth >= 0 ? "+" : ""}${growth.toFixed(1)}%`, sub: "vs seed capital", color: growth >= 0 ? "var(--green)" : "var(--red)", glow: growth >= 0 },
+                  { label: "NEXT ORDER SIZE", value: `$${nextOrder.toFixed(2)}`, sub: `${deployPct}% of balance (tier)`, color: "var(--cyan)", glow: true },
+                  { label: "PROJECTION", value: tradesTo100 != null ? `~${tradesTo100}` : "—", sub: tradesTo100 != null ? "trades to $100" : "growing…", color: "var(--text-2)", glow: false },
+                ].map(({ label, value, sub, color, glow }, idx) => (
+                  <div key={label} style={{
+                    padding: "14px 18px",
+                    borderRight: idx < 3 ? "1px solid var(--t-border)" : "none",
+                  }}>
+                    <div className="kicker" style={{ fontSize: 9, color: "var(--cyan)", opacity: 0.7, marginBottom: 6, letterSpacing: "0.1em" }}>{label}</div>
+                    <div className="mono" style={{
+                      fontSize: 24, fontWeight: 700, color, lineHeight: 1,
+                      textShadow: glow ? `0 0 12px ${color}, 0 0 32px ${color}40` : "none",
+                    }}>{value}</div>
+                    <div className="mono" style={{ fontSize: 10, color: "var(--text-3)", marginTop: 4 }}>{sub}</div>
                   </div>
-                  <div className="mono dim" style={{ fontSize: 10 }}>started at ${seed.toFixed(2)}</div>
-                </div>
-                <div>
-                  <div className="kicker" style={{ fontSize: 9.5 }}>GROWTH</div>
-                  <div className="mono" style={{ fontSize: 22, fontWeight: 600, color: growth >= 0 ? "var(--green)" : "var(--red)" }}>
-                    {growth >= 0 ? "+" : ""}{growth.toFixed(1)}%
-                  </div>
-                  <div className="mono dim" style={{ fontSize: 10 }}>vs seed capital</div>
-                </div>
-                <div>
-                  <div className="kicker" style={{ fontSize: 9.5 }}>NEXT ORDER SIZE</div>
-                  <div className="mono" style={{ fontSize: 22, fontWeight: 600 }}>${nextOrder.toFixed(2)}</div>
-                  <div className="mono dim" style={{ fontSize: 10 }}>{deployPct}% of balance (tier)</div>
-                </div>
-                <div>
-                  <div className="kicker" style={{ fontSize: 9.5 }}>PROJECTION</div>
-                  <div className="mono" style={{ fontSize: 22, fontWeight: 600 }}>
-                    {tradesTo100 != null ? `~${tradesTo100} trades` : "—"}
-                  </div>
-                  <div className="mono dim" style={{ fontSize: 10 }}>
-                    {tradesTo100 != null ? "to reach $100" : "growing…"}
-                  </div>
-                </div>
+                ))}
               </div>
             );
           })()
@@ -1847,7 +1891,11 @@ export default function Dashboard() {
               <span className="mono dim" style={{ fontSize: 10.5 }}>{closedTrades.length} trades · {fmtUSD(totalInvested, 0)} cycled</span>
             </div>
             <div style={{ display: "flex", alignItems: "baseline", gap: 14, flexWrap: "wrap", marginBottom: 14 }}>
-              <span className="hero-num" style={{ fontSize: 52, color: totalPnl >= 0 ? "var(--green)" : "var(--red)" }}>
+              <span className="hero-num mono" style={{
+                fontSize: 52, fontWeight: 700,
+                color: totalPnl >= 0 ? "var(--green)" : "var(--red)",
+                textShadow: totalPnl >= 0 ? "var(--glow-green)" : "var(--glow-red)",
+              }}>
                 {totalPnl >= 0 ? "+" : "−"}{fmtUSD(Math.abs(totalPnl))}
               </span>
               {openTrade && spot && (

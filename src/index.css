@@ -51,28 +51,35 @@
 
 /* ── Terminal theme variables (always-dark trading terminal) ── */
 :root {
-  --bg:        #0a0b0d;
-  --bg-1:      #0f1114;
-  --bg-2:      #14171b;
-  --bg-3:      #1a1e23;
-  --t-border:  #1f2429;
-  --border-2:  #2a3036;
-  --text:      #e7ecf1;
-  --text-2:    #a7afba;
-  --text-3:    #6c747f;
-  --text-4:    #454c55;
-  --green:     #4ade80;
+  --bg:        #080909;
+  --bg-1:      #0d0f11;
+  --bg-2:      #111418;
+  --bg-3:      #181c21;
+  --t-border:  #1c2128;
+  --border-2:  #252d36;
+  --text:      #e2e8f0;
+  --text-2:    #94a3b8;
+  --text-3:    #5a6578;
+  --text-4:    #3a424e;
+  --green:     #39ff8f;
   --green-2:   #22c55e;
-  --green-bg:  rgba(74, 222, 128, 0.08);
-  --red:       #f87171;
+  --green-bg:  rgba(57, 255, 143, 0.07);
+  --red:       #ff5f6d;
   --red-2:     #ef4444;
-  --red-bg:    rgba(248, 113, 113, 0.08);
+  --red-bg:    rgba(255, 95, 109, 0.07);
   --amber:     #fbbf24;
-  --amber-bg:  rgba(251, 191, 36, 0.08);
-  --blue:      #60a5fa;
-  --blue-bg:   rgba(96, 165, 250, 0.08);
-  --grid-line: rgba(255, 255, 255, 0.035);
-  --t-shadow:  0 1px 2px rgba(0,0,0,.5), 0 4px 16px rgba(0,0,0,.4);
+  --amber-bg:  rgba(251, 191, 36, 0.07);
+  --blue:      #38bdf8;
+  --blue-bg:   rgba(56, 189, 248, 0.07);
+  --cyan:      #00e5ff;
+  --cyan-2:    #00b8d9;
+  --cyan-bg:   rgba(0, 229, 255, 0.06);
+  --grid-line: rgba(0, 229, 255, 0.028);
+  --t-shadow:  0 1px 2px rgba(0,0,0,.6), 0 4px 20px rgba(0,0,0,.5);
+  --glow-green: 0 0 8px rgba(57,255,143,0.5), 0 0 24px rgba(57,255,143,0.2);
+  --glow-red:   0 0 8px rgba(255,95,109,0.5), 0 0 24px rgba(255,95,109,0.2);
+  --glow-cyan:  0 0 8px rgba(0,229,255,0.5), 0 0 24px rgba(0,229,255,0.2);
+  --panel-shadow: 0 2px 12px rgba(0,0,0,.6), 0 0 0 1px rgba(255,255,255,0.04) inset;
 }
 
 /* ── Utility: mono font ── */
@@ -142,11 +149,31 @@
   background-position: -1px -1px;
 }
 
+/* ── Scanline overlay for HUD feel ── */
+.app-grid::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0,0,0,0.04) 2px,
+    rgba(0,0,0,0.04) 4px
+  );
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ── Pill enhancements ── */
+.pill-cyan { background: var(--cyan-bg); color: var(--cyan); border: 1px solid rgba(0,229,255,0.2); }
+
 /* ── Panel base ── */
 .t-panel {
   background: var(--bg-1);
   border: 1px solid var(--t-border);
   border-radius: 10px;
+  box-shadow: var(--panel-shadow);
 }
 .t-panel-hd {
   display: flex;
@@ -155,6 +182,40 @@
   padding: 10px 14px;
   border-bottom: 1px solid var(--t-border);
 }
+
+/* ── HUD panel — Tony Stark corner-bracket card ── */
+.hud-panel {
+  position: relative;
+  background: linear-gradient(135deg, rgba(0,229,255,0.03) 0%, rgba(0,0,0,0) 60%);
+  border: 1px solid rgba(0,229,255,0.12);
+  border-radius: 10px;
+  box-shadow: 0 0 0 1px rgba(0,229,255,0.06), var(--panel-shadow);
+}
+.hud-panel::before, .hud-panel::after {
+  content: '';
+  position: absolute;
+  width: 14px;
+  height: 14px;
+}
+.hud-panel::before {
+  top: -1px; left: -1px;
+  border-top: 2px solid var(--cyan);
+  border-left: 2px solid var(--cyan);
+  border-radius: 10px 0 0 0;
+  opacity: 0.7;
+}
+.hud-panel::after {
+  bottom: -1px; right: -1px;
+  border-bottom: 2px solid var(--cyan);
+  border-right: 2px solid var(--cyan);
+  border-radius: 0 0 10px 0;
+  opacity: 0.7;
+}
+
+/* ── Glow text utilities ── */
+.glow-green { color: var(--green); text-shadow: var(--glow-green); }
+.glow-red   { color: var(--red);   text-shadow: var(--glow-red);   }
+.glow-cyan  { color: var(--cyan);  text-shadow: var(--glow-cyan);  }
 
 /* ── Buttons ── */
 .t-btn {
