@@ -270,7 +270,6 @@ export default function Settings() {
   }
 
   const pct = (v: number) => v === 0 ? "Off" : `${v}%`;
-  const usd = (v: number) => `$${v}`;
 
   return (
     <div className="min-h-screen bg-background">
@@ -393,19 +392,14 @@ export default function Settings() {
             onChange={(v) => set("entry_score_threshold")(v)}
           />
 
-          <details className="rounded-lg border border-border/50 bg-muted/20 p-3">
-            <summary className="cursor-pointer text-xs font-medium text-muted-foreground">RSI sell threshold (advanced)</summary>
-            <div className="mt-4">
-              <SliderField
-                label="RSI sell threshold"
-                hint="Sell signal fires when RSI rises above this after a buy. Higher = holds longer for bigger moves."
-                value={form.rsi_sell_threshold}
-                min={50} max={85} step={1}
-                format={(v) => `RSI > ${v}`}
-                onChange={(v) => set("rsi_sell_threshold")(v)}
-              />
-            </div>
-          </details>
+          <SliderField
+            label="RSI sell threshold"
+            hint="Sell signal fires when RSI rises above this after a buy. Higher = holds longer for bigger moves. Checked on every price tick so it exits promptly."
+            value={form.rsi_sell_threshold}
+            min={50} max={85} step={1}
+            format={(v) => `RSI > ${v}`}
+            onChange={(v) => set("rsi_sell_threshold")(v)}
+          />
         </SectionCard>
 
         {/* Exit Strategy */}

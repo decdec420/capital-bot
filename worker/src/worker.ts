@@ -75,11 +75,13 @@ interface UserState {
   openTrade:        OpenTrade | null;
   credentials:      Credentials | null; // null = paper mode or not yet loaded
   lastEntryCheckMs: number;             // debounce: last time tick-entry was evaluated
+  lastSellCheckMs:  number;             // debounce: last time tick-sell was evaluated
   lastDecision:     import("./trade-decision.ts").TradeDecision | null; // saved for lesson generation at close
   entryDecisionSnapshot: { score: number; reasons: string[]; rsi: number; price: number } | null;
 }
 
 const TICK_ENTRY_DEBOUNCE_MS = 60_000; // max one tick-level entry check per minute per user
+const TICK_SELL_DEBOUNCE_MS  = 60_000; // max one tick-level sell check per minute per user
 
 const symbolStates = new Map<string, SymbolState>();
 const userStates   = new Map<string, UserState>();
@@ -153,7 +155,7 @@ async function reloadSettings(): Promise<void> {
             console.warn(`[settings] no creds for ${s.user_id}:`, e instanceof Error ? e.message : String(e));
           }
         }
-        userStates.set(s.user_id, { settings: s, openTrade, credentials: creds, lastEntryCheckMs: 0, lastDecision: null, entryDecisionSnapshot: null });
+        userStates.set(s.user_id, { settings: s, openTrade, credentials: creds, lastEntryCheckMs: 0, lastSellCheckMs: 0, lastDecision: null, entryDecisionSnapshot: null });
         console.log(`[settings] loaded user ${s.user_id} — openTrade=${openTrade?.id ?? "none"}`);
       } else {
         // Update settings, preserve openTrade and credentials
@@ -546,6 +548,80 @@ async function checkTickEntry(userId: string, state: UserState, symState: Symbol
   }
 }
 
+// ── Tick-level exit: fire a sell without waiting for candle close ─────────────
+// Mirrors checkTickEntry. Runs on every price tick when RSI is above sell
+// threshold and a position is open. Debounced to once per minute so a single
+// noisy tick burst doesn't hammer the exchange API.
+
+async function checkTickSell(userId: string, state: UserState, symState: SymbolState): Promise<void> {
+  const { settings, openTrade } = state;
+
+  if (!settings.enabled) return;
+  if (!openTrade) return; // no position to close
+
+  const { lastRsi, currentPrice } = symState;
+
+  // Pre-check: RSI must be above sell threshold (caller already checks, but guard anyway)
+  if (lastRsi <= settings.rsi_sell_threshold) return;
+
+  // Debounce: mark immediately so concurrent ticks don't both pass
+  const now = Date.now();
+  if (now - state.lastSellCheckMs < TICK_SELL_DEBOUNCE_MS) return;
+  state.lastSellCheckMs = now;
+
+  console.log(`[tick-sell] ${userId} SELL on tick — RSI=${lastRsi.toFixed(2)} > ${settings.rsi_sell_threshold} @ $${currentPrice.toFixed(2)}`);
+
+  const entry      = openTrade.entry_price;
+  const pnlPct     = ((currentPrice - entry) / entry) * 100;
+  const holdMinutes = Math.round((now - new Date(openTrade.created_at ?? now).getTime()) / 60_000);
+
+  try {
+    if (!settings.live_trading) {
+      const pnl = (currentPrice - entry) * openTrade.size;
+      const notes = generateTradeLesson({
+        symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? lastRsi, entryPrice: entry,
+        exitPrice: currentPrice, pnlPct, effectivePnl: pnl,
+        closeReason: "rsi_signal", holdMinutes, entrySnapshot: state.entryDecisionSnapshot, isLive: false,
+      });
+      await closeTrade(openTrade.id, {
+        exit_price: currentPrice, exit_fees_usd: 0, pnl_usd: pnl, pnl_pct: pnlPct,
+        effective_pnl: pnl, close_reason: "rsi_signal", notes,
+      });
+      if (settings.compound_mode) {
+        const newBalance = settings.paper_balance_usd + pnl;
+        await updatePaperBalance(userId, newBalance);
+        settings.paper_balance_usd = Math.max(0, newBalance);
+        console.log(`[compound] balance updated: $${newBalance.toFixed(2)} (${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)})`);
+      }
+      await sendTelegram(fmtSell(settings.symbol, lastRsi, currentPrice, entry, pnl, pnlPct, false, "RSI tick sell"));
+      await logTick(userId, settings.symbol, lastRsi, currentPrice, "sell", `PAPER TICK SELL — RSI ${lastRsi.toFixed(1)} > ${settings.rsi_sell_threshold}`);
+    } else {
+      if (!state.credentials) throw new Error("live mode but no credentials");
+      const fill = await placeMarketSell(state.credentials, settings.symbol, openTrade.size.toFixed(8), `${openTrade.id}-tick-sell`);
+      const realPnl    = (fill.fillPrice - entry) * fill.filledBaseSize;
+      const realPnlPct = ((fill.fillPrice - entry) / entry) * 100;
+      const netPnl     = realPnl - openTrade.entry_fees_usd - fill.feesUsd;
+      const notes = generateTradeLesson({
+        symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? lastRsi, entryPrice: entry,
+        exitPrice: fill.fillPrice, pnlPct: realPnlPct, effectivePnl: netPnl,
+        closeReason: "rsi_signal", holdMinutes, entrySnapshot: state.entryDecisionSnapshot, isLive: true,
+      });
+      await closeTrade(openTrade.id, {
+        exit_price: fill.fillPrice, exit_fees_usd: fill.feesUsd,
+        pnl_usd: realPnl, pnl_pct: realPnlPct, effective_pnl: netPnl,
+        close_reason: "rsi_signal", close_order_id: fill.orderId, notes,
+      });
+      await sendTelegram(fmtSell(settings.symbol, lastRsi, fill.fillPrice, entry, realPnl, realPnlPct, true, "RSI tick sell"));
+      await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "sell", `LIVE TICK SELL — RSI ${lastRsi.toFixed(1)} filled @ $${fill.fillPrice.toFixed(2)}`);
+    }
+    state.openTrade = null;
+    state.entryDecisionSnapshot = null;
+  } catch (e) {
+    console.error(`[tick-sell] sell failed for ${userId}:`, e instanceof Error ? e.message : String(e));
+    state.lastSellCheckMs = 0; // reset debounce so it retries next tick
+  }
+}
+
 // ── RSI signals: checked on candle close ──────────────────
 
 async function checkSignals(userId: string, state: UserState, symState: SymbolState, closedCandle: Candle): Promise<void> {
@@ -713,14 +789,19 @@ async function _onTradeInner(symbol: string, price: number, size: number, tickMs
   symState.lastTickMs = Date.now();
   const closedCandle = symState.builder.addTick(price, size, tickMs);
 
-  // Every tick: check risk exits for all users on this symbol
+  // Every tick: check risk exits + tick-level RSI sell for users with an open position
   for (const [userId, userState] of userStates) {
     if (userState.settings.symbol !== symbol) continue;
     if (!userState.openTrade) continue;
-    if (userInFlight.has(userId)) continue; // already processing a signal for this user
+    if (userInFlight.has(userId)) continue;
     userInFlight.add(userId);
     try {
-      await checkRiskExits(userId, userState, price, symState.lastRsi);
+      // Hard price-based exits (stop-loss, trailing stop, take-profit) — always checked
+      const exited = await checkRiskExits(userId, userState, price, symState.lastRsi);
+      // Tick-level RSI sell — only if risk exits didn't already close the position
+      if (!exited && symState.lastRsi > userState.settings.rsi_sell_threshold) {
+        await checkTickSell(userId, userState, symState);
+      }
     } finally {
       userInFlight.delete(userId);
     }
