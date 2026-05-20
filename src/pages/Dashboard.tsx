@@ -868,13 +868,13 @@ function PositionPanel({
     const hasBackendDecision = Boolean(latestTick);
 
     function EmptyList({ label }: { label: string }) {
-      return <span className="dim">No {label} reported by backend</span>;
+      return <span className="dim">{label === "blockers" ? "None — all gates clear" : "None yet — waiting on signal data"}</span>;
     }
 
     return (
       <div className="t-panel" style={{ padding: 16 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 12 }}>
-          <span className="kicker">NO POSITION</span>
+          <span className="kicker">CASH · READY</span>
           <span className={`pill ${decisionPillClass(decisionState)}`}>{decisionState}</span>
         </div>
 
@@ -885,13 +885,13 @@ function PositionPanel({
             </svg>
           </div>
           <div>
-            <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>Waiting for backend decision</div>
-            <div className="mono dim" style={{ fontSize: 11 }}>Signal details come from tick status when available</div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>Scanning for the next entry</div>
+            <div className="mono dim" style={{ fontSize: 11 }}>Live ticks feed the decision engine continuously</div>
           </div>
         </div>
 
         <div style={{ background: "var(--bg-2)", borderRadius: 7, padding: 12 }}>
-          <div className="kicker" style={{ marginBottom: 8 }}>ENTRY STATUS</div>
+          <div className="kicker" style={{ marginBottom: 8 }}>SIGNAL STATUS</div>
           <div className="mono" style={{ fontSize: 12, lineHeight: 1.65, color: "var(--text-2)" }}>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px 12px", marginBottom: 10 }}>
               <div>
@@ -899,34 +899,34 @@ function PositionPanel({
                 <div style={{ color: "var(--text)", fontWeight: 600 }}>{rsiText}</div>
               </div>
               <div>
-                <div className="dim" style={{ fontSize: 10 }}>Trade score</div>
+                <div className="dim" style={{ fontSize: 10 }}>Entry score</div>
                 <div style={{ color: tradeScore === "—" ? "var(--text-3)" : "var(--text)", fontWeight: 600 }}>{tradeScore}</div>
               </div>
             </div>
 
             <div style={{ marginBottom: 8 }}>
-              <span className="dim">RSI interpretation: </span>
+              <span className="dim">Signal: </span>
               <span style={{ color: "var(--text)" }}>{rsiInterpretation}</span>
             </div>
 
             <div style={{ marginBottom: 8 }}>
-              <div className="dim" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.05em" }}>Top reasons</div>
+              <div className="dim" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.05em" }}>Favoring entry</div>
               {topReasons.length ? topReasons.map((reason) => <div key={reason}>• {reason}</div>) : <EmptyList label="reasons" />}
             </div>
 
             <div style={{ marginBottom: 8 }}>
-              <div className="dim" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.05em" }}>Top blockers</div>
+              <div className="dim" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.05em" }}>Blocking entry</div>
               {topBlockers.length ? topBlockers.map((blocker) => <div key={blocker}>• {blocker}</div>) : <EmptyList label="blockers" />}
             </div>
 
             <div>
-              <span className="dim">Next likely trigger: </span>
+              <span className="dim">Next trigger: </span>
               <span style={{ color: "var(--text)" }}>{nextTrigger}</span>
             </div>
 
             {!hasBackendDecision && (
               <div className="dim" style={{ marginTop: 8, fontSize: 10.5 }}>
-                No tick data yet — worker will populate this on the next 5-minute candle close.
+                Waiting on first candle close — signals update every 5 minutes.
               </div>
             )}
           </div>
@@ -958,9 +958,9 @@ function PositionPanel({
   return (
     <div className="t-panel" style={{ padding: 16 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
-        <span className="kicker">OPEN POSITION</span>
-        <button className="t-btn t-btn-danger" onClick={() => { if (confirm("Close this position now?")) onClose(); }} disabled={closing} style={{ height: 26, padding: "0 10px", fontSize: 11 }}>
-          {closing ? "Closing…" : "Close now"}
+        <span className="kicker">ACTIVE TRADE</span>
+        <button className="t-btn t-btn-danger" onClick={() => { if (confirm("Force-close this position now?")) onClose(); }} disabled={closing} style={{ height: 26, padding: "0 10px", fontSize: 11 }}>
+          {closing ? "Closing…" : "Force close"}
         </button>
       </div>
 
@@ -974,7 +974,7 @@ function PositionPanel({
         </span>
       </div>
       <div className="mono dim" style={{ fontSize: 10.5, marginBottom: 14 }}>
-        unrealized · {fmtRelTime(openTrade.created_at)}
+        floating P&L · {fmtRelTime(openTrade.created_at)} in trade
       </div>
 
       {/* Progress bar: stop → entry → spot → target */}
@@ -1001,15 +1001,15 @@ function PositionPanel({
 
       {/* Grid of details */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px 16px" }}>
-        <DataRow label="Entry"       value={fmtUSD(entry)} />
-        <DataRow label="Current"     value={fmtUSD(cur)} />
-        <DataRow label="Size"        value={Number(openTrade.size).toFixed(8) + " BTC"} />
-        <DataRow label="Invested"    value={fmtUSD(openTrade.quote_size)} />
-        <DataRow label="RSI @ entry" value={openTrade.rsi_at_entry?.toFixed(1) ?? "—"} />
-        <DataRow label="Peak high"   value={fmtUSD(tHigh)} />
-        {slPrice && <DataRow label="Stop-loss"   value={fmtUSD(slPrice)} color="var(--red)" />}
-        {tpPrice && <DataRow label="Take-profit" value={fmtUSD(tpPrice)} color="var(--green)" />}
-        {tsPrice && <DataRow label="Trail stop"  value={fmtUSD(tsPrice)} color="var(--amber)" />}
+        <DataRow label="Entry price"    value={fmtUSD(entry)} />
+        <DataRow label="Now"            value={fmtUSD(cur)} />
+        <DataRow label="Size"           value={Number(openTrade.size).toFixed(8) + " BTC"} />
+        <DataRow label="Deployed"       value={fmtUSD(openTrade.quote_size)} />
+        <DataRow label="RSI at entry"   value={openTrade.rsi_at_entry?.toFixed(1) ?? "—"} />
+        <DataRow label="High water"     value={fmtUSD(tHigh)} />
+        {slPrice && <DataRow label="Stop loss"     value={fmtUSD(slPrice)} color="var(--red)" />}
+        {tpPrice && <DataRow label="Take profit"   value={fmtUSD(tpPrice)} color="var(--green)" />}
+        {tsPrice && <DataRow label="Trailing stop" value={fmtUSD(tsPrice)} color="var(--amber)" />}
       </div>
     </div>
   );
@@ -1066,8 +1066,8 @@ function humanizeBlocker(b: string): string {
 }
 
 function humanizeAction(action: string, reason: string): string {
-  if (action === "buy")          return "Bought";
-  if (action === "sell")         return "Sold";
+  if (action === "buy")          return "Entered";
+  if (action === "sell")         return "Exited";
   if (action === "RISK_BLOCKED") return "Blocked";
   const r = reason ?? "";
   if (r.includes("holding"))     return "Holding";
@@ -1076,7 +1076,7 @@ function humanizeAction(action: string, reason: string): string {
     if (header.startsWith("tick-check")) return "Checking";
     return "Evaluating";
   }
-  return "Watching";
+  return "Scanning";
 }
 
 function factorInfo(label: string): { label: string; blurb: string } {
@@ -1108,8 +1108,8 @@ function parseReason(action: string, reason: string): ParsedReason {
     const rsiMatch = r.match(/RSI ([\d.]+)/);
     const isPaper = r.includes("PAPER");
     return {
-      headline: isPaper ? "Paper trade placed" : "Live trade placed",
-      detail: `Bot bought when RSI hit ${rsiMatch?.[1] ?? "oversold"} — right in the buy zone you set. ${isPaper ? "This is a paper trade, so no real money moved." : "A real market buy order was sent to Coinbase and confirmed."}`,
+      headline: isPaper ? "Simulated entry — trigger pulled" : "Entry confirmed — capital deployed",
+      detail: `RSI hit ${rsiMatch?.[1] ?? "oversold"} and dropped into the buy zone. Bot fired the entry order. ${isPaper ? "Simulated trade — no real money on the line." : "Market buy sent to Coinbase and confirmed."}`,
       severity: "success", ...empty,
     };
   }
@@ -1118,13 +1118,13 @@ function parseReason(action: string, reason: string): ParsedReason {
     const pnlMatch = r.match(/P&L \$?([-\d.]+)/);
     const pnl = pnlMatch ? Number(pnlMatch[1]) : null;
     const exitType = r.includes("trailing") ? "trailing stop"
-      : r.includes("stop_loss") ? "stop-loss limit"
+      : r.includes("stop_loss") ? "stop-loss"
       : r.includes("take_profit") ? "take-profit target"
-      : "RSI sell signal";
+      : "RSI exit signal";
     const won = pnl != null && pnl >= 0;
     return {
-      headline: pnl == null ? "Position closed" : won ? "Closed for a profit 🟢" : "Closed at a loss 🔴",
-      detail: `Exit triggered by ${exitType}.${pnl != null ? ` Result: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}.` : ""} ${r.includes("PAPER") ? "Paper trade — no real money was involved." : "Fill confirmed on Coinbase."}`,
+      headline: pnl == null ? "Position closed" : won ? "Profit banked 🟢" : "Loss taken 🔴",
+      detail: `Closed via ${exitType}.${pnl != null ? ` P&L: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}.` : ""} ${r.includes("PAPER") ? "Simulated trade — no real capital moved." : "Fill confirmed on Coinbase."}`,
       severity: pnl == null ? "info" : won ? "success" : "warn", ...empty,
     };
   }
@@ -1132,16 +1132,16 @@ function parseReason(action: string, reason: string): ParsedReason {
   if (action === "RISK_BLOCKED" || r.startsWith("RISK_BLOCKED")) {
     const blocker = r.replace(/^RISK_BLOCKED:\s*/i, "").split(":")[0].trim();
     const msgs: Record<string, { headline: string; detail: string }> = {
-      bid_ask_unavailable:    { headline: "Couldn't check the spread", detail: "Bot checks the gap between the buy and sell price before every trade, but Coinbase didn't respond. The buy was skipped to be safe. Usually fixes itself on the next tick." },
-      unacceptable_spread:    { headline: "Spread too wide — skipped", detail: "The difference between what you'd pay to buy vs. what you'd get if you sold immediately was larger than your Max Spread setting. Entering now would mean you're already down before the trade even starts." },
-      high_volatility_spike:  { headline: "Too choppy right now — skipped", detail: "The last 5-minute candle had a huge price swing. Buying into chaos like that gives your stop-loss a much higher chance of getting triggered right away." },
-      daily_loss_limit:       { headline: "Daily loss limit hit", detail: "The bot's losses today have reached the limit you set. No more buys until midnight UTC, when the counter resets. You can adjust the limit in Settings → Risk Gates." },
-      max_drawdown:           { headline: "Max drawdown limit hit", detail: "Total portfolio drawdown across all your trades has hit the ceiling you set. The bot is protecting what's left. You can raise or turn this off in Settings → Risk Gates." },
-      existing_open_position: { headline: "Already in a trade", detail: "The bot only holds one position at a time. There's an open trade right now — a new buy will be considered once it closes." },
-      stale_market_data:      { headline: "Price data went stale", detail: "The bot hasn't received a live price tick in over 2 minutes. Rather than act on stale data, it paused entries. Usually self-resolves when the WebSocket reconnects." },
-      missing_candles:        { headline: "Still warming up", detail: "Not enough price history has been collected yet to reliably compute signals. This clears automatically after the first few 5-minute candles close." },
+      bid_ask_unavailable:    { headline: "Spread check failed — held off", detail: "Bot checks the gap between bid and ask before every entry. Coinbase didn't return the data in time, so the buy was skipped. Self-resolves on the next tick." },
+      unacceptable_spread:    { headline: "Spread too wide — standing down", detail: "The gap between what you'd pay to buy vs. what you'd get selling immediately exceeded your Max Spread limit. Entering now means starting in the red before price even moves." },
+      high_volatility_spike:  { headline: "Market too choppy — held off", detail: "The last 5-minute candle swung hard. Trading into that kind of volatility puts your stop-loss at high risk of an instant trigger. Waiting for calmer conditions." },
+      daily_loss_limit:       { headline: "Daily loss limit reached", detail: "Losses today hit the ceiling you set. Buys are paused until midnight UTC when the counter resets. Adjust the limit in Settings → Risk Gates." },
+      max_drawdown:           { headline: "Max drawdown limit hit", detail: "Total portfolio drawdown hit the cap you set. Bot is protecting what's left. Raise or disable this in Settings → Risk Gates." },
+      existing_open_position: { headline: "Already in a trade — one at a time", detail: "Bot holds one position at a time. Current trade stays open until it hits an exit signal — then the hunt for the next entry begins." },
+      stale_market_data:      { headline: "Price feed went stale — paused", detail: "No live tick received in over 2 minutes. Bot won't act on stale data. Reconnects automatically when the WebSocket comes back." },
+      missing_candles:        { headline: "Warming up — not enough history yet", detail: "Not enough 5-minute candles have closed to compute reliable signals. Clears automatically after the first few candles come in." },
     };
-    const found = msgs[blocker] ?? { headline: "Buy blocked by a safety rule", detail: `The bot hit a risk gate before placing the order. Gate ID: "${blocker}"` };
+    const found = msgs[blocker] ?? { headline: "Entry blocked by risk gate", detail: `A safety rule blocked the order before it fired. Gate: "${blocker}"` };
     return { ...found, severity: "error", ...empty };
   }
 
@@ -1160,15 +1160,15 @@ function parseReason(action: string, reason: string): ParsedReason {
 
     let detail: string;
     if (blockerList.length > 0) {
-      detail = `RSI is at ${rsiMatch?.[1] ?? "—"} — in the buy zone. But the bot hit a roadblock before it could enter. See "Why it can't buy yet" below.`;
+      detail = `RSI at ${rsiMatch?.[1] ?? "—"} — in the zone, but a risk gate blocked the entry. Check "Entry blockers" below.`;
     } else if (scoreNum === 0) {
-      detail = `RSI is at ${rsiMatch?.[1] ?? "—"} — in the buy zone, but the market doesn't look ready. None of the extra quality checks are passing right now.`;
+      detail = `RSI hit ${rsiMatch?.[1] ?? "—"} and entered the buy zone, but none of the quality checks are green yet. Holding off for a cleaner setup.`;
     } else {
-      detail = `RSI is at ${rsiMatch?.[1] ?? "—"} — in the buy zone. The setup is scoring ${scoreNum} out of ${maxScore} points. ${isTick ? "Bot rechecks every minute while RSI stays in range." : "It needs enough points to clear your Entry Quality setting before placing a buy."}`;
+      detail = `RSI at ${rsiMatch?.[1] ?? "—"} — in the zone. Setup scoring ${scoreNum} of ${maxScore} points. ${isTick ? "Rechecking every minute while RSI holds in range." : "Needs enough points to clear your Entry Quality threshold before firing."}`;
     }
 
     return {
-      headline: isTick ? "RSI in range — sizing up the opportunity" : "Candle closed — sizing up the opportunity",
+      headline: isTick ? "RSI in the zone — running entry checks" : "Candle closed — evaluating the setup",
       detail,
       severity: blockerList.length ? "error" : "warn",
       factors, blockerList, scoreStr,
@@ -1178,8 +1178,8 @@ function parseReason(action: string, reason: string): ParsedReason {
   if (r.includes("holding")) {
     const rsiMatch = r.match(/RSI ([\d.]+)/);
     return {
-      headline: "Holding the position",
-      detail: `RSI is at ${rsiMatch?.[1] ?? "—"}, which hasn't reached your sell threshold yet. The bot is sitting tight and waiting for a cleaner exit signal.`,
+      headline: "In trade · holding for the exit signal",
+      detail: `RSI at ${rsiMatch?.[1] ?? "—"} — below your sell threshold. Position is open and running. Bot watches every tick for the exit.`,
       severity: "info", ...empty,
     };
   }
@@ -1187,13 +1187,13 @@ function parseReason(action: string, reason: string): ParsedReason {
   if (r.includes("waiting") || r.includes("watching") || action === "hold") {
     const rsiMatch = r.match(/RSI[ =]([\d.]+)/);
     return {
-      headline: "Watching and waiting",
-      detail: `RSI is at ${rsiMatch?.[1] ?? "—"} — above your buy threshold. Nothing to do yet. The bot will start evaluating a buy once RSI drops into the oversold range you've set.`,
+      headline: "RSI above buy zone — standing by",
+      detail: `RSI at ${rsiMatch?.[1] ?? "—"} — running too hot to enter. Waiting for it to cool into the oversold range before evaluating a buy.`,
       severity: "info", ...empty,
     };
   }
 
-  return { headline: "Monitoring", detail: r || "No additional details.", severity: "info", ...empty };
+  return { headline: "On watch", detail: r || "Monitoring market conditions.", severity: "info", ...empty };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1241,7 +1241,7 @@ function TickDetailPanel({ tick, parsed, severityColor }: { tick: TickLog; parse
       {scoredFactors.length > 0 && (
         <div style={{ marginBottom: 8 }}>
           <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 5 }}>
-            Signal quality checks
+            Entry scorecard
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             {scoredFactors.map((f, fi) => (
@@ -1266,7 +1266,7 @@ function TickDetailPanel({ tick, parsed, severityColor }: { tick: TickLog; parse
       {neutralFactors.length > 0 && (
         <div style={{ marginBottom: 8 }}>
           <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 5 }}>
-            Not yet available
+            Pending signals
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
             {neutralFactors.map((f, fi) => (
@@ -1283,7 +1283,7 @@ function TickDetailPanel({ tick, parsed, severityColor }: { tick: TickLog; parse
       {parsed.blockerList.length > 0 && (
         <div style={{ marginBottom: 6 }}>
           <div style={{ fontSize: 9, color: "var(--red)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 5 }}>
-            Why it can't buy yet
+            Entry blockers
           </div>
           {parsed.blockerList.map((b, bi) => (
             <div key={bi} style={{ display: "flex", alignItems: "flex-start", gap: 7, marginBottom: 4 }}>
@@ -1301,7 +1301,7 @@ function TickDetailPanel({ tick, parsed, severityColor }: { tick: TickLog; parse
             onClick={(e) => { e.stopPropagation(); setShowRaw(v => !v); }}
             style={{ fontSize: 9, color: "var(--text-4)", background: "none", border: "none", cursor: "pointer", padding: 0, textDecoration: "underline" }}
           >
-            {showRaw ? "hide raw log" : "show raw log"}
+            {showRaw ? "hide debug log" : "show debug log"}
           </button>
           {showRaw && (
             <div style={{ marginTop: 5, padding: "6px 8px", background: "var(--bg-3)", borderRadius: 4 }}>
@@ -1326,13 +1326,13 @@ function TickFeed({ ticks }: { ticks: TickLog[] }) {
   return (
     <div className="t-panel" style={{ display: "flex", flexDirection: "column", maxHeight: 340 }}>
       <div className="t-panel-hd">
-        <span className="kicker">LIVE FEED</span>
-        <span className="mono dim" style={{ fontSize: 10 }}>{ticks.length} events · tap for details</span>
+        <span className="kicker">SIGNAL FEED</span>
+        <span className="mono dim" style={{ fontSize: 10 }}>{ticks.length} events · expand any row</span>
       </div>
       <div style={{ overflowY: "auto", flex: 1 }}>
         {ticks.length === 0 ? (
           <div className="mono dim" style={{ padding: "16px 14px", fontSize: 11, textAlign: "center" }}>
-            no events yet…
+            standing by — first signal incoming…
           </div>
         ) : ticks.map((t, i) => {
           const isSelected = selectedId === t.id;
@@ -1429,7 +1429,7 @@ function fallbackNarrative(t: Trade): string {
     take_profit: "take-profit target", rsi_signal: "RSI sell signal", manual: "manual close",
   };
   const exit = exitLabels[t.close_reason ?? ""] ?? (t.close_reason ?? "exit");
-  return `Bot entered ${t.symbol} when RSI hit ${rsi}. Held for ${hold}, then exited via ${exit}. Result: ${win ? "+" : ""}$${Math.abs(pnl).toFixed(2)} (${fmtPct(t.pnl_pct)}).`;
+  return `Entered ${t.symbol} at RSI ${rsi}. ${hold} in the trade, closed via ${exit}. ${win ? "Banked" : "Took a loss of"} ${win ? "+" : ""}$${Math.abs(pnl).toFixed(2)} (${fmtPct(t.pnl_pct)}).`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1459,10 +1459,10 @@ function TradeCard({ trade, num }: { trade: Trade; num: number }) {
     if (win) {
       if (cr === "trailing_stop") whyPoints.push({ text: "Trailing stop locked in the gain", good: true });
       if (cr === "take_profit")   whyPoints.push({ text: "Hit the take-profit target", good: true });
-      if (cr === "rsi_signal")    whyPoints.push({ text: "RSI reached overbought — clean exit", good: true });
+      if (cr === "rsi_signal")    whyPoints.push({ text: "RSI peaked — clean exit signal fired", good: true });
     } else {
-      if (cr === "stop_loss")     whyPoints.push({ text: "Stop-loss triggered — price moved against the position", good: false });
-      if (cr === "trailing_stop") whyPoints.push({ text: "Trailing stop triggered on a reversal", good: false });
+      if (cr === "stop_loss")     whyPoints.push({ text: "Price hit the stop-loss — loss was cut", good: false });
+      if (cr === "trailing_stop") whyPoints.push({ text: "Trailing stop caught the reversal", good: false });
     }
   }
 
@@ -1487,7 +1487,7 @@ function TradeCard({ trade, num }: { trade: Trade; num: number }) {
               {closeReasonLabel(trade.close_reason)}
             </span>
             {lesson?.is_live === false && (
-              <span style={{ fontSize: 9, color: "var(--text-4)", fontFamily: "JetBrains Mono, monospace" }}>PAPER</span>
+              <span style={{ fontSize: 9, color: "var(--text-4)", fontFamily: "JetBrains Mono, monospace" }}>SIM</span>
             )}
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
@@ -1510,7 +1510,7 @@ function TradeCard({ trade, num }: { trade: Trade; num: number }) {
           {/* Price journey */}
           <div style={{ padding: "14px 14px 0", display: "flex", alignItems: "center", gap: 0 }}>
             <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3 }}>Entry</div>
+              <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3 }}>ENTRY</div>
               <div style={{ fontSize: 16, fontWeight: 700, color: "var(--text)" }}>{fmtUSD(trade.entry_price)}</div>
               <div style={{ fontSize: 10, color: "var(--text-3)", marginTop: 2 }}>RSI {trade.rsi_at_entry?.toFixed(1) ?? "—"} · {new Date(trade.created_at).toLocaleDateString("en-US", { month: "short", day: "numeric" })} {fmtTime(trade.created_at)}</div>
             </div>
@@ -1523,7 +1523,7 @@ function TradeCard({ trade, num }: { trade: Trade; num: number }) {
               <div style={{ fontSize: 10, color: accent, marginTop: 2 }}>{fmtPct(pnlPct)}</div>
             </div>
             <div style={{ flex: 1, textAlign: "right" }}>
-              <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3 }}>Exit</div>
+              <div style={{ fontSize: 9, color: "var(--text-4)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3 }}>EXIT</div>
               <div style={{ fontSize: 16, fontWeight: 700, color: "var(--text)" }}>{fmtUSD(trade.exit_price)}</div>
               <div style={{ fontSize: 10, color: "var(--text-3)", marginTop: 2 }}>{closeReasonLabel(trade.close_reason)} · {fmtTime(trade.closed_at)}</div>
             </div>
@@ -1543,7 +1543,7 @@ function TradeCard({ trade, num }: { trade: Trade; num: number }) {
           {whyPoints.length > 0 && (
             <div style={{ padding: "0 14px 12px" }}>
               <div style={{ fontSize: 9, color: accent, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>
-                {win ? "Why it worked" : "What went against it"}
+                {win ? "Why it worked" : "What worked against it"}
               </div>
               {whyPoints.map((p, i) => (
                 <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 7, marginBottom: 4 }}>
@@ -1560,7 +1560,7 @@ function TradeCard({ trade, num }: { trade: Trade; num: number }) {
           {lesson?.lesson && (
             <div style={{ margin: "0 14px 12px", padding: "9px 11px", background: `${accent}11`, borderLeft: `2px solid ${accent}`, borderRadius: "0 4px 4px 0" }}>
               <div style={{ fontSize: 9, color: accent, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 4 }}>
-                {win ? "What the bot learned" : "What the bot learned"}
+                Bot debrief
               </div>
               <div style={{ fontSize: 10.5, color: "var(--text-2)", lineHeight: 1.55 }}>{lesson.lesson}</div>
             </div>
@@ -1569,11 +1569,11 @@ function TradeCard({ trade, num }: { trade: Trade; num: number }) {
           {/* Stats grid */}
           <div style={{ margin: "0 14px 14px", display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "8px 12px" }}>
             {[
-              { label: "Invested",   value: fmtUSD(trade.quote_size) },
+              { label: "Deployed",   value: fmtUSD(trade.quote_size) },
               { label: "Size",       value: trade.size != null ? `${Number(trade.size).toFixed(6)} BTC` : "—" },
-              { label: "Hold time",  value: fmtDuration(trade.created_at, trade.closed_at) },
-              { label: "Entry fee",  value: trade.entry_fees_usd != null ? fmtUSD(trade.entry_fees_usd) : "—" },
-              { label: "RSI in",     value: trade.rsi_at_entry?.toFixed(1) ?? "—" },
+              { label: "Duration",   value: fmtDuration(trade.created_at, trade.closed_at) },
+              { label: "Fees in",    value: trade.entry_fees_usd != null ? fmtUSD(trade.entry_fees_usd) : "—" },
+              { label: "RSI entry",  value: trade.rsi_at_entry?.toFixed(1) ?? "—" },
               { label: "Score",      value: lesson?.entry_score != null ? `${lesson.entry_score}/12` : "—" },
             ].map(({ label, value }) => (
               <div key={label}>
@@ -1596,7 +1596,7 @@ function TradeHistory({ trades }: { trades: Trade[] }) {
   if (!trades.length) {
     return (
       <div className="t-panel" style={{ padding: 18, textAlign: "center" }}>
-        <span className="mono dim" style={{ fontSize: 11 }}>no closed trades yet · watching for first RSI signal</span>
+        <span className="mono dim" style={{ fontSize: 11 }}>no closed trades yet — bot is scanning for the first entry signal</span>
       </div>
     );
   }
@@ -1625,7 +1625,7 @@ function TradeHistory({ trades }: { trades: Trade[] }) {
       {trades.length > PAGE && (
         <div style={{ borderTop: "1px solid var(--t-border)", padding: "10px 14px", textAlign: "center" }}>
           <button className="t-btn" onClick={() => setShowAll(s => !s)} style={{ fontSize: 11 }}>
-            {showAll ? "Show less" : `Show ${trades.length - PAGE} more trade${trades.length - PAGE !== 1 ? "s" : ""}`}
+            {showAll ? "Collapse" : `Show ${trades.length - PAGE} more`}
           </button>
         </div>
       )}
@@ -1738,9 +1738,9 @@ export default function Dashboard() {
   // Bot state label
   const buyT = settings?.rsi_buy_threshold ?? 25;
   const sellT = settings?.rsi_sell_threshold ?? 75;
-  const stateLabel = openTrade ? "IN POSITION"
-    : currentRSI != null && currentRSI < buyT ? "BUYING SOON"
-    : "WATCHING";
+  const stateLabel = openTrade ? "IN TRADE"
+    : currentRSI != null && currentRSI < buyT ? "ENTRY READY"
+    : "SCANNING";
   const statePill = openTrade ? "pill-amber"
     : currentRSI != null && currentRSI < buyT ? "pill-green"
     : "pill-muted";
@@ -1803,22 +1803,22 @@ export default function Dashboard() {
           <span style={{ height: 14, width: 1, background: "var(--t-border)" }} />
           <span className={`pill ${settings?.live_trading ? "pill-red" : "pill-amber"}`}>
             <span className="dot dot-amber" style={{ width: 5, height: 5 }} />
-            {settings?.live_trading ? "LIVE" : "PAPER"}
+            {settings?.live_trading ? "LIVE" : "SIM"}
           </span>
           {settings?.enabled && (
             <span className="pill pill-green">
-              <span className="dot dot-green" style={{ width: 5, height: 5 }} /> BOT ON
+              <span className="dot dot-green" style={{ width: 5, height: 5 }} /> ARMED
             </span>
           )}
           {!settings?.enabled && (
-            <span className="pill pill-muted">BOT OFF</span>
+            <span className="pill pill-muted">OFFLINE</span>
           )}
           <span className={`pill ${statePill}`}>{stateLabel}</span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <span className="mono dim" style={{ fontSize: 11, marginRight: 4 }}>
             {new Date(now).toLocaleTimeString("en-US", { hour12: false })}
-            {lastUpdate ? ` · synced ${Math.floor((now - lastUpdate) / 1000)}s` : " · connecting"}
+            {lastUpdate ? ` · live ${Math.floor((now - lastUpdate) / 1000)}s` : " · linking up"}
           </span>
           <button className="t-btn" onClick={handleRefresh} title="Sync DB data">
             <RefreshCw size={11} /> Sync
@@ -1859,10 +1859,10 @@ export default function Dashboard() {
                   borderBottom: "2px solid var(--cyan)", borderLeft: "2px solid var(--cyan)",
                   borderRadius: "0 0 0 10px", opacity: 0.7, pointerEvents: "none" }} />
                 {[
-                  { label: "COMPOUND BALANCE", value: `$${balance.toFixed(2)}`, sub: `started at $${seed.toFixed(2)}`, color: balance >= seed ? "var(--green)" : "var(--red)", glow: balance >= seed },
-                  { label: "GROWTH", value: `${growth >= 0 ? "+" : ""}${growth.toFixed(1)}%`, sub: "vs seed capital", color: growth >= 0 ? "var(--green)" : "var(--red)", glow: growth >= 0 },
-                  { label: "NEXT ORDER SIZE", value: `$${nextOrder.toFixed(2)}`, sub: `${deployPct}% of balance (tier)`, color: "var(--cyan)", glow: true },
-                  { label: "PROJECTION", value: tradesTo100 != null ? `~${tradesTo100}` : "—", sub: tradesTo100 != null ? "trades to $100" : "growing…", color: "var(--text-2)", glow: false },
+                  { label: "RUNNING BALANCE", value: `$${balance.toFixed(2)}`, sub: `seed $${seed.toFixed(2)}`, color: balance >= seed ? "var(--green)" : "var(--red)", glow: balance >= seed },
+                  { label: "RETURN", value: `${growth >= 0 ? "+" : ""}${growth.toFixed(1)}%`, sub: "since seed capital", color: growth >= 0 ? "var(--green)" : "var(--red)", glow: growth >= 0 },
+                  { label: "NEXT STAKE", value: `$${nextOrder.toFixed(2)}`, sub: `${deployPct}% of balance · tiered`, color: "var(--cyan)", glow: true },
+                  { label: "RACES TO $100", value: tradesTo100 != null ? `~${tradesTo100}` : "—", sub: tradesTo100 != null ? "est. trades remaining" : "compounding…", color: "var(--text-2)", glow: false },
                 ].map(({ label, value, sub, color, glow }, idx) => (
                   <div key={label} style={{
                     padding: "14px 18px",
@@ -1887,8 +1887,8 @@ export default function Dashboard() {
           {/* P&L Hero */}
           <div className="t-panel" style={{ padding: "18px 22px" }}>
             <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 8 }}>
-              <span className="kicker">REALIZED P&L · ALL TIME</span>
-              <span className="mono dim" style={{ fontSize: 10.5 }}>{closedTrades.length} trades · {fmtUSD(totalInvested, 0)} cycled</span>
+              <span className="kicker">ALL-TIME P&L</span>
+              <span className="mono dim" style={{ fontSize: 10.5 }}>{closedTrades.length} trades closed · {fmtUSD(totalInvested, 0)} deployed</span>
             </div>
             <div style={{ display: "flex", alignItems: "baseline", gap: 14, flexWrap: "wrap", marginBottom: 14 }}>
               <span className="hero-num mono" style={{
@@ -1900,7 +1900,7 @@ export default function Dashboard() {
               </span>
               {openTrade && spot && (
                 <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                  <span className="kicker" style={{ fontSize: 9 }}>UNREALIZED</span>
+                  <span className="kicker" style={{ fontSize: 9 }}>LIVE P&L</span>
                   <span className="mono" style={{ fontSize: 15, color: (spot - Number(openTrade.entry_price)) >= 0 ? "var(--green)" : "var(--red)" }}>
                     {(spot - Number(openTrade.entry_price)) >= 0 ? "+" : "−"}
                     {fmtUSD(Math.abs((spot - Number(openTrade.entry_price)) * Number(openTrade.size)))}
@@ -1911,9 +1911,9 @@ export default function Dashboard() {
             <div style={{ display: "flex", gap: 28, flexWrap: "wrap" }}>
               {[
                 { label: "Win rate", value: winRate != null ? `${winRate.toFixed(0)}%` : "—", sub: `${wins}W · ${losses}L`, color: undefined },
-                { label: "Avg trade", value: avgTrade != null ? `${avgTrade >= 0 ? "+" : "−"}${fmtUSD(Math.abs(avgTrade))}` : "—", sub: "per trade", color: avgTrade != null ? (avgTrade >= 0 ? "var(--green)" : "var(--red)") : undefined },
-                { label: "ROI on capital", value: roi != null ? fmtPct(roi) : "—", sub: "vs amount cycled", color: roi != null ? (roi >= 0 ? "var(--green)" : "var(--red)") : undefined },
-                { label: "Best trade", value: closedTrades.length ? `+${fmtUSD(Math.max(...closedTrades.map((t) => Number(t.effective_pnl ?? t.pnl_usd ?? 0))))}` : "—", sub: "single close", color: "var(--green)" },
+                { label: "Avg per trade", value: avgTrade != null ? `${avgTrade >= 0 ? "+" : "−"}${fmtUSD(Math.abs(avgTrade))}` : "—", sub: "per close", color: avgTrade != null ? (avgTrade >= 0 ? "var(--green)" : "var(--red)") : undefined },
+                { label: "Capital ROI", value: roi != null ? fmtPct(roi) : "—", sub: "on deployed capital", color: roi != null ? (roi >= 0 ? "var(--green)" : "var(--red)") : undefined },
+                { label: "Best close", value: closedTrades.length ? `+${fmtUSD(Math.max(...closedTrades.map((t) => Number(t.effective_pnl ?? t.pnl_usd ?? 0))))}` : "—", sub: "highest ever", color: "var(--green)" },
               ].map(({ label, value, sub, color }) => (
                 <div key={label}>
                   <div className="kicker" style={{ fontSize: 9.5 }}>{label}</div>
@@ -1931,8 +1931,8 @@ export default function Dashboard() {
                 <div className="kicker">{settings?.symbol ?? "BTC-USD"} · LIVE</div>
                 <div className="mono" style={{ fontSize: 10, color: "var(--text-3)", marginTop: 2 }}>
                   {lastUpdate
-                    ? <><span className="dot dot-green" style={{ width: 5, height: 5, marginRight: 5, verticalAlign: "middle" }} />syncing</>
-                    : "connecting…"}
+                    ? <><span className="dot dot-green" style={{ width: 5, height: 5, marginRight: 5, verticalAlign: "middle" }} />live</>
+                    : "linking up…"}
                 </div>
               </div>
               <Sparkline data={sparkline} width={110} height={34} />
@@ -2026,8 +2026,8 @@ export default function Dashboard() {
         {/* ── Footer ── */}
         <div style={{ marginTop: 12, padding: "10px 4px", display: "flex", justifyContent: "space-between", fontSize: 10, color: "var(--text-4)", fontFamily: "JetBrains Mono, monospace", borderTop: "1px solid var(--t-border)" }}>
           <span>CAPITAL_BOT · {settings?.symbol ?? "BTC-USD"} · COINBASE</span>
-          <span>RSI({14}) · 5m · FLY.IO WORKER</span>
-          <span>STRATEGY: BUY &lt; RSI {buyT} · SELL &gt; RSI {sellT}</span>
+          <span>RSI(14) · 5M CANDLES · FLY.IO WORKER</span>
+          <span>STRATEGY · BUY ≤ {buyT} · SELL ≥ {sellT} · {settings?.compound_mode ? "COMPOUND ON" : "FIXED SIZE"}</span>
         </div>
       </main>
     </div>
