@@ -9,6 +9,8 @@ export type TradeDecisionState =
   | "RISK_BLOCKED"
   | "IN_POSITION";
 
+export type MarketRegime = "bullish" | "bearish" | "ranging";
+
 export interface TradeDecisionInput {
   settings: Settings;
   openTrade: OpenTrade | null;
@@ -26,6 +28,20 @@ export interface TradeDecision {
   reasons: string[];
   blockers: string[];
   nextTrigger: string;
+  marketRegime: MarketRegime;
+}
+
+/**
+ * Detect macro market regime from EMA-50 and EMA-200 relative to current price.
+ * Exported so the worker can attach regime to non-decision log calls (e.g. exits).
+ */
+export function detectRegime(closePrices: number[], currentPrice: number): MarketRegime {
+  const e50  = ema(closePrices, EMA_SHORT_PERIOD);
+  const e200 = ema(closePrices, EMA_LONG_PERIOD);
+  if (e50 === null || e200 === null) return "ranging";
+  if (currentPrice > e50 && e50 > e200) return "bullish";
+  if (currentPrice < e50 && e50 < e200) return "bearish";
+  return "ranging";
 }
 
 const RSI_PERIOD = 14;
@@ -144,6 +160,21 @@ export function evaluateTradeDecision(input: TradeDecisionInput): TradeDecision 
     reasons.push("0 EMA 50 unavailable until more close history is collected");
   }
 
+  // ── Market regime overlay ────────────────────────────────────────────────────
+  // Detects the macro trend from EMA-50 / EMA-200 alignment.
+  // Applied additively — individual EMA factors above capture component signals;
+  // this adds a small boost/penalty for the confirmed combined regime.
+  let regime: MarketRegime = "ranging";
+  if (ema50 !== null && ema200 !== null) {
+    if (currentPrice > ema50 && ema50 > ema200) {
+      regime = "bullish";
+      addScore(1, "bullish regime (price > EMA-50 > EMA-200)");
+    } else if (currentPrice < ema50 && ema50 < ema200) {
+      regime = "bearish";
+      addScore(-1, "bearish regime (price < EMA-50 < EMA-200)");
+    }
+  }
+
   const latestCandle = recentCandles[recentCandles.length - 1];
   const priorCandles = recentCandles.slice(0, -1);
   if (latestCandle && priorCandles.length > 0) {
@@ -208,5 +239,5 @@ export function evaluateTradeDecision(input: TradeDecisionInput): TradeDecision 
     nextTrigger = `score at least ${minTradeScore(settings)} (quality ${settings.entry_score_threshold}%) (currently ${score})`;
   }
 
-  return { state, score, riskBlocked, reasons, blockers, nextTrigger };
+  return { state, score, riskBlocked, reasons, blockers, nextTrigger, marketRegime: regime };
 }

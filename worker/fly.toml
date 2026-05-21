@@ -9,6 +9,13 @@ primary_region = 'iad'
 [build]
   dockerfile = 'Dockerfile'
 
+# Persistent volume — survives deploys and restarts.
+# Create once before first deploy:
+#   fly vol create candle_data --region iad --size 1 --app capital-bot-worker-black-moonrise-2383
+[mounts]
+  source      = "candle_data"
+  destination = "/data"
+
 [env]
   PORT = '8080'
 

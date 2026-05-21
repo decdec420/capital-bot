@@ -223,6 +223,36 @@ export async function updateTrailingHigh(id: string, trailingHigh: number): Prom
   await rest("PATCH", `/trades?id=eq.${id}`, { trailing_high: trailingHigh });
 }
 
-export async function logTick(userId: string, symbol: string, rsi: number, price: number, action: string, reason: string): Promise<void> {
-  await rest("POST", "/tick_log", { user_id: userId, symbol, rsi, price, action, reason });
+export interface TickDecision {
+  state?:        string;   // TradeDecisionState
+  score?:        number;
+  topReasons?:   string[];
+  topBlockers?:  string[];
+  nextTrigger?:  string;
+  regime?:       string;   // MarketRegime
+}
+
+export async function logTick(
+  userId: string,
+  symbol: string,
+  rsi: number,
+  price: number,
+  action: string,
+  reason: string,
+  decision?: TickDecision,
+): Promise<void> {
+  await rest("POST", "/tick_log", {
+    user_id:        userId,
+    symbol,
+    rsi,
+    price,
+    action,
+    reason,
+    decision_state: decision?.state       ?? null,
+    score:          decision?.score       ?? null,
+    top_reasons:    decision?.topReasons  ?? null,
+    top_blockers:   decision?.topBlockers ?? null,
+    next_trigger:   decision?.nextTrigger ?? null,
+    market_regime:  decision?.regime      ?? null,
+  });
 }

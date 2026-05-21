@@ -545,13 +545,55 @@ export async function runNightlyAnalysis(userId: string): Promise<void> {
       profit_factor:            Number.isFinite(ins.profitFactor) ? ins.profitFactor : null,
 
       recommendations:          ins.recommendations,
-      auto_applied:             ins.autoApplied,
-      auto_applied_fields:      ins.autoAppliedFields,
+      auto_applied:             false,       // updated after auto-apply block
+      auto_applied_fields:      {},          // updated after auto-apply block
     };
 
-    // Write to bot_insights
+    // ── Auto-apply conservative threshold nudges ──────────────────────────
+    // Guards: 20+ trades, change ≤ 5 points, improvement is meaningful.
+    // We only auto-apply RSI buy threshold — everything else stays manual.
+    let autoApplied = false;
+    const autoAppliedFields: Record<string, { old: number; new: number }> = {};
+
+    if (
+      ins.suggestedRsiThreshold !== null &&
+      trades.length >= 20 &&
+      Math.abs(ins.suggestedRsiThreshold - settings.rsi_buy_threshold) <= 5
+    ) {
+      try {
+        const oldVal = settings.rsi_buy_threshold;
+        const newVal = ins.suggestedRsiThreshold;
+        await rest("PATCH", `/settings?user_id=eq.${userId}`, { rsi_buy_threshold: newVal });
+        await rest("POST", "/param_history", {
+          user_id:    userId,
+          field:      "rsi_buy_threshold",
+          old_value:  String(oldVal),
+          new_value:  String(newVal),
+          source:     "auto_analyser",
+          note:       `Auto-applied by nightly analyser. Best bucket: ${ins.bestRsiBucket?.label} ` +
+                      `(${ins.bestRsiBucket ? (ins.bestRsiBucket.winRate * 100).toFixed(0) : "?"}% win rate, ` +
+                      `${ins.bestRsiBucket?.trades} trades).`,
+        });
+        autoApplied = true;
+        autoAppliedFields["rsi_buy_threshold"] = { old: oldVal, new: newVal };
+        console.log(`[analyser] Auto-applied rsi_buy_threshold: ${oldVal} → ${newVal} for user ${userId}`);
+
+        // Append auto-apply note to recommendations
+        ins.recommendations.push(
+          `🤖 AUTO-APPLIED: RSI buy threshold nudged from ${oldVal} → ${newVal} based on ` +
+          `${trades.length} trades of data. Recorded in param history. Monitor next 7 days.`
+        );
+      } catch (err) {
+        console.warn(`[analyser] Auto-apply failed for user ${userId}:`, err);
+      }
+    }
+
+    // Write to bot_insights (with final auto-apply state)
+    insightRow.auto_applied = autoApplied;
+    insightRow.auto_applied_fields = autoAppliedFields;
+
     await rest("POST", "/bot_insights", insightRow);
-    console.log(`[analyser] Insights written for user ${userId}: ${ins.recommendations.length} recommendations`);
+    console.log(`[analyser] Insights written for user ${userId}: ${ins.recommendations.length} recommendations${autoApplied ? " (auto-applied changes)" : ""}`);
 
     // Send Telegram report if chat ID configured
     const TELEGRAM_TOKEN   = Deno.env.get("TELEGRAM_BOT_TOKEN");

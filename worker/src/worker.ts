@@ -96,29 +96,61 @@ const userInFlight = new Set<string>();
 // before either resolves, creating a double-buy race on live money.
 const symbolProcessing = new Set<string>();
 
-// ── Boot: warmup RSI from historical candles ───────────────
+// ── Fly Volume: candle persistence across restarts ──────────
+// Candles are written to /data/candles_{symbol}.json on each close.
+// On warmup we load from disk first — instant boot, no Coinbase API call needed.
+// Falls back to Coinbase API if disk is empty or /data isn't mounted.
+
+const DATA_DIR = "/data";
+const MAX_SAVED_CANDLES = 500; // rolling buffer per symbol
+
+function candleFile(symbol: string): string {
+  return `${DATA_DIR}/candles_${symbol.replace(/[^a-z0-9]/gi, "_").toLowerCase()}.json`;
+}
+
+async function loadSavedCandles(symbol: string): Promise<Candle[]> {
+  try {
+    const text = await Deno.readTextFile(candleFile(symbol));
+    const parsed = JSON.parse(text) as Candle[];
+    console.log(`[volume] Loaded ${parsed.length} saved candles for ${symbol}`);
+    return parsed;
+  } catch {
+    return []; // file doesn't exist yet or volume not mounted
+  }
+}
+
+async function saveCandles(symbol: string, candles: Candle[]): Promise<void> {
+  try {
+    const toSave = candles.slice(-MAX_SAVED_CANDLES);
+    await Deno.writeTextFile(candleFile(symbol), JSON.stringify(toSave));
+  } catch {
+    // Silently skip — volume may not be mounted in local dev
+  }
+}
+
+// ── Boot: warmup RSI from saved candles or historical API ──
 
 async function warmupSymbol(symbol: string, creds: Credentials): Promise<void> {
-  console.log(`[warmup] fetching ${WARMUP_CANDLES} 5-min candles for ${symbol}…`);
-  try {
-    const candles = await fetchHistoricalCandles(creds, symbol, WARMUP_CANDLES, "FIVE_MINUTE");
-    const closePrices = candles.map((c) => c.close);
-    const rsiSeries  = computeRsiSeries(closePrices, RSI_PERIOD);
-    const rsiHistory = rsiSeries.slice(-RSI_HISTORY_LIMIT);
-    const lastRsi    = rsiHistory[rsiHistory.length - 1] ?? computeRsi(closePrices, RSI_PERIOD);
-    symbolStates.set(symbol, {
-      builder: new CandleBuilder(),
-      closePrices,
-      rsiHistory,
-      recentCandles: candles.slice(-20),
-      lastRsi,
-      currentPrice: closePrices[closePrices.length - 1] ?? 0,
-      lastTickMs: Date.now(),
-    });
-    console.log(`[warmup] ${symbol} — ${candles.length} candles, RSI=${lastRsi.toFixed(2)}`);
-  } catch (e) {
-    console.error(`[warmup] ${symbol} failed:`, e instanceof Error ? e.message : String(e));
-    // Start cold — RSI will stabilise after WARMUP_CANDLES ticks
+  // 1. Try loading from Fly Volume first (instant, no API cost)
+  let candles = await loadSavedCandles(symbol);
+
+  // 2. If not enough candles on disk, fetch from Coinbase
+  if (candles.length < WARMUP_CANDLES) {
+    console.log(`[warmup] ${symbol} — ${candles.length} on disk, fetching ${WARMUP_CANDLES} from Coinbase…`);
+    try {
+      candles = await fetchHistoricalCandles(creds, symbol, WARMUP_CANDLES, "FIVE_MINUTE");
+      // Persist immediately so future restarts are instant
+      await saveCandles(symbol, candles);
+    } catch (e) {
+      console.error(`[warmup] ${symbol} Coinbase fetch failed:`, e instanceof Error ? e.message : String(e));
+      // Use whatever we had from disk, even if sparse
+    }
+  } else {
+    console.log(`[warmup] ${symbol} — using ${candles.length} candles from disk (no API call needed)`);
+  }
+
+  if (candles.length === 0) {
+    console.warn(`[warmup] ${symbol} — starting cold, RSI will stabilise after ${WARMUP_CANDLES} candles`);
     symbolStates.set(symbol, {
       builder: new CandleBuilder(),
       closePrices: [],
@@ -128,7 +160,23 @@ async function warmupSymbol(symbol: string, creds: Credentials): Promise<void> {
       currentPrice: 0,
       lastTickMs: Date.now(),
     });
+    return;
   }
+
+  const closePrices = candles.map((c) => c.close);
+  const rsiSeries   = computeRsiSeries(closePrices, RSI_PERIOD);
+  const rsiHistory  = rsiSeries.slice(-RSI_HISTORY_LIMIT);
+  const lastRsi     = rsiHistory[rsiHistory.length - 1] ?? computeRsi(closePrices, RSI_PERIOD);
+  symbolStates.set(symbol, {
+    builder: new CandleBuilder(),
+    closePrices,
+    rsiHistory,
+    recentCandles: candles.slice(-20),
+    lastRsi,
+    currentPrice: closePrices[closePrices.length - 1] ?? 0,
+    lastTickMs: Date.now(),
+  });
+  console.log(`[warmup] ${symbol} — ready. ${candles.length} candles, RSI=${lastRsi.toFixed(2)}`);
 }
 
 // ── Reload settings + open trades from Supabase ────────────
@@ -495,7 +543,11 @@ async function checkTickEntry(userId: string, state: UserState, symState: Symbol
       ...factorParts,
       ...blockerParts,
     ].join(";;");
-    await logTick(userId, settings.symbol, lastRsi, currentPrice, "hold", logReason);
+    await logTick(userId, settings.symbol, lastRsi, currentPrice, "hold", logReason, {
+      state: decision.state, score: decision.score,
+      topReasons: decision.reasons, topBlockers: decision.blockers,
+      nextTrigger: decision.nextTrigger, regime: decision.marketRegime,
+    });
     return;
   }
 
@@ -517,7 +569,11 @@ async function checkTickEntry(userId: string, state: UserState, symState: Symbol
       state.openTrade = { id, entry_price: currentPrice, size, quote_size: orderUsd, entry_fees_usd: 0, trailing_high: null, rsi_at_entry: lastRsi };
       state.entryDecisionSnapshot = { score: decision.score, reasons: decision.reasons, rsi: lastRsi, price: currentPrice };
       await sendTelegram(fmtBuy(settings.symbol, lastRsi, currentPrice, size, orderUsd, false));
-      await logTick(userId, settings.symbol, lastRsi, currentPrice, "buy", `PAPER TICK BUY — RSI ${lastRsi.toFixed(1)}`);
+      await logTick(userId, settings.symbol, lastRsi, currentPrice, "buy", `PAPER TICK BUY — RSI ${lastRsi.toFixed(1)}`, {
+        state: decision.state, score: decision.score,
+        topReasons: decision.reasons, topBlockers: decision.blockers,
+        nextTrigger: decision.nextTrigger, regime: decision.marketRegime,
+      });
     } else {
       if (!state.credentials) throw new Error("live mode but no credentials");
       const orderUsd = await resolveOrderSize(settings, state.credentials, currentPrice);
@@ -542,7 +598,11 @@ async function checkTickEntry(userId: string, state: UserState, symState: Symbol
       state.openTrade = { id: pendingId, entry_price: fill.fillPrice, size: fill.filledBaseSize, quote_size: fill.filledQuoteSize, entry_fees_usd: fill.feesUsd, trailing_high: null, rsi_at_entry: lastRsi };
       state.entryDecisionSnapshot = { score: decision.score, reasons: decision.reasons, rsi: lastRsi, price: fill.fillPrice };
       await sendTelegram(fmtBuy(settings.symbol, lastRsi, fill.fillPrice, fill.filledBaseSize, fill.filledQuoteSize, true));
-      await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "buy", `LIVE TICK BUY filled @ $${fill.fillPrice.toFixed(2)}`);
+      await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "buy", `LIVE TICK BUY filled @ $${fill.fillPrice.toFixed(2)}`, {
+        state: decision.state, score: decision.score,
+        topReasons: decision.reasons, topBlockers: decision.blockers,
+        nextTrigger: decision.nextTrigger, regime: decision.marketRegime,
+      });
     }
   } catch (e) {
     console.error(`[tick-entry] buy failed for ${userId}:`, e instanceof Error ? e.message : String(e));
@@ -743,7 +803,11 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
         });
         state.openTrade = { id, entry_price: currentPrice, size, quote_size: orderUsd, entry_fees_usd: 0, trailing_high: null, rsi_at_entry: lastRsi };
         await sendTelegram(fmtBuy(settings.symbol, lastRsi, currentPrice, size, orderUsd, false));
-        await logTick(userId, settings.symbol, lastRsi, currentPrice, "buy", `PAPER BUY — RSI ${lastRsi.toFixed(1)}`);
+        await logTick(userId, settings.symbol, lastRsi, currentPrice, "buy", `PAPER BUY — RSI ${lastRsi.toFixed(1)}`, {
+          state: decision.state, score: decision.score,
+          topReasons: decision.reasons, topBlockers: decision.blockers,
+          nextTrigger: decision.nextTrigger, regime: decision.marketRegime,
+        });
       } else {
         if (!state.credentials) throw new Error("live mode but no credentials");
         // ── Idempotency: write pending row BEFORE placing order ──
@@ -772,7 +836,11 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
         });
         state.openTrade = { id: pendingId, entry_price: fill.fillPrice, size: fill.filledBaseSize, quote_size: fill.filledQuoteSize, entry_fees_usd: fill.feesUsd, trailing_high: null, rsi_at_entry: lastRsi };
         await sendTelegram(fmtBuy(settings.symbol, lastRsi, fill.fillPrice, fill.filledBaseSize, fill.filledQuoteSize, true));
-        await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "buy", `LIVE BUY filled @ $${fill.fillPrice.toFixed(2)}`);
+        await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "buy", `LIVE BUY filled @ $${fill.fillPrice.toFixed(2)}`, {
+          state: decision.state, score: decision.score,
+          topReasons: decision.reasons, topBlockers: decision.blockers,
+          nextTrigger: decision.nextTrigger, regime: decision.marketRegime,
+        });
       }
     } catch (e) {
       console.error(`[signal] buy failed for ${userId}:`, e instanceof Error ? e.message : String(e));
@@ -805,7 +873,9 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
           console.log(`[compound] balance updated: $${newBalance.toFixed(2)} (${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)})`);
         }
         await sendTelegram(fmtSell(settings.symbol, lastRsi, currentPrice, entry, (currentPrice - entry) * openTrade.size, pnlPct, false));
-        await logTick(userId, settings.symbol, lastRsi, currentPrice, "sell", `PAPER SELL — P&L $${((currentPrice - entry) * openTrade.size).toFixed(2)}`);
+        await logTick(userId, settings.symbol, lastRsi, currentPrice, "sell", `PAPER SELL — P&L $${((currentPrice - entry) * openTrade.size).toFixed(2)}`, {
+          regime: decision.marketRegime,
+        });
       } else {
         if (!state.credentials) throw new Error("live mode but no credentials");
         const fill = await placeMarketSell(state.credentials, settings.symbol, openTrade.size.toFixed(8), `${openTrade.id}-close`);
@@ -823,7 +893,9 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
           }),
         });
         await sendTelegram(fmtSell(settings.symbol, lastRsi, fill.fillPrice, entry, realPnl, realPnlPct, true));
-        await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "sell", `LIVE SELL filled @ $${fill.fillPrice.toFixed(2)}`);
+        await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "sell", `LIVE SELL filled @ $${fill.fillPrice.toFixed(2)}`, {
+          regime: decision.marketRegime,
+        });
       }
       state.openTrade = null;
     } catch (e) {
@@ -846,7 +918,11 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
       ...blockerParts,
     ].join(";;");
   }
-  await logTick(userId, settings.symbol, lastRsi, currentPrice, "hold", holdReason);
+  await logTick(userId, settings.symbol, lastRsi, currentPrice, "hold", holdReason, {
+    state: decision.state, score: decision.score,
+    topReasons: decision.reasons, topBlockers: decision.blockers,
+    nextTrigger: decision.nextTrigger, regime: decision.marketRegime,
+  });
 }
 
 // ── WebSocket trade handler ────────────────────────────────

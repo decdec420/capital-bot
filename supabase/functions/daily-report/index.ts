@@ -76,6 +76,15 @@ async function buildReport(admin: any, userId: string, symbol: string, live: boo
     .eq("status", "open")
     .maybeSingle();
 
+  // Latest nightly audit insight (may be null if analyser hasn't run yet)
+  const { data: insight } = await admin
+    .from("bot_insights")
+    .select("computed_at,profit_factor,max_drawdown_pct,last7d_win_rate,last7d_net_pnl,last7d_trades,suggested_rsi_threshold,current_rsi_threshold,auto_applied,recommendations")
+    .eq("user_id", userId)
+    .order("computed_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
   const dateStr = new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 
   let msg = `${mode} <b>Daily Report</b> — ${symbol} — ${dateStr}\n\n`;
@@ -101,6 +110,32 @@ async function buildReport(admin: any, userId: string, symbol: string, live: boo
     }
   } else {
     msg += `\n<i>No open position.</i>`;
+  }
+
+  // Nightly audit summary (if available)
+  if (insight) {
+    msg += `\n\n<b>🤖 Bot Audit</b> <i>(last run: ${new Date(insight.computed_at).toLocaleDateString("en-US", { month: "short", day: "numeric" })})</i>\n`;
+    if (insight.profit_factor != null) {
+      msg += `Profit factor: <code>${Number(insight.profit_factor).toFixed(2)}</code>  `;
+    }
+    if (insight.max_drawdown_pct != null) {
+      msg += `Max drawdown: <code>${Number(insight.max_drawdown_pct).toFixed(1)}%</code>\n`;
+    }
+    if (insight.last7d_trades > 0) {
+      const wr7 = insight.last7d_win_rate != null ? `${(Number(insight.last7d_win_rate) * 100).toFixed(0)}%` : "—";
+      msg += `Last 7d: <code>${insight.last7d_trades} trades · ${wr7} win rate · ${fmt$(Number(insight.last7d_net_pnl ?? 0))}</code>\n`;
+    }
+    if (insight.auto_applied) {
+      msg += `✅ <b>Auto-applied:</b> RSI threshold ${insight.current_rsi_threshold} → ${insight.suggested_rsi_threshold}\n`;
+    }
+    // Top 2 recommendations only (keep message concise)
+    const recs: string[] = Array.isArray(insight.recommendations) ? insight.recommendations.slice(0, 2) : [];
+    if (recs.length > 0) {
+      msg += `\n<b>Top Insights</b>\n`;
+      for (const rec of recs) {
+        msg += `${rec}\n\n`;
+      }
+    }
   }
 
   return msg;
