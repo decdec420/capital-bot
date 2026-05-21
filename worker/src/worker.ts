@@ -26,6 +26,7 @@ import {
 } from "./supabase.ts";
 import { sendTelegram, fmtBuy, fmtSell } from "./telegram.ts";
 import { normalizePrivateKey } from "./coinbase-auth.ts";
+import { scheduleMidnightAnalysis } from "./analyser.ts";
 
 const RSI_PERIOD        = 14;
 const WARMUP_CANDLES    = 100;
@@ -1080,7 +1081,15 @@ async function main() {
     }
   }, SETTINGS_REFRESH);
 
-  console.log("=== worker running ===");
+  // ── Nightly analysis engine ────────────────────────────────────────────
+  // Fires at 00:02 UTC every day. Reads all closed trades, computes
+  // recommendations, writes to bot_insights, sends Telegram audit report.
+  scheduleMidnightAnalysis(async () => {
+    await reloadSettings();
+    return Array.from(userStates.keys());
+  });
+
+  console.log("=== worker running — nightly analyser scheduled ===");
 }
 
 main().catch((e) => {

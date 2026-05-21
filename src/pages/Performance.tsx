@@ -7,7 +7,7 @@ import {
 } from "recharts";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
-import { Settings, LogOut, BarChart2, Clock, Target, TrendingUp, TrendingDown, RefreshCw } from "lucide-react";
+import { Settings, LogOut, BarChart2, Clock, Target, TrendingUp, TrendingDown, RefreshCw, Brain, Lightbulb } from "lucide-react";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 interface Trade {
@@ -105,6 +105,32 @@ const TD = ({ children, right, color }: { children: React.ReactNode; right?: boo
   </td>
 );
 
+// ── Insight types ─────────────────────────────────────────────────────────
+interface BotInsight {
+  id: string;
+  computed_at: string;
+  total_trades: number;
+  best_rsi_bucket_label: string | null;
+  best_rsi_bucket_win_rate: number | null;
+  suggested_rsi_threshold: number | null;
+  current_rsi_threshold: number | null;
+  avg_win_hold_hours: number | null;
+  avg_loss_hold_hours: number | null;
+  suggested_trailing_pct: number | null;
+  scale_in_trades: number;
+  scale_in_win_rate: number | null;
+  scale_in_delta_win_rate: number | null;
+  last7d_trades: number;
+  last7d_win_rate: number | null;
+  last7d_net_pnl: number | null;
+  alltime_win_rate: number | null;
+  alltime_net_pnl: number | null;
+  max_drawdown_pct: number | null;
+  profit_factor: number | null;
+  recommendations: string[];
+  auto_applied: boolean;
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────
 export default function Performance() {
   const { user, signOut } = useAuth();
@@ -121,6 +147,22 @@ export default function Performance() {
         .order("closed_at", { ascending: true });
       if (error) throw error;
       return data ?? [];
+    },
+    enabled: !!user,
+  });
+
+  const { data: latestInsight } = useQuery<BotInsight | null>({
+    queryKey: ["bot-insight"],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("bot_insights")
+        .select("*")
+        .eq("user_id", user!.id)
+        .order("computed_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return data ?? null;
     },
     enabled: !!user,
   });
@@ -265,6 +307,66 @@ export default function Performance() {
       </header>
 
       <main style={{ padding: "24px", maxWidth: 1200, margin: "0 auto" }}>
+
+        {/* ── Bot Audit (Nightly AI Insights) ── */}
+        {latestInsight && latestInsight.recommendations?.length > 0 && (
+          <div style={{ marginBottom: 20 }}>
+            <div className="hud-panel" style={{ overflow: "hidden", border: "1px solid rgba(139,92,246,0.3)", boxShadow: "0 0 24px rgba(139,92,246,0.06)" }}>
+              <div style={{ padding: "14px 20px 12px", borderBottom: "1px solid rgba(139,92,246,0.2)", display: "flex", alignItems: "center", justifyContent: "space-between", background: "rgba(139,92,246,0.06)" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <Brain size={15} style={{ color: "#a78bfa" }} />
+                  <div>
+                    <div className="mono" style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.1em", color: "#a78bfa" }}>Nightly Bot Audit</div>
+                    <div className="mono" style={{ fontSize: 12, marginTop: 2 }}>
+                      Last run: {new Date(latestInsight.computed_at).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                      <span style={{ marginLeft: 10, color: "rgba(255,255,255,0.35)", fontSize: 10 }}>
+                        {latestInsight.total_trades} trades analysed
+                      </span>
+                    </div>
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 8, fontSize: 10 }}>
+                  {latestInsight.profit_factor !== null && (
+                    <span className="mono" style={{ padding: "2px 8px", borderRadius: 4, background: (latestInsight.profit_factor ?? 0) >= 1 ? "rgba(74,222,128,0.12)" : "rgba(248,113,113,0.12)", color: (latestInsight.profit_factor ?? 0) >= 1 ? "#4ade80" : "#f87171" }}>
+                      PF {latestInsight.profit_factor?.toFixed(2)}
+                    </span>
+                  )}
+                  {latestInsight.max_drawdown_pct !== null && (
+                    <span className="mono" style={{ padding: "2px 8px", borderRadius: 4, background: "rgba(255,255,255,0.06)", color: "rgba(255,255,255,0.5)" }}>
+                      DD {latestInsight.max_drawdown_pct?.toFixed(1)}%
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div style={{ padding: "14px 20px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
+                {latestInsight.recommendations.map((rec, i) => (
+                  <div key={i} style={{ display: "flex", gap: 10, padding: "10px 14px", borderRadius: 6, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)" }}>
+                    <Lightbulb size={13} style={{ color: "#a78bfa", flexShrink: 0, marginTop: 1 }} />
+                    <span className="mono" style={{ fontSize: 11, lineHeight: 1.6, color: "rgba(255,255,255,0.8)" }}>{rec}</span>
+                  </div>
+                ))}
+                {latestInsight.suggested_rsi_threshold !== null && (
+                  <div style={{ marginTop: 4, padding: "10px 14px", borderRadius: 6, background: "rgba(139,92,246,0.08)", border: "1px solid rgba(139,92,246,0.2)" }}>
+                    <span className="mono" style={{ fontSize: 10, color: "#a78bfa" }}>
+                      💡 SUGGESTED: Lower RSI buy threshold from {latestInsight.current_rsi_threshold} → {latestInsight.suggested_rsi_threshold} in Settings
+                    </span>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {!latestInsight && trades.length > 0 && (
+          <div style={{ marginBottom: 16 }}>
+            <div className="hud-panel" style={{ padding: "14px 20px", display: "flex", alignItems: "center", gap: 10, border: "1px solid rgba(139,92,246,0.15)" }}>
+              <Brain size={14} style={{ color: "#a78bfa", opacity: 0.5 }} />
+              <span className="mono dim" style={{ fontSize: 11 }}>
+                Nightly Bot Audit fires at 00:02 UTC — first report appears tomorrow morning.
+              </span>
+            </div>
+          </div>
+        )}
 
         {trades.length === 0 && !isFetching && (
           <div className="hud-panel" style={{ padding: 40, textAlign: "center" }}>
