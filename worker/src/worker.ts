@@ -456,10 +456,11 @@ async function checkRiskExits(userId: string, state: UserState, price: number, r
         effective_pnl: pnl, close_reason: closeReason, notes,
       });
       if (settings.compound_mode) {
-        const newBalance = settings.paper_balance_usd + pnl;
+        // Return deployed capital + pnl so balance accurately reflects available cash
+        const newBalance = settings.paper_balance_usd + openTrade.quote_size + pnl;
         await updatePaperBalance(userId, newBalance);
         settings.paper_balance_usd = Math.max(0, newBalance);
-        console.log(`[compound] balance updated: $${newBalance.toFixed(2)} (${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)})`);
+        console.log(`[compound] balance updated: $${newBalance.toFixed(2)} (returned $${openTrade.quote_size.toFixed(2)} + pnl ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)})`);
       }
       await sendTelegram(fmtSell(settings.symbol, rsi, price, entry, pnl, changePct, false, exitLabel));
       await logTick(userId, settings.symbol, rsi, price, "sell", `PAPER ${exitLabel}`);
@@ -568,6 +569,13 @@ async function checkTickEntry(userId: string, state: UserState, symState: Symbol
       });
       state.openTrade = { id, entry_price: currentPrice, size, quote_size: orderUsd, entry_fees_usd: 0, trailing_high: null, rsi_at_entry: lastRsi };
       state.entryDecisionSnapshot = { score: decision.score, reasons: decision.reasons, rsi: lastRsi, price: currentPrice };
+      if (settings.compound_mode) {
+        // Deduct deployed capital immediately so scale-in and next-buy sizing see correct available cash
+        const newBalance = settings.paper_balance_usd - orderUsd;
+        await updatePaperBalance(userId, newBalance);
+        settings.paper_balance_usd = Math.max(0, newBalance);
+        console.log(`[compound] balance deployed: $${orderUsd.toFixed(2)} → remaining $${Math.max(0, newBalance).toFixed(2)}`);
+      }
       await sendTelegram(fmtBuy(settings.symbol, lastRsi, currentPrice, size, orderUsd, false));
       await logTick(userId, settings.symbol, lastRsi, currentPrice, "buy", `PAPER TICK BUY — RSI ${lastRsi.toFixed(1)}`, {
         state: decision.state, score: decision.score,
@@ -649,10 +657,11 @@ async function checkTickSell(userId: string, state: UserState, symState: SymbolS
         effective_pnl: pnl, close_reason: "rsi_signal", notes,
       });
       if (settings.compound_mode) {
-        const newBalance = settings.paper_balance_usd + pnl;
+        // Return deployed capital + pnl so balance accurately reflects available cash
+        const newBalance = settings.paper_balance_usd + openTrade.quote_size + pnl;
         await updatePaperBalance(userId, newBalance);
         settings.paper_balance_usd = Math.max(0, newBalance);
-        console.log(`[compound] balance updated: $${newBalance.toFixed(2)} (${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)})`);
+        console.log(`[compound] balance updated: $${newBalance.toFixed(2)} (returned $${openTrade.quote_size.toFixed(2)} + pnl ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)})`);
       }
       await sendTelegram(fmtSell(settings.symbol, lastRsi, currentPrice, entry, pnl, pnlPct, false, "RSI tick sell"));
       await logTick(userId, settings.symbol, lastRsi, currentPrice, "sell", `PAPER TICK SELL — RSI ${lastRsi.toFixed(1)} > ${settings.rsi_sell_threshold}`);
@@ -802,6 +811,13 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
           notes: `[PAPER] RSI ${lastRsi.toFixed(1)} < ${settings.rsi_buy_threshold}${settings.compound_mode ? ` [compound $${orderUsd.toFixed(2)}]` : ""}`,
         });
         state.openTrade = { id, entry_price: currentPrice, size, quote_size: orderUsd, entry_fees_usd: 0, trailing_high: null, rsi_at_entry: lastRsi };
+        if (settings.compound_mode) {
+          // Deduct deployed capital immediately so scale-in and next-buy sizing see correct available cash
+          const newBalance = settings.paper_balance_usd - orderUsd;
+          await updatePaperBalance(userId, newBalance);
+          settings.paper_balance_usd = Math.max(0, newBalance);
+          console.log(`[compound] balance deployed: $${orderUsd.toFixed(2)} → remaining $${Math.max(0, newBalance).toFixed(2)}`);
+        }
         await sendTelegram(fmtBuy(settings.symbol, lastRsi, currentPrice, size, orderUsd, false));
         await logTick(userId, settings.symbol, lastRsi, currentPrice, "buy", `PAPER BUY — RSI ${lastRsi.toFixed(1)}`, {
           state: decision.state, score: decision.score,
@@ -867,10 +883,11 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
           effective_pnl: pnl, close_reason: "rsi_signal", notes,
         });
         if (settings.compound_mode) {
-          const newBalance = settings.paper_balance_usd + pnl;
+          // Return deployed capital + pnl so balance accurately reflects available cash
+          const newBalance = settings.paper_balance_usd + openTrade.quote_size + pnl;
           await updatePaperBalance(userId, newBalance);
           settings.paper_balance_usd = Math.max(0, newBalance);
-          console.log(`[compound] balance updated: $${newBalance.toFixed(2)} (${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)})`);
+          console.log(`[compound] balance updated: $${newBalance.toFixed(2)} (returned $${openTrade.quote_size.toFixed(2)} + pnl ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)})`);
         }
         await sendTelegram(fmtSell(settings.symbol, lastRsi, currentPrice, entry, (currentPrice - entry) * openTrade.size, pnlPct, false));
         await logTick(userId, settings.symbol, lastRsi, currentPrice, "sell", `PAPER SELL — P&L $${((currentPrice - entry) * openTrade.size).toFixed(2)}`, {
