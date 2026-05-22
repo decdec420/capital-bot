@@ -835,6 +835,8 @@ function PositionPanel({
   onClose: () => void;
   closing: boolean;
 }) {
+  const [selectedLeg, setSelectedLeg] = useState<"entry" | "scale_in" | null>(null);
+
   if (!openTrade) {
     const latestTick = tickLogs.find((t) => !settings?.symbol || t.symbol === settings.symbol) ?? tickLogs[0];
     const persistedState = normalizeDecisionState(latestTick?.decision_state ?? latestTick?.decision);
@@ -953,6 +955,17 @@ function PositionPanel({
   const target = tpPrice ?? entry * 1.05;
   const progress = Math.max(0, Math.min(1, (cur - stop) / (target - stop)));
 
+  // ── Per-leg breakdown ────────────────────────────────────────────────
+  const hasScaleIn = (openTrade.scale_in_count ?? 0) > 0;
+  const scaleInUsd = Number(openTrade.scale_in_quote_size ?? 0);
+  const scaleInPx  = Number(openTrade.scale_in_price ?? entry);
+  const scaleInBtc = scaleInPx > 0 ? scaleInUsd / scaleInPx : 0;
+  const origUsd    = Number(openTrade.quote_size) - scaleInUsd;
+  const origBtc    = Number(openTrade.size) - scaleInBtc;
+  const origPx     = origBtc > 0 ? origUsd / origBtc : entry;
+  const leg1Pnl    = (cur - origPx) * origBtc;
+  const leg2Pnl    = hasScaleIn ? (cur - scaleInPx) * scaleInBtc : null;
+
   function DataRow({ label, value, color }: { label: string; value: string; color?: string }) {
     return (
       <div>
@@ -962,74 +975,163 @@ function PositionPanel({
     );
   }
 
-  return (
-    <div className="t-panel" style={{ padding: 16 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span className="kicker">ACTIVE TRADE</span>
-          {(openTrade.scale_in_count ?? 0) > 0 && (
-            <span className="pill pill-cyan" style={{ fontSize: 9, padding: "1px 6px" }}>SCALED IN</span>
+  // ── Trade leg detail modal ───────────────────────────────────────────
+  const modal = selectedLeg && (
+    <div
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}
+      onClick={() => setSelectedLeg(null)}
+    >
+      <div
+        className="t-panel"
+        style={{ padding: 20, minWidth: 300, maxWidth: 380, width: "100%", position: "relative" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <span className="kicker">{selectedLeg === "entry" ? "LEG 1 · ENTRY" : "LEG 2 · SCALE-IN"}</span>
+          <button
+            style={{ background: "none", border: "none", color: "var(--text-3)", cursor: "pointer", fontSize: 16, lineHeight: 1, padding: "0 4px" }}
+            onClick={() => setSelectedLeg(null)}
+          >×</button>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px 16px" }}>
+          {selectedLeg === "entry" ? (
+            <>
+              <DataRow label="Entry price"    value={fmtUSD(origPx)} />
+              <DataRow label="Now"            value={fmtUSD(cur)} />
+              <DataRow label="Size"           value={origBtc.toFixed(8) + " BTC"} />
+              <DataRow label="Deployed"       value={fmtUSD(origUsd)} />
+              <DataRow label="RSI at entry"   value={openTrade.rsi_at_entry?.toFixed(1) ?? "—"} />
+              <DataRow label="Unrealized P&L" value={(leg1Pnl >= 0 ? "+" : "") + fmtUSD(leg1Pnl)} color={leg1Pnl >= 0 ? "var(--green)" : "var(--red)"} />
+              <DataRow label="Open for"       value={fmtRelTime(openTrade.created_at)} />
+              {slPrice && <DataRow label="Stop loss"     value={fmtUSD(slPrice)}  color="var(--red)" />}
+              {tpPrice && <DataRow label="Take profit"   value={fmtUSD(tpPrice)}  color="var(--green)" />}
+              {tsPrice && <DataRow label="Trailing stop" value={fmtUSD(tsPrice)}  color="var(--amber)" />}
+              <DataRow label="High water"     value={fmtUSD(tHigh)} />
+            </>
+          ) : (
+            <>
+              <DataRow label="Scale-in price"  value={fmtUSD(scaleInPx)} color="var(--cyan)" />
+              <DataRow label="Now"             value={fmtUSD(cur)} />
+              <DataRow label="Size"            value={scaleInBtc.toFixed(8) + " BTC"} />
+              <DataRow label="Deployed"        value={fmtUSD(scaleInUsd)} color="var(--cyan)" />
+              <DataRow label="RSI at scale-in" value="—" />
+              <DataRow label="Unrealized P&L"  value={(leg2Pnl! >= 0 ? "+" : "") + fmtUSD(leg2Pnl!)} color={leg2Pnl! >= 0 ? "var(--green)" : "var(--red)"} />
+              {slPrice && <DataRow label="Stop loss"     value={fmtUSD(slPrice)}  color="var(--red)" />}
+              {tpPrice && <DataRow label="Take profit"   value={fmtUSD(tpPrice)}  color="var(--green)" />}
+              {tsPrice && <DataRow label="Trailing stop" value={fmtUSD(tsPrice)}  color="var(--amber)" />}
+            </>
           )}
         </div>
-        <button className="t-btn t-btn-danger" onClick={() => { if (confirm("Force-close this position now?")) onClose(); }} disabled={closing} style={{ height: 26, padding: "0 10px", fontSize: 11 }}>
-          {closing ? "Closing…" : "Force close"}
-        </button>
-      </div>
-
-      {/* Unrealized P&L */}
-      <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 4 }}>
-        <span className="hero-num" style={{ fontSize: 32, color: unreal.pnl >= 0 ? "var(--green)" : "var(--red)" }}>
-          {unreal.pnl >= 0 ? "+" : "−"}{fmtUSD(Math.abs(unreal.pnl))}
-        </span>
-        <span className="mono" style={{ fontSize: 13, color: unreal.pct >= 0 ? "var(--green)" : "var(--red)" }}>
-          {fmtPct(unreal.pct)}
-        </span>
-      </div>
-      <div className="mono dim" style={{ fontSize: 10.5, marginBottom: 14 }}>
-        floating P&L · {fmtRelTime(openTrade.created_at)} in trade
-      </div>
-
-      {/* Progress bar: stop → entry → spot → target */}
-      <div style={{ marginBottom: 16 }}>
-        <div style={{ height: 5, background: "var(--bg-3)", borderRadius: 3, position: "relative", overflow: "hidden" }}>
-          <div style={{
-            position: "absolute", top: 0, bottom: 0, left: 0,
-            width: `${progress * 100}%`,
-            background: unreal.pnl >= 0 ? "var(--green)" : "var(--red)",
-            borderRadius: 3,
-          }} />
-          <div style={{
-            position: "absolute", top: 0, bottom: 0,
-            left: `${((entry - stop) / (target - stop)) * 100}%`,
-            width: 1, background: "var(--text-4)",
-          }} />
-        </div>
-        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4, fontSize: 9.5, fontFamily: "JetBrains Mono, monospace" }}>
-          <span style={{ color: "var(--red)" }}>STOP {fmtUSD(stop, 0)}</span>
-          <span className="dim">ENTRY {fmtUSD(entry, 0)}</span>
-          <span style={{ color: "var(--green)" }}>TGT {fmtUSD(target, 0)}</span>
-        </div>
-      </div>
-
-      {/* Grid of details */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px 16px" }}>
-        <DataRow label={(openTrade.scale_in_count ?? 0) > 0 ? "Avg entry" : "Entry price"} value={fmtUSD(entry)} />
-        <DataRow label="Now"            value={fmtUSD(cur)} />
-        <DataRow label="Size"           value={Number(openTrade.size).toFixed(8) + " BTC"} />
-        <DataRow label="Deployed"       value={fmtUSD(openTrade.quote_size)} />
-        <DataRow label="RSI at entry"   value={openTrade.rsi_at_entry?.toFixed(1) ?? "—"} />
-        <DataRow label="High water"     value={fmtUSD(tHigh)} />
-        {(openTrade.scale_in_count ?? 0) > 0 && openTrade.scale_in_price != null && (
-          <DataRow label="Scale-in @" value={fmtUSD(openTrade.scale_in_price)} color="var(--cyan)" />
-        )}
-        {(openTrade.scale_in_count ?? 0) > 0 && openTrade.scale_in_quote_size != null && (
-          <DataRow label="Scale-in $" value={fmtUSD(openTrade.scale_in_quote_size)} color="var(--cyan)" />
-        )}
-        {slPrice && <DataRow label="Stop loss"     value={fmtUSD(slPrice)} color="var(--red)" />}
-        {tpPrice && <DataRow label="Take profit"   value={fmtUSD(tpPrice)} color="var(--green)" />}
-        {tsPrice && <DataRow label="Trailing stop" value={fmtUSD(tsPrice)} color="var(--amber)" />}
       </div>
     </div>
+  );
+
+  return (
+    <>
+      {modal}
+      <div className="t-panel" style={{ padding: 16 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span className="kicker">ACTIVE TRADE</span>
+            {hasScaleIn && (
+              <span className="pill pill-cyan" style={{ fontSize: 9, padding: "1px 6px" }}>SCALED IN</span>
+            )}
+          </div>
+          <button className="t-btn t-btn-danger" onClick={() => { if (confirm("Force-close this position now?")) onClose(); }} disabled={closing} style={{ height: 26, padding: "0 10px", fontSize: 11 }}>
+            {closing ? "Closing…" : "Force close"}
+          </button>
+        </div>
+
+        {/* Unrealized P&L */}
+        <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 4 }}>
+          <span className="hero-num" style={{ fontSize: 32, color: unreal.pnl >= 0 ? "var(--green)" : "var(--red)" }}>
+            {unreal.pnl >= 0 ? "+" : "−"}{fmtUSD(Math.abs(unreal.pnl))}
+          </span>
+          <span className="mono" style={{ fontSize: 13, color: unreal.pct >= 0 ? "var(--green)" : "var(--red)" }}>
+            {fmtPct(unreal.pct)}
+          </span>
+        </div>
+        <div className="mono dim" style={{ fontSize: 10.5, marginBottom: 14 }}>
+          floating P&L · {fmtRelTime(openTrade.created_at)} in trade
+        </div>
+
+        {/* Progress bar: stop → entry → spot → target */}
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ height: 5, background: "var(--bg-3)", borderRadius: 3, position: "relative", overflow: "hidden" }}>
+            <div style={{
+              position: "absolute", top: 0, bottom: 0, left: 0,
+              width: `${progress * 100}%`,
+              background: unreal.pnl >= 0 ? "var(--green)" : "var(--red)",
+              borderRadius: 3,
+            }} />
+            <div style={{
+              position: "absolute", top: 0, bottom: 0,
+              left: `${((entry - stop) / (target - stop)) * 100}%`,
+              width: 1, background: "var(--text-4)",
+            }} />
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4, fontSize: 9.5, fontFamily: "JetBrains Mono, monospace" }}>
+            <span style={{ color: "var(--red)" }}>STOP {fmtUSD(stop, 0)}</span>
+            <span className="dim">ENTRY {fmtUSD(entry, 0)}</span>
+            <span style={{ color: "var(--green)" }}>TGT {fmtUSD(target, 0)}</span>
+          </div>
+        </div>
+
+        {/* Trade legs */}
+        <div className="kicker" style={{ marginBottom: 8, fontSize: 9 }}>TRADE LEGS — click for details</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <button
+            onClick={() => setSelectedLeg("entry")}
+            style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: "var(--bg-2)", border: "1px solid var(--t-border)", borderRadius: 6, padding: "8px 12px", cursor: "pointer", width: "100%", textAlign: "left" }}
+          >
+            <div style={{ display: "flex", flex: 1, gap: 16 }}>
+              <div>
+                <div style={{ fontSize: 9, color: "var(--text-3)", marginBottom: 1 }}>LEG 1 · ENTRY</div>
+                <div className="mono" style={{ fontSize: 12, color: "var(--text)" }}>{fmtUSD(hasScaleIn ? origPx : entry)}</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 9, color: "var(--text-3)", marginBottom: 1 }}>DEPLOYED</div>
+                <div className="mono" style={{ fontSize: 12, color: "var(--text)" }}>{fmtUSD(hasScaleIn ? origUsd : openTrade.quote_size)}</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 9, color: "var(--text-3)", marginBottom: 1 }}>RSI AT ENTRY</div>
+                <div className="mono" style={{ fontSize: 12, color: "var(--text)" }}>{openTrade.rsi_at_entry?.toFixed(1) ?? "—"}</div>
+              </div>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 1 }}>
+              <div className="mono" style={{ fontSize: 12, color: leg1Pnl >= 0 ? "var(--green)" : "var(--red)" }}>
+                {leg1Pnl >= 0 ? "+" : "−"}{fmtUSD(Math.abs(leg1Pnl))}
+              </div>
+              <div style={{ fontSize: 9, color: "var(--text-4)" }}>tap ›</div>
+            </div>
+          </button>
+
+          {hasScaleIn && (
+            <button
+              onClick={() => setSelectedLeg("scale_in")}
+              style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: "var(--bg-2)", border: "1px solid rgba(0,255,255,0.18)", borderRadius: 6, padding: "8px 12px", cursor: "pointer", width: "100%", textAlign: "left" }}
+            >
+              <div style={{ display: "flex", flex: 1, gap: 16 }}>
+                <div>
+                  <div style={{ fontSize: 9, color: "var(--cyan)", marginBottom: 1 }}>LEG 2 · SCALE-IN</div>
+                  <div className="mono" style={{ fontSize: 12, color: "var(--text)" }}>{fmtUSD(scaleInPx)}</div>
+                </div>
+                <div>
+                  <div style={{ fontSize: 9, color: "var(--text-3)", marginBottom: 1 }}>DEPLOYED</div>
+                  <div className="mono" style={{ fontSize: 12, color: "var(--cyan)" }}>{fmtUSD(scaleInUsd)}</div>
+                </div>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 1 }}>
+                <div className="mono" style={{ fontSize: 12, color: leg2Pnl! >= 0 ? "var(--green)" : "var(--red)" }}>
+                  {leg2Pnl! >= 0 ? "+" : "−"}{fmtUSD(Math.abs(leg2Pnl!))}
+                </div>
+                <div style={{ fontSize: 9, color: "var(--text-4)" }}>tap ›</div>
+              </div>
+            </button>
+          )}
+        </div>
+      </div>
+    </>
   );
 }
 
