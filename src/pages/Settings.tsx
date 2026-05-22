@@ -27,6 +27,7 @@ interface BotSettings {
   scale_in_enabled: boolean;
   scale_in_rsi_threshold: number;
   scale_in_amount_usd: number;
+  max_buy_usd: number;
 }
 
 const DEFAULT_BOT_SETTINGS: BotSettings = {
@@ -50,6 +51,7 @@ const DEFAULT_BOT_SETTINGS: BotSettings = {
   scale_in_enabled: false,
   scale_in_rsi_threshold: 30,
   scale_in_amount_usd: 10,
+  max_buy_usd: 0,
 };
 
 const PRESETS = {
@@ -499,6 +501,20 @@ export default function Settings() {
                 <p>$500 – $1,000 → deploy <strong>70%</strong> per trade</p>
                 <p>Over $1,000 → deploy <strong>50%</strong> per trade</p>
               </div>
+
+              <Field>
+                <Label>Max stake per trade (cap)</Label>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-muted-foreground">$</span>
+                  <input
+                    type="number" min="0" max="100000" step="1"
+                    value={form.max_buy_usd}
+                    onChange={(e) => set("max_buy_usd")(Number(e.target.value))}
+                    className="h-9 w-32 rounded-md border border-input bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring"
+                  />
+                </div>
+                <Hint>Hard ceiling on each trade — the bot will never deploy more than this even as the balance grows. Set to 0 to disable the cap.</Hint>
+              </Field>
             </>
           )}
         </SectionCard>
