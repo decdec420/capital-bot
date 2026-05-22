@@ -22,6 +22,7 @@ interface Trade {
   effective_pnl?: number;
   status: string;
   rsi_at_entry?: number;
+  rsi_at_exit?: number;
   close_reason?: string;
   created_at: string;
   closed_at?: string;
@@ -36,6 +37,7 @@ interface TradeLesson {
   version: number;
   symbol: string;
   entry_rsi: number;
+  exit_rsi: number | null;
   entry_price: number;
   exit_price: number;
   pnl_pct: number;
@@ -284,6 +286,11 @@ function TradeDetailCard({ trade, num }: { trade: Trade; num: number }) {
                 {exitDate ? fmtDate(exitDate) : "—"}
               </div>
               <div className="mono" style={{ fontSize: 10, color: closeColor, marginTop: 4 }}>{closeLabel}</div>
+              {(trade.rsi_at_exit != null || lesson?.exit_rsi != null) && (
+                <div className="mono" style={{ fontSize: 10, color: "var(--cyan)", marginTop: 4 }}>
+                  RSI {(trade.rsi_at_exit ?? lesson?.exit_rsi)?.toFixed(1)} at exit
+                </div>
+              )}
             </div>
           </div>
 
@@ -371,6 +378,7 @@ function TradeDetailCard({ trade, num }: { trade: Trade; num: number }) {
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
                 {[
                   { label: "RSI at entry",  value: trade.rsi_at_entry?.toFixed(1) ?? "—" },
+                  { label: "RSI at exit",   value: (trade.rsi_at_exit ?? lesson?.exit_rsi)?.toFixed(1) ?? "—" },
                   { label: "Deployed",       value: `$${Number(trade.quote_size).toFixed(2)}` },
                   { label: "Size",           value: trade.size != null ? `${Number(trade.size).toFixed(6)} BTC` : "—" },
                   { label: "Hold time",      value: holdStr },

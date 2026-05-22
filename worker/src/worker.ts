@@ -340,6 +340,7 @@ interface TradeLesson {
   version:     number;
   symbol:      string;
   entry_rsi:   number;
+  exit_rsi:    number | null;
   entry_price: number;
   exit_price:  number;
   pnl_pct:     number;
@@ -356,11 +357,11 @@ interface TradeLesson {
 }
 
 function generateTradeLesson(params: {
-  symbol: string; entryRsi: number; entryPrice: number; exitPrice: number;
+  symbol: string; entryRsi: number; exitRsi: number | null; entryPrice: number; exitPrice: number;
   pnlPct: number; effectivePnl: number; closeReason: string; holdMinutes: number;
   entrySnapshot: UserState["entryDecisionSnapshot"]; isLive: boolean;
 }): string {
-  const { symbol, entryRsi, entryPrice, exitPrice, pnlPct, effectivePnl, closeReason, holdMinutes, entrySnapshot, isLive } = params;
+  const { symbol, entryRsi, exitRsi, entryPrice, exitPrice, pnlPct, effectivePnl, closeReason, holdMinutes, entrySnapshot, isLive } = params;
   const win = effectivePnl >= 0;
 
   const exitLabels: Record<string, string> = {
@@ -401,7 +402,8 @@ function generateTradeLesson(params: {
   }
 
   const result: TradeLesson = {
-    version: 1, symbol, entry_rsi: entryRsi, entry_price: entryPrice, exit_price: exitPrice,
+    version: 1, symbol, entry_rsi: entryRsi, exit_rsi: exitRsi ?? null,
+    entry_price: entryPrice, exit_price: exitPrice,
     pnl_pct: pnlPct, effective_pnl: effectivePnl, hold_minutes: holdMinutes,
     close_reason: closeReason, outcome: win ? "win" : "loss",
     entry_score: score, entry_factors: (entrySnapshot?.reasons ?? []),
@@ -450,13 +452,13 @@ async function checkRiskExits(userId: string, state: UserState, price: number, r
     if (!settings.live_trading) {
       const pnl = (price - entry) * openTrade.size;
       const notes = generateTradeLesson({
-        symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? rsi, entryPrice: entry,
-        exitPrice: price, pnlPct: changePct, effectivePnl: pnl,
+        symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? rsi, exitRsi: rsi,
+        entryPrice: entry, exitPrice: price, pnlPct: changePct, effectivePnl: pnl,
         closeReason, holdMinutes, entrySnapshot: state.entryDecisionSnapshot, isLive: false,
       });
       await closeTrade(openTrade.id, {
         exit_price: price, exit_fees_usd: 0, pnl_usd: pnl, pnl_pct: changePct,
-        effective_pnl: pnl, close_reason: closeReason, notes,
+        effective_pnl: pnl, close_reason: closeReason, notes, rsi_at_exit: rsi,
       });
       if (settings.compound_mode) {
         // Return deployed capital + pnl so balance accurately reflects available cash
@@ -474,14 +476,14 @@ async function checkRiskExits(userId: string, state: UserState, price: number, r
       const realPnlPct = ((fill.fillPrice - entry) / entry) * 100;
       const netPnl     = realPnl - openTrade.entry_fees_usd - fill.feesUsd;
       const notes = generateTradeLesson({
-        symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? rsi, entryPrice: entry,
-        exitPrice: fill.fillPrice, pnlPct: realPnlPct, effectivePnl: netPnl,
+        symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? rsi, exitRsi: rsi,
+        entryPrice: entry, exitPrice: fill.fillPrice, pnlPct: realPnlPct, effectivePnl: netPnl,
         closeReason, holdMinutes, entrySnapshot: state.entryDecisionSnapshot, isLive: true,
       });
       await closeTrade(openTrade.id, {
         exit_price: fill.fillPrice, exit_fees_usd: fill.feesUsd,
         pnl_usd: realPnl, pnl_pct: realPnlPct, effective_pnl: netPnl,
-        close_reason: closeReason, close_order_id: fill.orderId, notes,
+        close_reason: closeReason, close_order_id: fill.orderId, notes, rsi_at_exit: rsi,
       });
       await sendTelegram(fmtSell(settings.symbol, rsi, fill.fillPrice, entry, realPnl, realPnlPct, true, exitLabel));
       await logTick(userId, settings.symbol, rsi, fill.fillPrice, "sell", `LIVE ${exitLabel}`);
@@ -651,13 +653,13 @@ async function checkTickSell(userId: string, state: UserState, symState: SymbolS
     if (!settings.live_trading) {
       const pnl = (currentPrice - entry) * openTrade.size;
       const notes = generateTradeLesson({
-        symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? lastRsi, entryPrice: entry,
-        exitPrice: currentPrice, pnlPct, effectivePnl: pnl,
+        symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? lastRsi, exitRsi: lastRsi,
+        entryPrice: entry, exitPrice: currentPrice, pnlPct, effectivePnl: pnl,
         closeReason: "rsi_signal", holdMinutes, entrySnapshot: state.entryDecisionSnapshot, isLive: false,
       });
       await closeTrade(openTrade.id, {
         exit_price: currentPrice, exit_fees_usd: 0, pnl_usd: pnl, pnl_pct: pnlPct,
-        effective_pnl: pnl, close_reason: "rsi_signal", notes,
+        effective_pnl: pnl, close_reason: "rsi_signal", notes, rsi_at_exit: lastRsi,
       });
       if (settings.compound_mode) {
         // Return deployed capital + pnl so balance accurately reflects available cash
@@ -675,14 +677,14 @@ async function checkTickSell(userId: string, state: UserState, symState: SymbolS
       const realPnlPct = ((fill.fillPrice - entry) / entry) * 100;
       const netPnl     = realPnl - openTrade.entry_fees_usd - fill.feesUsd;
       const notes = generateTradeLesson({
-        symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? lastRsi, entryPrice: entry,
-        exitPrice: fill.fillPrice, pnlPct: realPnlPct, effectivePnl: netPnl,
+        symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? lastRsi, exitRsi: lastRsi,
+        entryPrice: entry, exitPrice: fill.fillPrice, pnlPct: realPnlPct, effectivePnl: netPnl,
         closeReason: "rsi_signal", holdMinutes, entrySnapshot: state.entryDecisionSnapshot, isLive: true,
       });
       await closeTrade(openTrade.id, {
         exit_price: fill.fillPrice, exit_fees_usd: fill.feesUsd,
         pnl_usd: realPnl, pnl_pct: realPnlPct, effective_pnl: netPnl,
-        close_reason: "rsi_signal", close_order_id: fill.orderId, notes,
+        close_reason: "rsi_signal", close_order_id: fill.orderId, notes, rsi_at_exit: lastRsi,
       });
       await sendTelegram(fmtSell(settings.symbol, lastRsi, fill.fillPrice, entry, realPnl, realPnlPct, true, "RSI tick sell"));
       await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "sell", `LIVE TICK SELL — RSI ${lastRsi.toFixed(1)} filled @ $${fill.fillPrice.toFixed(2)}`);
@@ -877,13 +879,13 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
       if (!settings.live_trading) {
         const pnl = (currentPrice - entry) * openTrade.size;
         const notes = generateTradeLesson({
-          symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? lastRsi, entryPrice: entry,
-          exitPrice: currentPrice, pnlPct, effectivePnl: pnl,
+          symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? lastRsi, exitRsi: lastRsi,
+          entryPrice: entry, exitPrice: currentPrice, pnlPct, effectivePnl: pnl,
           closeReason: "rsi_signal", holdMinutes, entrySnapshot: state.entryDecisionSnapshot, isLive: false,
         });
         await closeTrade(openTrade.id, {
           exit_price: currentPrice, exit_fees_usd: 0, pnl_usd: pnl, pnl_pct: pnlPct,
-          effective_pnl: pnl, close_reason: "rsi_signal", notes,
+          effective_pnl: pnl, close_reason: "rsi_signal", notes, rsi_at_exit: lastRsi,
         });
         if (settings.compound_mode) {
           // Return deployed capital + pnl so balance accurately reflects available cash
@@ -905,10 +907,10 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
         await closeTrade(openTrade.id, {
           exit_price: fill.fillPrice, exit_fees_usd: fill.feesUsd,
           pnl_usd: realPnl, pnl_pct: realPnlPct, effective_pnl: netPnl,
-          close_reason: "rsi_signal", close_order_id: fill.orderId,
+          close_reason: "rsi_signal", close_order_id: fill.orderId, rsi_at_exit: lastRsi,
           notes: generateTradeLesson({
-            symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? lastRsi, entryPrice: entry,
-            exitPrice: fill.fillPrice, pnlPct: realPnlPct, effectivePnl: netPnl,
+            symbol: settings.symbol, entryRsi: openTrade.rsi_at_entry ?? lastRsi, exitRsi: lastRsi,
+            entryPrice: entry, exitPrice: fill.fillPrice, pnlPct: realPnlPct, effectivePnl: netPnl,
             closeReason: "rsi_signal", holdMinutes, entrySnapshot: state.entryDecisionSnapshot, isLive: true,
           }),
         });

@@ -59,6 +59,7 @@ export interface OpenTrade {
   entry_fees_usd: number;
   trailing_high: number | null;
   rsi_at_entry: number;
+  created_at: string;            // ISO timestamp — used for hold_minutes calc
   scale_in_count: number;        // 0 = not yet scaled in, 1 = scaled in once
   scale_in_price: number | null; // price at which scale-in fired
   scale_in_quote_size: number | null; // dollar amount of the scale-in
@@ -87,7 +88,7 @@ export async function loadAllSettings(): Promise<Settings[]> {
     "take_profit_pct,trailing_stop_pct,daily_loss_limit_usd,max_drawdown_pct," +
     "max_spread_pct,max_volatility_pct,entry_score_threshold,enabled," +
     "compound_mode,paper_balance_usd,paper_starting_balance_usd," +
-    "scale_in_enabled,scale_in_rsi_threshold,scale_in_amount_usd",
+    "scale_in_enabled,scale_in_rsi_threshold,scale_in_amount_usd,max_buy_usd",
   );
 }
 
@@ -119,7 +120,7 @@ export async function updateScaleIn(
 
 /** Load open trade for a user (null if none) */
 export async function loadOpenTrade(userId: string): Promise<OpenTrade | null> {
-  const rows = await rest("GET", `/trades?user_id=eq.${userId}&status=eq.open&select=id,entry_price,size,quote_size,entry_fees_usd,trailing_high,rsi_at_entry,scale_in_count,scale_in_price,scale_in_quote_size&limit=1`);
+  const rows = await rest("GET", `/trades?user_id=eq.${userId}&status=eq.open&select=id,entry_price,size,quote_size,entry_fees_usd,trailing_high,rsi_at_entry,created_at,scale_in_count,scale_in_price,scale_in_quote_size&limit=1`);
   if (!rows?.length) return null;
   const r = rows[0];
   return {
@@ -130,6 +131,10 @@ export async function loadOpenTrade(userId: string): Promise<OpenTrade | null> {
     entry_fees_usd: Number(r.entry_fees_usd ?? 0),
     trailing_high: r.trailing_high ? Number(r.trailing_high) : null,
     rsi_at_entry: Number(r.rsi_at_entry ?? 0),
+    created_at: r.created_at,
+    scale_in_count: Number(r.scale_in_count ?? 0),
+    scale_in_price: r.scale_in_price ? Number(r.scale_in_price) : null,
+    scale_in_quote_size: r.scale_in_quote_size ? Number(r.scale_in_quote_size) : null,
   };
 }
 
@@ -213,6 +218,7 @@ export async function closeTrade(id: string, update: {
   exit_price: number; exit_fees_usd: number;
   pnl_usd: number; pnl_pct: number; effective_pnl: number;
   close_reason: string; close_order_id?: string; notes: string;
+  rsi_at_exit?: number;
 }): Promise<void> {
   await rest("PATCH", `/trades?id=eq.${id}`, {
     ...update,
