@@ -52,8 +52,11 @@ async function resolveOrderSize(settings: Settings, creds: Credentials | null, c
     balance = settings.paper_balance_usd;
   }
   const deployPct = tieredDeployPct(balance);
-  const size = balance * deployPct;
-  console.log(`[compound] balance=$${balance.toFixed(2)} tier=${(deployPct*100).toFixed(0)}% orderSize=$${size.toFixed(2)}`);
+  let size = balance * deployPct;
+  // Hard cap: if max_buy_usd is set (> 0), never exceed it regardless of balance
+  const cap = settings.max_buy_usd ?? 0;
+  if (cap > 0 && size > cap) size = cap;
+  console.log(`[compound] balance=$${balance.toFixed(2)} tier=${(deployPct*100).toFixed(0)}% orderSize=$${size.toFixed(2)}${cap > 0 ? ` (capped at $${cap})` : ""}`);
   return size;
 }
 

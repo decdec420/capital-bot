@@ -86,6 +86,7 @@ interface BotSettings {
   scale_in_enabled?: boolean;
   scale_in_rsi_threshold?: number;
   scale_in_amount_usd?: number;
+  max_buy_usd?: number;
 }
 
 interface Candle {
@@ -1587,19 +1588,15 @@ function TradeCard({ trade, num }: { trade: Trade; num: number }) {
   }
 
   return (
-    <div style={{ borderBottom: "1px solid var(--t-border)" }}>
+    <div style={{ borderBottom: "1px solid var(--t-border)", borderLeft: `3px solid ${accent}` }}>
       {/* Collapsed row */}
       <div
         onClick={() => setOpen(o => !o)}
         style={{ padding: "10px 14px", cursor: "pointer", background: open ? "var(--bg-2)" : "transparent", userSelect: "none" }}
       >
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        {/* Top line: number/symbol/pills + P&L */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            {/* Win/loss indicator */}
-            <div style={{
-              width: 6, height: 6, borderRadius: "50%", flexShrink: 0,
-              background: accent, boxShadow: `0 0 6px ${accent}`,
-            }} />
             <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text)", fontFamily: "JetBrains Mono, monospace" }}>
               #{num} {trade.symbol}
             </span>
@@ -1610,17 +1607,32 @@ function TradeCard({ trade, num }: { trade: Trade; num: number }) {
               <span style={{ fontSize: 9, color: "var(--text-4)", fontFamily: "JetBrains Mono, monospace" }}>SIM</span>
             )}
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <div style={{ textAlign: "right" }}>
-              <div style={{ fontSize: 12, fontWeight: 700, color: accent, fontFamily: "JetBrains Mono, monospace" }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: accent, fontFamily: "JetBrains Mono, monospace" }}>
                 {pnl >= 0 ? "+" : "−"}{fmtUSD(Math.abs(pnl))}
               </div>
-              <div style={{ fontSize: 10, color: "var(--text-4)", fontFamily: "JetBrains Mono, monospace" }}>
-                {fmtPct(pnlPct)} · {fmtDuration(trade.created_at, trade.closed_at)}
+              <div style={{ fontSize: 10, color: accent, opacity: 0.8, fontFamily: "JetBrains Mono, monospace" }}>
+                {fmtPct(pnlPct)}
               </div>
             </div>
             <span style={{ fontSize: 9, color: "var(--text-4)" }}>{open ? "▲" : "▼"}</span>
           </div>
+        </div>
+        {/* Second line: deployed, RSI, duration, entry price */}
+        <div style={{ display: "flex", gap: 16, fontFamily: "JetBrains Mono, monospace" }}>
+          <span style={{ fontSize: 9.5, color: "var(--text-3)" }}>
+            <span style={{ color: "var(--text-4)" }}>deployed </span>{fmtUSD(trade.quote_size)}
+          </span>
+          <span style={{ fontSize: 9.5, color: "var(--text-3)" }}>
+            <span style={{ color: "var(--text-4)" }}>RSI </span>{trade.rsi_at_entry?.toFixed(1) ?? "—"}
+          </span>
+          <span style={{ fontSize: 9.5, color: "var(--text-3)" }}>
+            <span style={{ color: "var(--text-4)" }}>held </span>{fmtDuration(trade.created_at, trade.closed_at)}
+          </span>
+          <span style={{ fontSize: 9.5, color: "var(--text-3)" }}>
+            <span style={{ color: "var(--text-4)" }}>entry </span>{fmtUSD(trade.entry_price)}
+          </span>
         </div>
       </div>
 
@@ -1962,10 +1974,13 @@ export default function Dashboard() {
           (() => {
             const balance  = settings.paper_balance_usd ?? 0;
             const seed     = settings.paper_starting_balance_usd ?? balance;
-            const growth   = seed > 0 ? ((balance - seed) / seed) * 100 : 0;
+            // Return = actual realized P&L relative to seed capital — NOT balance inflation
+            // balance growth is misleading in compound mode since capital is recycled, not earned
+            const realReturn = seed > 0 ? (totalPnl / seed) * 100 : 0;
             const deployPct = balance < 100 ? 90 : balance < 500 ? 80 : balance < 1000 ? 70 : 50;
-            const nextOrder = balance * (deployPct / 100);
-            // (projection calc reserved for future use)
+            const rawOrder  = balance * (deployPct / 100);
+            const cap       = settings.max_buy_usd ?? 0;
+            const nextOrder = cap > 0 ? Math.min(rawOrder, cap) : rawOrder;
             // When in a trade, show cash-on-hand (balance minus capital currently deployed)
             const inTradeAmt  = openTrade ? Number(openTrade.quote_size ?? 0) : 0;
             const cashOnHand  = balance - inTradeAmt;
@@ -1988,8 +2003,8 @@ export default function Dashboard() {
                     color: inTrade ? "var(--amber)" : (balance >= seed ? "var(--green)" : "var(--red)"),
                     glow: !inTrade && balance >= seed,
                   },
-                  { label: "RETURN", value: `${growth >= 0 ? "+" : ""}${growth.toFixed(1)}%`, sub: "since seed capital", color: growth >= 0 ? "var(--green)" : "var(--red)", glow: growth >= 0 },
-                  { label: "NEXT STAKE", value: `$${nextOrder.toFixed(2)}`, sub: `${deployPct}% of balance · tiered`, color: "var(--cyan)", glow: true },
+                  { label: "RETURN", value: `${realReturn >= 0 ? "+" : ""}${realReturn.toFixed(1)}%`, sub: `${fmtUSD(totalPnl)} realized · seed ${fmtUSD(seed)}`, color: realReturn >= 0 ? "var(--green)" : "var(--red)", glow: realReturn > 0 },
+                  { label: "NEXT STAKE", value: `$${nextOrder.toFixed(2)}`, sub: cap > 0 ? `capped at $${cap} · compound` : `${deployPct}% of balance · tiered`, color: "var(--cyan)", glow: true },
                 ].map(({ label, value, sub, color, glow }) => (
                   <div key={label} style={{
                     padding: "14px 18px",

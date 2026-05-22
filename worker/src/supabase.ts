@@ -38,6 +38,8 @@ export interface Settings {
   scale_in_enabled: boolean;
   scale_in_rsi_threshold: number;     // RSI below this triggers the second buy
   scale_in_amount_usd: number;        // fixed dollar amount for the scale-in buy
+  // Compound cap — 0 = no cap
+  max_buy_usd: number;                // hard ceiling on compound order size
 }
 
 export interface ClosedTradeRiskRow {
