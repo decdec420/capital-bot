@@ -26,10 +26,44 @@ interface Trade {
   created_at: string;
   closed_at?: string;
   entry_fees_usd?: number;
+  notes?: string;
   scale_in_count?: number;
   scale_in_price?: number;
   scale_in_quote_size?: number;
 }
+
+interface TradeLesson {
+  version: number;
+  symbol: string;
+  entry_rsi: number;
+  entry_price: number;
+  exit_price: number;
+  pnl_pct: number;
+  effective_pnl: number;
+  hold_minutes: number;
+  close_reason: string;
+  outcome: "win" | "loss";
+  entry_score: number | null;
+  entry_factors: string[];
+  is_live: boolean;
+  narrative: string;
+  lesson: string;
+  closed_at: string;
+}
+
+function parseLesson(notes?: string): TradeLesson | null {
+  if (!notes) return null;
+  try { return JSON.parse(notes) as TradeLesson; } catch { return null; }
+}
+
+const CLOSE_LABELS: Record<string, string> = {
+  rsi_signal: "RSI EXIT", stop_loss: "STOP LOSS", take_profit: "TAKE PROFIT",
+  trailing_stop: "TRAILING", manual: "MANUAL",
+};
+const CLOSE_COLORS: Record<string, string> = {
+  rsi_signal: "var(--cyan)", stop_loss: "var(--red)", take_profit: "var(--green)",
+  trailing_stop: "var(--amber)", manual: "var(--text-3)",
+};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 function pnl(t: Trade): number {
@@ -131,10 +165,267 @@ interface BotInsight {
   auto_applied: boolean;
 }
 
+// ── Trade detail card ─────────────────────────────────────────────────────
+function TradeDetailCard({ trade, num }: { trade: Trade; num: number }) {
+  const [open, setOpen] = useState(false);
+  const p       = Number(trade.effective_pnl ?? trade.pnl_usd ?? 0);
+  const pPct    = Number(trade.pnl_pct ?? 0);
+  const win     = p >= 0;
+  const accent  = win ? "#4ade80" : "#f87171";
+  const lesson  = parseLesson(trade.notes);
+  const closeLabel = CLOSE_LABELS[trade.close_reason ?? ""] ?? (trade.close_reason ?? "—").toUpperCase();
+  const closeColor = CLOSE_COLORS[trade.close_reason ?? ""] ?? "var(--text-3)";
+
+  const goodFactors = (lesson?.entry_factors ?? []).filter(f => f.startsWith("+")).map(f => f.replace(/^\+\d+ /, ""));
+  const badFactors  = (lesson?.entry_factors ?? []).filter(f => f.startsWith("-")).map(f => f.replace(/^-\d+ /, ""));
+
+  const holdMin = trade.closed_at
+    ? Math.round((new Date(trade.closed_at).getTime() - new Date(trade.created_at).getTime()) / 60_000)
+    : (lesson?.hold_minutes ?? null);
+  const holdStr = holdMin == null ? "—"
+    : holdMin < 60 ? `${holdMin}m`
+    : holdMin < 1440 ? `${Math.floor(holdMin / 60)}h ${holdMin % 60}m`
+    : `${(holdMin / 1440).toFixed(1)}d`;
+
+  const entryDate = new Date(trade.created_at);
+  const exitDate  = trade.closed_at ? new Date(trade.closed_at) : null;
+  const fmtDate   = (d: Date) => d.toLocaleDateString("en-US", { month: "short", day: "numeric" }) + " " + d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
+
+  const MAX_SCORE = 12;
+  const score = lesson?.entry_score ?? null;
+  const scorePct = score != null ? Math.max(0, Math.min(1, score / MAX_SCORE)) : null;
+  const scoreColor = score == null ? "var(--text-4)" : score >= 8 ? "#4ade80" : score >= 5 ? "var(--cyan)" : score >= 3 ? "var(--amber)" : "#f87171";
+
+  const hasScaleIn = (trade.scale_in_count ?? 0) > 0;
+  const scaleInUsd = Number(trade.scale_in_quote_size ?? 0);
+  const scaleInPx  = Number(trade.scale_in_price ?? 0);
+
+  return (
+    <div style={{ borderBottom: "1px solid rgba(255,255,255,0.05)", borderLeft: `3px solid ${accent}` }}>
+      {/* ── Collapsed row ── */}
+      <div
+        onClick={() => setOpen(o => !o)}
+        style={{ padding: "11px 20px", cursor: "pointer", display: "flex", alignItems: "center", gap: 0,
+          background: open ? "rgba(255,255,255,0.03)" : "transparent" }}
+      >
+        {/* Trade # + date */}
+        <div style={{ minWidth: 90, flexShrink: 0 }}>
+          <div className="mono" style={{ fontSize: 11, fontWeight: 700, color: "rgba(255,255,255,0.9)" }}>#{num}</div>
+          <div className="mono" style={{ fontSize: 9, color: "rgba(255,255,255,0.3)", marginTop: 1 }}>
+            {entryDate.toLocaleDateString("en-US", { month: "short", day: "numeric" })}
+          </div>
+        </div>
+        {/* Entry → Exit prices */}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="mono" style={{ fontSize: 10.5, color: "rgba(255,255,255,0.7)" }}>
+            ${Number(trade.entry_price).toLocaleString("en-US", { maximumFractionDigits: 0 })}
+            <span style={{ color: "rgba(255,255,255,0.25)", margin: "0 5px" }}>→</span>
+            {trade.exit_price
+              ? `$${Number(trade.exit_price).toLocaleString("en-US", { maximumFractionDigits: 0 })}`
+              : <span style={{ color: "rgba(255,255,255,0.25)" }}>—</span>}
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 3, flexWrap: "wrap" }}>
+            {trade.rsi_at_entry != null && (
+              <span className="mono" style={{ fontSize: 9, color: "rgba(255,255,255,0.35)" }}>
+                RSI {trade.rsi_at_entry.toFixed(1)}
+              </span>
+            )}
+            <span className="mono" style={{ fontSize: 9, color: "rgba(255,255,255,0.3)" }}>
+              ${Number(trade.quote_size).toFixed(0)} deployed
+            </span>
+            <span className="mono" style={{ fontSize: 9, color: "rgba(255,255,255,0.3)" }}>{holdStr}</span>
+            {hasScaleIn && <span className="mono" style={{ fontSize: 9, color: "var(--cyan)", opacity: 0.7 }}>SCALED</span>}
+          </div>
+        </div>
+        {/* P&L + close reason */}
+        <div style={{ textAlign: "right", flexShrink: 0, marginRight: 12 }}>
+          <div className="mono" style={{ fontSize: 15, fontWeight: 700, color: accent, lineHeight: 1 }}>
+            {p >= 0 ? "+" : "−"}${Math.abs(p).toFixed(2)}
+          </div>
+          <div className="mono" style={{ fontSize: 10, color: accent, opacity: 0.75, marginTop: 2 }}>
+            {(pPct >= 0 ? "+" : "")}{pPct.toFixed(2)}%
+          </div>
+          <div className="mono" style={{ fontSize: 8, color: closeColor, marginTop: 3, letterSpacing: "0.06em" }}>{closeLabel}</div>
+        </div>
+        <span className="mono" style={{ fontSize: 9, color: "rgba(255,255,255,0.25)", flexShrink: 0 }}>{open ? "▲" : "▼"}</span>
+      </div>
+
+      {/* ── Expanded detail ── */}
+      {open && (
+        <div style={{ background: "rgba(0,0,0,0.3)", borderTop: "1px solid rgba(255,255,255,0.05)", padding: "20px" }}>
+
+          {/* Price journey header */}
+          <div style={{ display: "flex", alignItems: "stretch", gap: 0, marginBottom: 20, background: "rgba(255,255,255,0.03)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.07)", overflow: "hidden" }}>
+            <div style={{ flex: 1, padding: "14px 18px" }}>
+              <div className="mono" style={{ fontSize: 8, color: "rgba(255,255,255,0.3)", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 6 }}>ENTRY</div>
+              <div className="mono" style={{ fontSize: 22, fontWeight: 700, color: "rgba(255,255,255,0.9)", lineHeight: 1 }}>
+                ${Number(trade.entry_price).toLocaleString("en-US", { minimumFractionDigits: 2 })}
+              </div>
+              <div className="mono" style={{ fontSize: 9, color: "rgba(255,255,255,0.3)", marginTop: 5 }}>{fmtDate(entryDate)}</div>
+              {trade.rsi_at_entry != null && (
+                <div className="mono" style={{ fontSize: 10, color: "var(--cyan)", marginTop: 4 }}>RSI {trade.rsi_at_entry.toFixed(1)} at entry</div>
+              )}
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "0 20px", borderLeft: "1px solid rgba(255,255,255,0.07)", borderRight: "1px solid rgba(255,255,255,0.07)" }}>
+              <div className="mono" style={{ fontSize: 20, fontWeight: 800, color: accent, lineHeight: 1 }}>
+                {p >= 0 ? "+" : "−"}${Math.abs(p).toFixed(2)}
+              </div>
+              <div className="mono" style={{ fontSize: 11, color: accent, opacity: 0.8, marginTop: 3 }}>
+                {(pPct >= 0 ? "+" : "")}{pPct.toFixed(2)}%
+              </div>
+              <div className="mono" style={{ fontSize: 9, color: "rgba(255,255,255,0.2)", marginTop: 6 }}>{holdStr} held</div>
+            </div>
+            <div style={{ flex: 1, padding: "14px 18px", textAlign: "right" }}>
+              <div className="mono" style={{ fontSize: 8, color: "rgba(255,255,255,0.3)", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 6 }}>EXIT</div>
+              <div className="mono" style={{ fontSize: 22, fontWeight: 700, color: "rgba(255,255,255,0.9)", lineHeight: 1 }}>
+                {trade.exit_price ? `$${Number(trade.exit_price).toLocaleString("en-US", { minimumFractionDigits: 2 })}` : "—"}
+              </div>
+              <div className="mono" style={{ fontSize: 9, color: "rgba(255,255,255,0.3)", marginTop: 5 }}>
+                {exitDate ? fmtDate(exitDate) : "—"}
+              </div>
+              <div className="mono" style={{ fontSize: 10, color: closeColor, marginTop: 4 }}>{closeLabel}</div>
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+
+            {/* Left col: Entry decision */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+
+              {/* Score */}
+              {score != null && (
+                <div style={{ padding: "14px 16px", background: "rgba(255,255,255,0.03)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.07)" }}>
+                  <div className="mono" style={{ fontSize: 8, color: "rgba(255,255,255,0.3)", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 8 }}>Entry Score</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                    <div className="mono" style={{ fontSize: 24, fontWeight: 800, color: scoreColor, lineHeight: 1 }}>{score}</div>
+                    <div className="mono" style={{ fontSize: 11, color: "rgba(255,255,255,0.3)" }}>/ {MAX_SCORE}</div>
+                    <div className="mono" style={{ fontSize: 10, color: scoreColor, marginLeft: "auto" }}>
+                      {score >= 8 ? "HIGH QUALITY" : score >= 5 ? "DECENT" : score >= 3 ? "MARGINAL" : "WEAK"}
+                    </div>
+                  </div>
+                  <div style={{ height: 5, background: "rgba(255,255,255,0.08)", borderRadius: 3, overflow: "hidden" }}>
+                    <div style={{ height: "100%", width: `${(scorePct ?? 0) * 100}%`, background: scoreColor, borderRadius: 3, transition: "width 0.5s ease" }} />
+                  </div>
+                </div>
+              )}
+
+              {/* Entry factors */}
+              {(goodFactors.length > 0 || badFactors.length > 0) && (
+                <div style={{ padding: "14px 16px", background: "rgba(255,255,255,0.03)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.07)" }}>
+                  <div className="mono" style={{ fontSize: 8, color: "rgba(255,255,255,0.3)", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 10 }}>Decision Factors</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                    {goodFactors.map((f, i) => (
+                      <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                        <span style={{ color: "#4ade80", fontSize: 11, minWidth: 12 }}>✓</span>
+                        <span className="mono" style={{ fontSize: 10, color: "rgba(255,255,255,0.65)", lineHeight: 1.4 }}>{f}</span>
+                      </div>
+                    ))}
+                    {badFactors.map((f, i) => (
+                      <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                        <span style={{ color: "#f87171", fontSize: 11, minWidth: 12 }}>✗</span>
+                        <span className="mono" style={{ fontSize: 10, color: "rgba(255,255,255,0.65)", lineHeight: 1.4 }}>{f}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Scale-in detail */}
+              {hasScaleIn && (
+                <div style={{ padding: "14px 16px", background: "rgba(0,229,255,0.04)", borderRadius: 8, border: "1px solid rgba(0,229,255,0.15)" }}>
+                  <div className="mono" style={{ fontSize: 8, color: "var(--cyan)", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 8 }}>Scale-In Fired</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                    <div>
+                      <div className="mono" style={{ fontSize: 8, color: "rgba(255,255,255,0.3)", marginBottom: 3 }}>SCALE-IN PRICE</div>
+                      <div className="mono" style={{ fontSize: 12, color: "var(--cyan)" }}>${scaleInPx > 0 ? scaleInPx.toLocaleString("en-US", { maximumFractionDigits: 2 }) : "—"}</div>
+                    </div>
+                    <div>
+                      <div className="mono" style={{ fontSize: 8, color: "rgba(255,255,255,0.3)", marginBottom: 3 }}>ADDED</div>
+                      <div className="mono" style={{ fontSize: 12, color: "var(--cyan)" }}>${scaleInUsd > 0 ? scaleInUsd.toFixed(2) : "—"}</div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Right col: Narrative + stats */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+
+              {/* Bot narrative */}
+              {lesson?.narrative && (
+                <div style={{ padding: "14px 16px", background: "rgba(255,255,255,0.03)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.07)" }}>
+                  <div className="mono" style={{ fontSize: 8, color: "rgba(255,255,255,0.3)", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 8 }}>What Happened</div>
+                  <div className="mono" style={{ fontSize: 11, color: "rgba(255,255,255,0.7)", lineHeight: 1.7 }}>{lesson.narrative}</div>
+                </div>
+              )}
+
+              {/* Bot lesson */}
+              {lesson?.lesson && (
+                <div style={{ padding: "12px 16px", background: `${accent}0d`, borderRadius: 8, border: `1px solid ${accent}30`, borderLeft: `3px solid ${accent}` }}>
+                  <div className="mono" style={{ fontSize: 8, color: accent, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 6 }}>Bot's Takeaway</div>
+                  <div className="mono" style={{ fontSize: 11, color: "rgba(255,255,255,0.75)", lineHeight: 1.6 }}>{lesson.lesson}</div>
+                </div>
+              )}
+
+              {/* Stats grid */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+                {[
+                  { label: "RSI at entry",  value: trade.rsi_at_entry?.toFixed(1) ?? "—" },
+                  { label: "Deployed",       value: `$${Number(trade.quote_size).toFixed(2)}` },
+                  { label: "Size",           value: trade.size != null ? `${Number(trade.size).toFixed(6)} BTC` : "—" },
+                  { label: "Hold time",      value: holdStr },
+                  { label: "Entry fees",     value: trade.entry_fees_usd != null ? `$${Number(trade.entry_fees_usd).toFixed(4)}` : "—" },
+                  { label: "Mode",           value: lesson?.is_live === true ? "LIVE" : "PAPER" },
+                ].map(({ label, value }) => (
+                  <div key={label} style={{ padding: "10px 12px", background: "rgba(255,255,255,0.03)", borderRadius: 6, border: "1px solid rgba(255,255,255,0.06)" }}>
+                    <div className="mono" style={{ fontSize: 8, color: "rgba(255,255,255,0.3)", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>{label}</div>
+                    <div className="mono" style={{ fontSize: 11, color: "rgba(255,255,255,0.8)" }}>{value}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Trade log panel ───────────────────────────────────────────────────────
+function TradeLog({ trades }: { trades: Trade[] }) {
+  const reversed = [...trades].reverse(); // newest first
+  if (!reversed.length) {
+    return (
+      <div className="hud-panel" style={{ padding: 40, textAlign: "center" }}>
+        <div className="mono dim" style={{ fontSize: 12 }}>No closed trades yet.</div>
+      </div>
+    );
+  }
+  const totalPnl = reversed.reduce((s, t) => s + Number(t.effective_pnl ?? t.pnl_usd ?? 0), 0);
+  const wins = reversed.filter(t => Number(t.effective_pnl ?? t.pnl_usd ?? 0) >= 0).length;
+  return (
+    <div className="hud-panel" style={{ overflow: "hidden" }}>
+      <div style={{ padding: "14px 20px", borderBottom: "1px solid rgba(255,255,255,0.07)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div>
+          <div className="mono" style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.08em", color: "rgba(255,255,255,0.4)" }}>Trade Journal</div>
+          <div className="mono" style={{ fontSize: 12, marginTop: 2 }}>{reversed.length} closed trades · {wins}W / {reversed.length - wins}L</div>
+        </div>
+        <div className="mono" style={{ fontSize: 15, fontWeight: 700, color: totalPnl >= 0 ? "#4ade80" : "#f87171" }}>
+          {totalPnl >= 0 ? "+" : "−"}${Math.abs(totalPnl).toFixed(2)} net
+        </div>
+      </div>
+      {reversed.map((t, i) => (
+        <TradeDetailCard key={t.id} trade={t} num={reversed.length - i} />
+      ))}
+    </div>
+  );
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────
 export default function Performance() {
   const { user, signOut } = useAuth();
   const [now] = useState(Date.now());
+  const [tab, setTab] = useState<"analytics" | "trades">("analytics");
 
   const { data: trades = [], isFetching, refetch } = useQuery<Trade[]>({
     queryKey: ["perf-trades"],
@@ -294,6 +585,19 @@ export default function Performance() {
               <Settings size={11} /> Settings
             </Link>
           </nav>
+          {/* ── Sub-tabs ── */}
+          <div style={{ display: "flex", gap: 2, marginLeft: 16, background: "rgba(255,255,255,0.05)", borderRadius: 6, padding: 3 }}>
+            {(["analytics", "trades"] as const).map(t => (
+              <button key={t} onClick={() => setTab(t)} className="t-btn" style={{
+                background: tab === t ? "rgba(255,255,255,0.12)" : "transparent",
+                color: tab === t ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.4)",
+                fontWeight: tab === t ? 600 : 400,
+                fontSize: 10, padding: "3px 10px",
+              }}>
+                {t === "analytics" ? "Analytics" : `Trades${trades.length ? ` (${trades.length})` : ""}`}
+              </button>
+            ))}
+          </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <span className="mono dim" style={{ fontSize: 10 }}>{new Date(now).toLocaleDateString()}</span>
@@ -375,7 +679,12 @@ export default function Performance() {
           </div>
         )}
 
-        {summary && (
+        {/* ── Trades tab ── */}
+        {tab === "trades" && trades.length > 0 && (
+          <TradeLog trades={sorted} />
+        )}
+
+        {tab === "analytics" && summary && (
           <>
             {/* ── Scoreboard ── */}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10, marginBottom: 16 }}>
