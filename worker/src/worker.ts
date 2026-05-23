@@ -448,6 +448,10 @@ async function checkRiskExits(userId: string, state: UserState, price: number, r
 
   const holdMinutes = Math.round((Date.now() - new Date(openTrade.created_at ?? Date.now()).getTime()) / 60_000);
 
+  // Optimistic clear: prevents any concurrent/subsequent path from attempting a second close
+  // while async operations are in flight. Restored on failure so the next tick can retry.
+  state.openTrade = null;
+
   try {
     if (!settings.live_trading) {
       const pnl = (price - entry) * openTrade.size;
@@ -488,22 +492,21 @@ async function checkRiskExits(userId: string, state: UserState, price: number, r
       await sendTelegram(fmtSell(settings.symbol, rsi, fill.fillPrice, entry, realPnl, realPnlPct, true, exitLabel));
       await logTick(userId, settings.symbol, rsi, fill.fillPrice, "sell", `LIVE ${exitLabel}`);
     }
-    state.openTrade = null;
   } catch (e) {
     console.error(`[risk] exit failed for ${userId}:`, e instanceof Error ? e.message : String(e));
-    // Fix #14: if a live sell timed out, Coinbase may have already filled the order.
-    // Clear the in-memory openTrade to stop the worker retrying on every tick
-    // (which would fail as a duplicate clientOrderId). Log an error so it's visible.
-    // Manual reconciliation: check Coinbase orders and update the DB trade if needed.
     if (settings.live_trading) {
+      // Live sell failed — unclear if Coinbase filled it. Don't restore openTrade;
+      // keep it null and alert so the user can reconcile manually.
       console.warn(`[risk] clearing openTrade for ${userId} after failed live exit — verify position on Coinbase`);
-      state.openTrade = null;
       await logTick(userId, settings.symbol, rsi, price, "error",
         `LIVE SELL FAILED — position cleared from worker memory. Check Coinbase manually. Error: ${e instanceof Error ? e.message : String(e)}`
       ).catch(console.error);
       await sendTelegram(
         `⚠️ capital-bot: live sell FAILED for ${settings.symbol}.\nError: ${e instanceof Error ? e.message : String(e)}\nPosition cleared from worker — CHECK COINBASE IMMEDIATELY.`
       ).catch(console.error);
+    } else {
+      // Paper sell failed — safe to restore and retry on the next tick
+      state.openTrade = openTrade;
     }
   }
   return true;
@@ -649,6 +652,9 @@ async function checkTickSell(userId: string, state: UserState, symState: SymbolS
   const pnlPct     = ((currentPrice - entry) / entry) * 100;
   const holdMinutes = Math.round((now - new Date(openTrade.created_at ?? now).getTime()) / 60_000);
 
+  // Optimistic clear: any code path that runs while we await will see no open trade
+  state.openTrade = null;
+
   try {
     if (!settings.live_trading) {
       const pnl = (currentPrice - entry) * openTrade.size;
@@ -689,11 +695,16 @@ async function checkTickSell(userId: string, state: UserState, symState: SymbolS
       await sendTelegram(fmtSell(settings.symbol, lastRsi, fill.fillPrice, entry, realPnl, realPnlPct, true, "RSI tick sell"));
       await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "sell", `LIVE TICK SELL — RSI ${lastRsi.toFixed(1)} filled @ $${fill.fillPrice.toFixed(2)}`);
     }
-    state.openTrade = null;
+    // state.openTrade is already null (cleared optimistically above)
     state.entryDecisionSnapshot = null;
   } catch (e) {
     console.error(`[tick-sell] sell failed for ${userId}:`, e instanceof Error ? e.message : String(e));
-    state.lastSellCheckMs = 0; // reset debounce so it retries next tick
+    // Restore open trade so the next tick can retry (paper only — for live, keep null
+    // to avoid double-selling; user must reconcile manually if the order went through)
+    if (!settings.live_trading) {
+      state.openTrade = openTrade;
+      state.lastSellCheckMs = 0; // reset debounce so it retries promptly
+    }
   }
 }
 
@@ -872,6 +883,9 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
   // ── SELL (RSI signal) ───────────────────────────────────
   if (sellSignal && openTrade) {
     console.log(`[signal] ${userId} SELL — RSI ${lastRsi.toFixed(2)} > ${settings.rsi_sell_threshold} @ $${currentPrice.toFixed(2)}`);
+    // Optimistic clear before any async operations — prevents double-sell if tick-sell
+    // fires concurrently or if this function is re-entered before await resolves
+    state.openTrade = null;
     try {
       const entry  = openTrade.entry_price;
       const pnlPct = ((currentPrice - entry) / entry) * 100;
@@ -919,9 +933,12 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
           regime: decision.marketRegime,
         });
       }
-      state.openTrade = null;
+      // state.openTrade already null (cleared optimistically above)
+      state.entryDecisionSnapshot = null;
     } catch (e) {
       console.error(`[signal] sell failed for ${userId}:`, e instanceof Error ? e.message : String(e));
+      // Restore on paper failure so next candle can retry
+      if (!settings.live_trading) state.openTrade = openTrade;
     }
     return;
   }

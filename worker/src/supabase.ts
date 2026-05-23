@@ -220,7 +220,9 @@ export async function closeTrade(id: string, update: {
   close_reason: string; close_order_id?: string; notes: string;
   rsi_at_exit?: number;
 }): Promise<void> {
-  await rest("PATCH", `/trades?id=eq.${id}`, {
+  // status=eq.open guard: if this trade was already closed (double-sell race),
+  // PostgREST will match zero rows and do nothing — prevents corrupt duplicate closes.
+  await rest("PATCH", `/trades?id=eq.${id}&status=eq.open`, {
     ...update,
     status: "closed",
     closed_at: new Date().toISOString(),

@@ -55,6 +55,14 @@ export class CoinbaseWs {
         product_ids: this.symbols,
         channel: "market_trades",
       }));
+      // Subscribe to heartbeats — Coinbase sends one per second, keeping the
+      // connection alive and preventing the load balancer from dropping it
+      // after a few hours of perceived inactivity.
+      ws.send(JSON.stringify({
+        type: "subscribe",
+        product_ids: this.symbols,
+        channel: "heartbeats",
+      }));
     };
 
     ws.onmessage = (event) => {
