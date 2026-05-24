@@ -51,6 +51,12 @@ async function resolveOrderSize(settings: Settings, creds: Credentials | null, c
   } else {
     balance = settings.paper_balance_usd;
   }
+  // Guard: if balance is zero (e.g. drained by a loss and floored), fall back to
+  // buy_amount_usd so the bot doesn't create $0 trades and stall permanently.
+  if (balance <= 0) {
+    console.log(`[compound] balance is $0 — falling back to buy_amount_usd $${settings.buy_amount_usd}`);
+    return settings.buy_amount_usd;
+  }
   const deployPct = tieredDeployPct(balance);
   let size = balance * deployPct;
   // Hard cap: if max_buy_usd is set (> 0), never exceed it regardless of balance

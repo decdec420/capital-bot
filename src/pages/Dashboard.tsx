@@ -1981,9 +1981,11 @@ export default function Dashboard() {
             const rawOrder  = balance * (deployPct / 100);
             const cap       = settings.max_buy_usd ?? 0;
             const nextOrder = cap > 0 ? Math.min(rawOrder, cap) : rawOrder;
-            // When in a trade, show cash-on-hand (balance minus capital currently deployed)
+            // When in a trade, paper_balance_usd is ALREADY the remaining cash
+            // (worker deducts the deployed amount at buy time). Total equity = balance + inTradeAmt.
             const inTradeAmt  = openTrade ? Number(openTrade.quote_size ?? 0) : 0;
-            const cashOnHand  = balance - inTradeAmt;
+            const cashOnHand  = balance;           // balance IS the remaining cash — don't subtract again
+            const totalEquity = balance + inTradeAmt;
             const inTrade     = inTradeAmt > 0;
             return (
               <div className="hud-panel" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 0, marginBottom: 12 }}>
@@ -1999,7 +2001,7 @@ export default function Dashboard() {
                   {
                     label: inTrade ? "CASH ON HAND" : "RUNNING BALANCE",
                     value: inTrade ? `$${cashOnHand.toFixed(2)}` : `$${balance.toFixed(2)}`,
-                    sub: inTrade ? `$${inTradeAmt.toFixed(2)} in trade · total $${balance.toFixed(2)}` : `seed $${seed.toFixed(2)}`,
+                    sub: inTrade ? `$${inTradeAmt.toFixed(2)} in trade · total $${totalEquity.toFixed(2)}` : `seed $${seed.toFixed(2)}`,
                     color: inTrade ? "var(--amber)" : (balance >= seed ? "var(--green)" : "var(--red)"),
                     glow: !inTrade && balance >= seed,
                   },
