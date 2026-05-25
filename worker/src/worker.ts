@@ -218,7 +218,20 @@ async function reloadSettings(): Promise<void> {
       } else {
         // Update settings, preserve openTrade and credentials
         const wasLive = existing.settings.live_trading;
+        // Compound balance race-condition fix: preserve the in-memory paper_balance_usd
+        // rather than overwriting it with the DB value. The worker maintains this value
+        // in memory and writes it to DB async — the DB may lag by up to one tick.
+        // If we replace existing.settings with a new object (s), in-flight async functions
+        // still hold a reference to the old settings object and write paper_balance_usd there,
+        // but state.settings now points to s which retains the stale pre-deduction DB value.
+        // On the next close: newBalance = stale_full_balance + quote_size + pnl → inflation.
+        const preservedBalance = existing.settings.paper_balance_usd;
         existing.settings = s;
+        if (s.compound_mode) {
+          // Keep the in-memory balance — it's the authoritative value between DB writes.
+          // On worker restart the new-user path (above) loads from DB, so restarts are safe.
+          existing.settings.paper_balance_usd = preservedBalance;
+        }
 
         // Fix #13: sync openTrade from DB so external closes (dashboard "Close now")
         // are reflected in the worker without a restart. Without this the worker
