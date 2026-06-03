@@ -52,7 +52,7 @@ Deno.serve(async (req) => {
     // Check live mode from settings
     const { data: settings } = await admin
       .from("settings")
-      .select("live_trading")
+      .select("live_trading, compound_mode, paper_balance_usd")
       .eq("user_id", user.id)
       .maybeSingle();
 
@@ -95,6 +95,13 @@ Deno.serve(async (req) => {
     const netPnl   = grossPnl - entryFees - exitFees;
     const pnlPct   = ((fillPrice - entryPrice) / entryPrice) * 100;
 
+    // Fetch full trade for compound balance return (need quote_size + scale_in_quote_size)
+    const { data: fullTrade } = await admin
+      .from("trades")
+      .select("quote_size, scale_in_quote_size")
+      .eq("id", tradeId)
+      .maybeSingle();
+
     await admin.from("trades").update({
       status: "closed",
       exit_price: fillPrice,
@@ -103,9 +110,20 @@ Deno.serve(async (req) => {
       pnl_pct: pnlPct,
       effective_pnl: netPnl,
       closed_at: new Date().toISOString(),
+      close_reason: "manual",
       ...(closeOrderId ? { close_order_id: closeOrderId } : {}),
       notes: `${liveMode ? "LIVE" : "PAPER"} manual close @ $${fillPrice.toFixed(2)} — gross P&L $${grossPnl.toFixed(2)} — net $${netPnl.toFixed(2)}`,
-    }).eq("id", tradeId);
+    }).eq("id", tradeId).eq("status", "open");
+
+    // Return deployed capital to compound balance (paper mode only)
+    if (!liveMode && settings?.compound_mode) {
+      const totalDeployed = Number(fullTrade?.quote_size ?? 0);
+      const { data: cur } = await admin.from("settings").select("paper_balance_usd").eq("user_id", user.id).maybeSingle();
+      const currentBalance = Number(cur?.paper_balance_usd ?? 0);
+      const newBalance = Math.max(0, currentBalance + totalDeployed + netPnl);
+      await admin.from("settings").update({ paper_balance_usd: newBalance }).eq("user_id", user.id);
+      log("info", "compound_balance_returned", { fn: FN, totalDeployed, netPnl, newBalance });
+    }
 
     return json({ ok: true, tradeId, fillPrice, grossPnl, netPnl, pnlPct }, 200, cors);
   } catch (e) {

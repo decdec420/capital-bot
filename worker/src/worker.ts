@@ -66,6 +66,15 @@ async function resolveOrderSize(settings: Settings, creds: Credentials | null, c
   return size;
 }
 
+// ── EMA helper (used for trend filter in entryRiskBlocked) ──
+function calcEma(values: number[], period: number): number | null {
+  if (values.length < period) return null;
+  const k = 2 / (period + 1);
+  let result = values.slice(0, period).reduce((s, v) => s + v, 0) / period;
+  for (const v of values.slice(period)) result = (v - result) * k + result;
+  return result;
+}
+
 // ── Per-symbol shared state ─────────────────────────────────
 
 interface SymbolState {
@@ -301,7 +310,7 @@ async function entryRiskBlocked(
   userId: string, state: UserState, symState: SymbolState, closedCandle: Candle,
 ): Promise<boolean> {
   const { settings, openTrade } = state;
-  const { lastRsi, currentPrice, recentCandles } = symState;
+  const { lastRsi, currentPrice, recentCandles, closePrices } = symState;
 
   if (openTrade) return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `existing_open_position:${openTrade.id}`);
 
@@ -319,6 +328,17 @@ async function entryRiskBlocked(
     const volPct = calcVolatilityPct(closedCandle);
     if (volPct > settings.max_volatility_pct)
       return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `high_volatility_spike:${volPct.toFixed(2)}pct>${settings.max_volatility_pct}pct`);
+  }
+
+  // Hard trend filter: never enter when price is below EMA-200.
+  // Buying below EMA-200 means buying into a sustained downtrend — the primary source of
+  // large stop-loss losses. RSI can reach oversold in a downtrend repeatedly without bouncing.
+  if (closePrices.length >= 200) {
+    const e200 = calcEma(closePrices, 200);
+    if (e200 !== null && currentPrice < e200) {
+      return blockEntry(userId, settings.symbol, lastRsi, currentPrice,
+        `bearish_trend:price_${currentPrice.toFixed(0)}_below_EMA200_${e200.toFixed(0)}`);
+    }
   }
 
   const rows = await loadClosedTradeRiskRows(userId);
@@ -594,7 +614,7 @@ async function checkTickEntry(userId: string, state: UserState, symState: Symbol
         entry_fees_usd: 0, rsi_at_entry: lastRsi,
         notes: `[PAPER] TICK BUY — RSI ${lastRsi.toFixed(1)} < ${settings.rsi_buy_threshold}${settings.compound_mode ? ` [compound $${orderUsd.toFixed(2)}]` : ""}`,
       });
-      state.openTrade = { id, entry_price: currentPrice, size, quote_size: orderUsd, entry_fees_usd: 0, trailing_high: null, rsi_at_entry: lastRsi };
+      state.openTrade = { id, entry_price: currentPrice, size, quote_size: orderUsd, entry_fees_usd: 0, trailing_high: null, rsi_at_entry: lastRsi, created_at: new Date().toISOString(), scale_in_count: 0, scale_in_price: null, scale_in_quote_size: null };
       state.entryDecisionSnapshot = { score: decision.score, reasons: decision.reasons, rsi: lastRsi, price: currentPrice };
       if (settings.compound_mode) {
         // Deduct deployed capital immediately so scale-in and next-buy sizing see correct available cash
@@ -630,7 +650,7 @@ async function checkTickEntry(userId: string, state: UserState, symState: Symbol
         coinbase_order_id: fill.orderId,
         notes: `LIVE TICK BUY — RSI ${lastRsi.toFixed(1)} filled @ $${fill.fillPrice.toFixed(2)}`,
       });
-      state.openTrade = { id: pendingId, entry_price: fill.fillPrice, size: fill.filledBaseSize, quote_size: fill.filledQuoteSize, entry_fees_usd: fill.feesUsd, trailing_high: null, rsi_at_entry: lastRsi };
+      state.openTrade = { id: pendingId, entry_price: fill.fillPrice, size: fill.filledBaseSize, quote_size: fill.filledQuoteSize, entry_fees_usd: fill.feesUsd, trailing_high: null, rsi_at_entry: lastRsi, created_at: new Date().toISOString(), scale_in_count: 0, scale_in_price: null, scale_in_quote_size: null };
       state.entryDecisionSnapshot = { score: decision.score, reasons: decision.reasons, rsi: lastRsi, price: fill.fillPrice };
       await sendTelegram(fmtBuy(settings.symbol, lastRsi, fill.fillPrice, fill.filledBaseSize, fill.filledQuoteSize, true));
       await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "buy", `LIVE TICK BUY filled @ $${fill.fillPrice.toFixed(2)}`, {
@@ -737,8 +757,19 @@ async function checkTickScaleIn(userId: string, state: UserState, symState: Symb
   const { lastRsi, currentPrice } = symState;
   if (lastRsi == null || lastRsi >= settings.scale_in_rsi_threshold) return;
 
+  // Require price to have actually dropped from entry before averaging down.
+  // Without this guard, scale-in fires immediately on tiny RSI moves near the entry RSI zone
+  // (e.g. entry at RSI 29, scale-in threshold 22 — but with old threshold=30 it fired at RSI 29.9).
+  // Adding capital at essentially the same price doesn't reduce average cost; it just doubles risk.
+  const MIN_SCALE_IN_DROP_PCT = 2.0; // price must be at least 2% below entry
+  const dropFromEntryPct = ((openTrade.entry_price - currentPrice) / openTrade.entry_price) * 100;
+  if (dropFromEntryPct < MIN_SCALE_IN_DROP_PCT) {
+    console.log(`[scale-in] ${userId} — skipped: only ${dropFromEntryPct.toFixed(2)}% below entry, need ${MIN_SCALE_IN_DROP_PCT}%`);
+    return;
+  }
+
   const scaleAmount = settings.scale_in_amount_usd;
-  console.log(`[scale-in] ${userId} — RSI ${lastRsi.toFixed(1)} < ${settings.scale_in_rsi_threshold}, adding $${scaleAmount.toFixed(2)}`);
+  console.log(`[scale-in] ${userId} — RSI ${lastRsi.toFixed(1)} < ${settings.scale_in_rsi_threshold}, price ${dropFromEntryPct.toFixed(2)}% below entry, adding $${scaleAmount.toFixed(2)}`);
 
   try {
     if (!settings.live_trading) {
@@ -845,7 +876,8 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
           entry_fees_usd: 0, rsi_at_entry: lastRsi,
           notes: `[PAPER] RSI ${lastRsi.toFixed(1)} < ${settings.rsi_buy_threshold}${settings.compound_mode ? ` [compound $${orderUsd.toFixed(2)}]` : ""}`,
         });
-        state.openTrade = { id, entry_price: currentPrice, size, quote_size: orderUsd, entry_fees_usd: 0, trailing_high: null, rsi_at_entry: lastRsi };
+        state.openTrade = { id, entry_price: currentPrice, size, quote_size: orderUsd, entry_fees_usd: 0, trailing_high: null, rsi_at_entry: lastRsi, created_at: new Date().toISOString(), scale_in_count: 0, scale_in_price: null, scale_in_quote_size: null };
+        state.entryDecisionSnapshot = { score: decision.score, reasons: decision.reasons, rsi: lastRsi, price: currentPrice };
         if (settings.compound_mode) {
           // Deduct deployed capital immediately so scale-in and next-buy sizing see correct available cash
           const newBalance = settings.paper_balance_usd - orderUsd;
@@ -885,7 +917,8 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
           coinbase_order_id: fill.orderId,
           notes: `LIVE BUY — RSI ${lastRsi.toFixed(1)} filled @ $${fill.fillPrice.toFixed(2)}`,
         });
-        state.openTrade = { id: pendingId, entry_price: fill.fillPrice, size: fill.filledBaseSize, quote_size: fill.filledQuoteSize, entry_fees_usd: fill.feesUsd, trailing_high: null, rsi_at_entry: lastRsi };
+        state.openTrade = { id: pendingId, entry_price: fill.fillPrice, size: fill.filledBaseSize, quote_size: fill.filledQuoteSize, entry_fees_usd: fill.feesUsd, trailing_high: null, rsi_at_entry: lastRsi, created_at: new Date().toISOString(), scale_in_count: 0, scale_in_price: null, scale_in_quote_size: null };
+        state.entryDecisionSnapshot = { score: decision.score, reasons: decision.reasons, rsi: lastRsi, price: fill.fillPrice };
         await sendTelegram(fmtBuy(settings.symbol, lastRsi, fill.fillPrice, fill.filledBaseSize, fill.filledQuoteSize, true));
         await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "buy", `LIVE BUY filled @ $${fill.fillPrice.toFixed(2)}`, {
           state: decision.state, score: decision.score,
