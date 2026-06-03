@@ -29,7 +29,7 @@ import { normalizePrivateKey } from "./coinbase-auth.ts";
 import { scheduleMidnightAnalysis } from "./analyser.ts";
 
 const RSI_PERIOD        = 14;
-const WARMUP_CANDLES    = 100;
+const WARMUP_CANDLES    = 300; // 300 so EMA-200 is active immediately after warmup
 const SETTINGS_REFRESH  = 15_000; // ms — reduced from 60s to limit disable-lag
 const RSI_HISTORY_LIMIT = 50;     // bounded recent RSI values for signal-shape detection
 
@@ -75,6 +75,26 @@ function calcEma(values: number[], period: number): number | null {
   return result;
 }
 
+// ── Consecutive loss cooldown tracker ───────────────────────
+// Call after every trade close. If 3 losses in a row, pauses new entries
+// for 2 hours — the market is likely in a bad regime (strong trending move).
+function recordTradeClose(state: UserState, isWin: boolean): void {
+  if (isWin) {
+    if (state.consecutiveLosses > 0) {
+      console.log(`[cooldown] win after ${state.consecutiveLosses} losses — resetting counter`);
+    }
+    state.consecutiveLosses = 0;
+    state.cooldownUntil     = 0;
+  } else {
+    state.consecutiveLosses = (state.consecutiveLosses ?? 0) + 1;
+    console.log(`[cooldown] loss #${state.consecutiveLosses} consecutive`);
+    if (state.consecutiveLosses >= 3) {
+      state.cooldownUntil = Date.now() + 2 * 3_600_000; // 2-hour pause
+      console.warn(`[cooldown] ⚠️ 3 consecutive losses — entries paused 2h until ${new Date(state.cooldownUntil).toISOString()}`);
+    }
+  }
+}
+
 // ── Per-symbol shared state ─────────────────────────────────
 
 interface SymbolState {
@@ -97,6 +117,8 @@ interface UserState {
   lastSellCheckMs:  number;             // debounce: last time tick-sell was evaluated
   lastDecision:     import("./trade-decision.ts").TradeDecision | null; // saved for lesson generation at close
   entryDecisionSnapshot: { score: number; reasons: string[]; rsi: number; price: number } | null;
+  consecutiveLosses: number;  // resets to 0 on any win; ≥3 triggers cooldown
+  cooldownUntil:     number;  // epoch ms — no new entries before this time (0 = inactive)
 }
 
 const TICK_ENTRY_DEBOUNCE_MS = 60_000; // max one tick-level entry check per minute per user
@@ -222,7 +244,7 @@ async function reloadSettings(): Promise<void> {
             console.warn(`[settings] no creds for ${s.user_id}:`, e instanceof Error ? e.message : String(e));
           }
         }
-        userStates.set(s.user_id, { settings: s, openTrade, credentials: creds, lastEntryCheckMs: 0, lastSellCheckMs: 0, lastDecision: null, entryDecisionSnapshot: null });
+        userStates.set(s.user_id, { settings: s, openTrade, credentials: creds, lastEntryCheckMs: 0, lastSellCheckMs: 0, lastDecision: null, entryDecisionSnapshot: null, consecutiveLosses: 0, cooldownUntil: 0 });
         console.log(`[settings] loaded user ${s.user_id} — openTrade=${openTrade?.id ?? "none"}`);
       } else {
         // Update settings, preserve openTrade and credentials
@@ -313,6 +335,13 @@ async function entryRiskBlocked(
   const { lastRsi, currentPrice, recentCandles, closePrices } = symState;
 
   if (openTrade) return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `existing_open_position:${openTrade.id}`);
+
+  // Consecutive loss cooldown: 3 losses in a row → 2h entry pause
+  if (state.cooldownUntil > 0 && Date.now() < state.cooldownUntil) {
+    const remainMin = Math.ceil((state.cooldownUntil - Date.now()) / 60_000);
+    return blockEntry(userId, settings.symbol, lastRsi, currentPrice,
+      `consecutive_loss_cooldown:${remainMin}min_remaining_until_${new Date(state.cooldownUntil).toISOString()}`);
+  }
 
   if (recentCandles.length < RSI_PERIOD + 1)
     return blockEntry(userId, settings.symbol, lastRsi, currentPrice, `missing_candles:have_${recentCandles.length}_need_${RSI_PERIOD + 1}`);
@@ -405,7 +434,8 @@ function generateTradeLesson(params: {
 
   const exitLabels: Record<string, string> = {
     trailing_stop: "trailing stop", stop_loss: "stop-loss",
-    take_profit:   "take-profit target", rsi_signal: "RSI sell signal", manual: "manual close",
+    take_profit:   "take-profit target", rsi_signal: "RSI sell signal",
+    manual:        "manual close", time_stop: "time-stop (6h stagnant)",
   };
   const exitLabel = exitLabels[closeReason] ?? closeReason;
   const rsiZone = entryRsi < 25 ? "deeply oversold" : entryRsi < 30 ? "oversold" : entryRsi < 35 ? "getting oversold" : "near the buy threshold";
@@ -472,16 +502,32 @@ async function checkRiskExits(userId: string, state: UserState, price: number, r
   const dropFromPeak = ((price - newHigh) / newHigh) * 100;
   const trailingHit  = settings.trailing_stop_pct > 0 && dropFromPeak <= -settings.trailing_stop_pct;
   const slHit        = settings.stop_loss_pct > 0 && changePct <= -settings.stop_loss_pct;
-  const tpHit        = settings.take_profit_pct > 0 && changePct >= settings.take_profit_pct;
 
-  if (!trailingHit && !slHit && !tpHit) return false;
+  // Dynamic take-profit: RSI < 22 at entry = deeply oversold = expect a larger bounce.
+  // We reward the patience of waiting for the deepest dips with a 50% higher target.
+  const rsiAtEntry    = openTrade.rsi_at_entry ?? settings.rsi_buy_threshold;
+  const dynamicTpPct  = (rsiAtEntry < 22 && settings.take_profit_pct > 0)
+    ? settings.take_profit_pct * 1.5
+    : settings.take_profit_pct;
+  const tpHit         = dynamicTpPct > 0 && changePct >= dynamicTpPct;
 
-  const closeReason = trailingHit ? "trailing_stop" : slHit ? "stop_loss" : "take_profit";
+  // Time-stop: close stagnant or losing trades after 6 hours.
+  // Dead capital costs opportunity — better to take a small loss and wait for a clean setup.
+  const holdMs       = Date.now() - new Date(openTrade.created_at ?? Date.now()).getTime();
+  const timeStopHit  = !trailingHit && !slHit && !tpHit &&
+    holdMs >= 6 * 3_600_000 &&
+    changePct < -0.3; // only time-stop if actually losing (not flat or winning)
+
+  if (!trailingHit && !slHit && !tpHit && !timeStopHit) return false;
+
+  const closeReason = trailingHit ? "trailing_stop" : slHit ? "stop_loss" : tpHit ? "take_profit" : "time_stop";
   const exitLabel   = trailingHit
     ? `Trailing stop (peak $${newHigh.toFixed(0)}, dropped ${dropFromPeak.toFixed(2)}%)`
     : slHit
       ? `Stop-loss (${changePct.toFixed(2)}%)`
-      : `Take-profit (${changePct.toFixed(2)}%)`;
+      : tpHit
+        ? `Take-profit (${changePct.toFixed(2)}%)${rsiAtEntry < 22 ? " [deep RSI boost]" : ""}`
+        : `Time-stop (${(holdMs / 3_600_000).toFixed(1)}h held, ${changePct.toFixed(2)}%)`;
 
   console.log(`[risk] ${userId} → ${exitLabel} @ $${price.toFixed(2)}`);
 
@@ -510,6 +556,7 @@ async function checkRiskExits(userId: string, state: UserState, price: number, r
         settings.paper_balance_usd = Math.max(0, newBalance);
         console.log(`[compound] balance updated: $${newBalance.toFixed(2)} (returned $${openTrade.quote_size.toFixed(2)} + pnl ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)})`);
       }
+      recordTradeClose(state, pnl >= 0);
       await sendTelegram(fmtSell(settings.symbol, rsi, price, entry, pnl, changePct, false, exitLabel));
       await logTick(userId, settings.symbol, rsi, price, "sell", `PAPER ${exitLabel}`);
     } else {
@@ -528,6 +575,7 @@ async function checkRiskExits(userId: string, state: UserState, price: number, r
         pnl_usd: realPnl, pnl_pct: realPnlPct, effective_pnl: netPnl,
         close_reason: closeReason, close_order_id: fill.orderId, notes, rsi_at_exit: rsi,
       });
+      recordTradeClose(state, netPnl >= 0);
       await sendTelegram(fmtSell(settings.symbol, rsi, fill.fillPrice, entry, realPnl, realPnlPct, true, exitLabel));
       await logTick(userId, settings.symbol, rsi, fill.fillPrice, "sell", `LIVE ${exitLabel}`);
     }
@@ -713,6 +761,7 @@ async function checkTickSell(userId: string, state: UserState, symState: SymbolS
         settings.paper_balance_usd = Math.max(0, newBalance);
         console.log(`[compound] balance updated: $${newBalance.toFixed(2)} (returned $${openTrade.quote_size.toFixed(2)} + pnl ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)})`);
       }
+      recordTradeClose(state, pnl >= 0);
       await sendTelegram(fmtSell(settings.symbol, lastRsi, currentPrice, entry, pnl, pnlPct, false, "RSI tick sell"));
       await logTick(userId, settings.symbol, lastRsi, currentPrice, "sell", `PAPER TICK SELL — RSI ${lastRsi.toFixed(1)} > ${settings.rsi_sell_threshold}`);
     } else {
@@ -731,6 +780,7 @@ async function checkTickSell(userId: string, state: UserState, symState: SymbolS
         pnl_usd: realPnl, pnl_pct: realPnlPct, effective_pnl: netPnl,
         close_reason: "rsi_signal", close_order_id: fill.orderId, notes, rsi_at_exit: lastRsi,
       });
+      recordTradeClose(state, netPnl >= 0);
       await sendTelegram(fmtSell(settings.symbol, lastRsi, fill.fillPrice, entry, realPnl, realPnlPct, true, "RSI tick sell"));
       await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "sell", `LIVE TICK SELL — RSI ${lastRsi.toFixed(1)} filled @ $${fill.fillPrice.toFixed(2)}`);
     }
@@ -960,6 +1010,7 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
           settings.paper_balance_usd = Math.max(0, newBalance);
           console.log(`[compound] balance updated: $${newBalance.toFixed(2)} (returned $${openTrade.quote_size.toFixed(2)} + pnl ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)})`);
         }
+        recordTradeClose(state, pnl >= 0);
         await sendTelegram(fmtSell(settings.symbol, lastRsi, currentPrice, entry, (currentPrice - entry) * openTrade.size, pnlPct, false));
         await logTick(userId, settings.symbol, lastRsi, currentPrice, "sell", `PAPER SELL — P&L $${((currentPrice - entry) * openTrade.size).toFixed(2)}`, {
           regime: decision.marketRegime,
@@ -980,6 +1031,7 @@ async function checkSignals(userId: string, state: UserState, symState: SymbolSt
             closeReason: "rsi_signal", holdMinutes, entrySnapshot: state.entryDecisionSnapshot, isLive: true,
           }),
         });
+        recordTradeClose(state, netPnl >= 0);
         await sendTelegram(fmtSell(settings.symbol, lastRsi, fill.fillPrice, entry, realPnl, realPnlPct, true));
         await logTick(userId, settings.symbol, lastRsi, fill.fillPrice, "sell", `LIVE SELL filled @ $${fill.fillPrice.toFixed(2)}`, {
           regime: decision.marketRegime,
@@ -1085,7 +1137,7 @@ async function _onTradeInner(symbol: string, price: number, size: number, tickMs
   // Candle closed: recompute RSI, check buy/sell for all users
   if (closedCandle) {
     symState.closePrices.push(closedCandle.close);
-    if (symState.closePrices.length > 200) symState.closePrices.shift();
+    if (symState.closePrices.length > 500) symState.closePrices.shift(); // 500 → accurate EMA-200 with buffer
     symState.recentCandles.push(closedCandle);
     if (symState.recentCandles.length > 20) symState.recentCandles.shift();
     symState.lastRsi = computeRsi(symState.closePrices, RSI_PERIOD);

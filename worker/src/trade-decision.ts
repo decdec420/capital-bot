@@ -81,6 +81,31 @@ function deriveRsiHistory(closePrices: number[], lastRsi: number): number[] {
   return history.slice(-6);
 }
 
+// ── Bollinger Bands (20-period, 2σ) ──────────────────────────────────────────
+// Price touching the lower band means the move is statistically significant —
+// not just an RSI artefact from a slow market. This is the single best
+// confirmation filter for mean-reversion entries.
+function bollingerBands(prices: number[], period = 20, mult = 2): { upper: number; mid: number; lower: number } | null {
+  if (prices.length < period) return null;
+  const slice = prices.slice(-period);
+  const mid = slice.reduce((s, v) => s + v, 0) / period;
+  const variance = slice.reduce((s, v) => s + (v - mid) ** 2, 0) / period;
+  const sd = Math.sqrt(variance);
+  return { upper: mid + mult * sd, mid, lower: mid - mult * sd };
+}
+
+// ── 15-min RSI (resample 5-min closes — every 3rd is the 15-min close) ───────
+// The 15-min timeframe acts as the regime filter: buying when the 15-min RSI
+// is still healthy (≥50) means we're buying a pullback in an uptrend.
+// Buying when the 15-min RSI is already crushed (<25) means entering a sustained
+// sell-off — the EMA-200 block may miss these during early breakdowns.
+function rsi15min(closePrices5m: number[]): number | null {
+  const prices: number[] = [];
+  for (let i = 2; i < closePrices5m.length; i += 3) prices.push(closePrices5m[i]);
+  if (prices.length < RSI_PERIOD + 1) return null;
+  return computeRsi(prices, RSI_PERIOD);
+}
+
 function describeScore(score: number): string {
   return score > 0 ? `+${score}` : `${score}`;
 }
@@ -206,6 +231,38 @@ export function evaluateTradeDecision(input: TradeDecisionInput): TradeDecision 
     const avgRange = average(priorRanges);
     if (avgRange > 0 && latestRange > avgRange * 2.5) {
       addScore(-2, `high volatility spike (${(latestRange * 100).toFixed(2)}% range)`);
+    }
+  }
+
+  // ── Bollinger Bands confirmation ──────────────────────────────────────────────
+  // Price at or below the lower band confirms the RSI dip is real (statistically
+  // significant move, not just noise from a quiet market).
+  const bb = bollingerBands(closePrices);
+  if (bb !== null) {
+    const distToLowerPct = ((currentPrice - bb.lower) / bb.lower) * 100;
+    if (distToLowerPct <= 0) {
+      addScore(2, `price at/below BB lower band ($${bb.lower.toFixed(0)})`);
+    } else if (distToLowerPct <= 0.5) {
+      addScore(1, `price within 0.5% of BB lower ($${bb.lower.toFixed(0)})`);
+    }
+  }
+
+  // ── 15-minute RSI confluence ──────────────────────────────────────────────────
+  // Best setup: 15-min RSI ≥50 (larger trend healthy) + 5-min RSI <28 = buying
+  // a short-term dip in a medium-term uptrend. High win-rate mean reversion.
+  // Danger: 15-min RSI <25 means sustained multi-candle sell-off — too risky.
+  const rsi15 = rsi15min(closePrices);
+  if (rsi15 !== null) {
+    if (rsi15 >= 50) {
+      addScore(2, `15-min RSI ${rsi15.toFixed(1)} — pullback in uptrend (high quality)`);
+    } else if (rsi15 >= 35) {
+      addScore(1, `15-min RSI ${rsi15.toFixed(1)} — neutral, dip is real`);
+    } else if (rsi15 < 30) {
+      addScore(-1, `15-min RSI ${rsi15.toFixed(1)} — sustained sell-off, caution`);
+    }
+    // Hard block: 15-min RSI below 25 = confirmed multi-timeframe downtrend
+    if (rsi15 < 25 && !openTrade) {
+      blockers.push(`15min_downtrend_rsi_${rsi15.toFixed(1)}_below_25`);
     }
   }
 

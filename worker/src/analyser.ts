@@ -552,13 +552,21 @@ export async function runNightlyAnalysis(userId: string): Promise<void> {
     // ── Auto-apply conservative threshold nudges ──────────────────────────
     // Guards: 20+ trades, change ≤ 5 points, improvement is meaningful.
     // We only auto-apply RSI buy threshold — everything else stays manual.
+    //
+    // HARD RULES (protect deliberate manual tuning):
+    //   • NEVER raise rsi_buy_threshold (loosening entries requires human review)
+    //   • NEVER lower rsi_buy_threshold below 15 (safety floor)
+    // Auto-apply can ONLY tighten criteria (lower the threshold).
+    const RSI_AUTO_APPLY_FLOOR = 15;   // absolute minimum threshold
     let autoApplied = false;
     const autoAppliedFields: Record<string, { old: number; new: number }> = {};
 
     if (
       ins.suggestedRsiThreshold !== null &&
       trades.length >= 20 &&
-      Math.abs(ins.suggestedRsiThreshold - settings.rsi_buy_threshold) <= 5
+      Math.abs(ins.suggestedRsiThreshold - settings.rsi_buy_threshold) <= 5 &&
+      ins.suggestedRsiThreshold < settings.rsi_buy_threshold &&      // only tighten, never loosen
+      ins.suggestedRsiThreshold >= RSI_AUTO_APPLY_FLOOR               // respect floor
     ) {
       try {
         const oldVal = settings.rsi_buy_threshold;
